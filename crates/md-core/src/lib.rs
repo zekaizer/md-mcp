@@ -9,6 +9,7 @@
 pub mod document;
 pub mod error;
 pub mod frontmatter;
+pub mod listing;
 pub mod patch;
 pub mod section;
 pub mod text;
