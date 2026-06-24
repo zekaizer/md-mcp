@@ -22,21 +22,29 @@ pub struct Vault {
 }
 
 impl Vault {
-    /// Open the vault at `path`. Fails if it does not exist or is not a directory.
+    /// Open the vault at `path`. Fails if it does not exist or is not a
+    /// directory. Rolls back any transaction left incomplete by a crash.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let root = Dir::open_ambient_dir(path, ambient_authority())
             .map_err(|e| Error::io(format!("cannot open vault {}: {e}", path.display())))?;
-        Ok(Self {
+        let vault = Self {
             root,
             root_path: path.to_path_buf(),
-        })
+        };
+        vault.recover_transactions()?;
+        Ok(vault)
     }
 
     /// The filesystem path the vault was opened at (for diagnostics).
     #[must_use]
     pub fn root_path(&self) -> &Path {
         &self.root_path
+    }
+
+    /// The capability-jailed directory handle (crate-internal).
+    pub(crate) fn dir(&self) -> &Dir {
+        &self.root
     }
 
     /// Validate a vault-relative path, returning a cleaned relative path.
