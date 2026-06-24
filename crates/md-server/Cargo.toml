@@ -1,0 +1,15 @@
+[package]
+name = "md-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The MCP server runtime (rmcp stdio + tokio) and the md-core dependency are
+# wired in when the server bootstrap lands; the scaffold is intentionally bare.
