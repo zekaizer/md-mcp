@@ -50,6 +50,17 @@ impl Vault {
         &self.root
     }
 
+    /// Best-effort fsync of the parent directory of `rel`, so a `rename` that
+    /// published `rel` survives a power loss. `rel` is already validated/jailed,
+    /// so opening it under the (trusted) vault root is safe.
+    pub(crate) fn fsync_parent(&self, rel: &str) {
+        let parent = Path::new(rel)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty());
+        let dir = parent.map_or_else(|| self.root_path.clone(), |p| self.root_path.join(p));
+        let _ = std::fs::File::open(&dir).and_then(|f| f.sync_all());
+    }
+
     /// Validate a vault-relative path, returning a cleaned relative path.
     ///
     /// Rejects `..`, absolute paths, Windows prefixes, and the empty/root path.
@@ -165,6 +176,7 @@ impl Vault {
             .map_err(|e| Error::io(format!("fsync temp for {rel}: {e}")))?;
         tmp.replace(name)
             .map_err(|e| Error::io(format!("commit {rel}: {e}")))?;
+        self.fsync_parent(&clean);
         Ok(())
     }
 

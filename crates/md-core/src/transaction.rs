@@ -99,17 +99,31 @@ impl Vault {
             match self.apply_op(&batch_id, k, op, &mut journal, &journal_path) {
                 Ok(outcome) => outcomes.push(outcome),
                 Err(e) => {
-                    self.rollback(&journal);
-                    self.cleanup(&batch_id, &journal_path);
+                    // Only clear the journal/backups if the undo fully succeeded;
+                    // otherwise leave them for recovery to retry.
+                    if self.rollback(&journal) {
+                        self.cleanup(&batch_id, &journal_path);
+                    }
                     return Err(e);
                 }
             }
         }
 
+        // The commit point: flip the durable flag. If even that write fails, the
+        // batch is uncommitted, so roll it back rather than leaving it applied.
         journal.committed = true;
-        self.write_journal(&journal_path, &journal)?;
-        self.cleanup(&batch_id, &journal_path);
-        Ok(outcomes)
+        match self.write_journal(&journal_path, &journal) {
+            Ok(()) => {
+                self.cleanup(&batch_id, &journal_path);
+                Ok(outcomes)
+            }
+            Err(e) => {
+                if self.rollback(&journal) {
+                    self.cleanup(&batch_id, &journal_path);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Roll back any transaction a crash left incomplete. Called at open.
@@ -125,6 +139,7 @@ impl Vault {
                 journal_paths.push(format!("{JOURNAL_DIR}/{name}"));
             }
         }
+        let mut all_recovered = true;
         for jpath in journal_paths {
             let Ok(bytes) = self.dir().read(&jpath) else {
                 continue;
@@ -132,12 +147,24 @@ impl Vault {
             let Ok(journal) = serde_json::from_slice::<Journal>(&bytes) else {
                 continue;
             };
-            if !journal.committed {
-                self.rollback(&journal);
+            if journal.committed {
+                // Crash between commit and cleanup: just finish cleaning up.
+                self.cleanup(&journal.batch_id, &jpath);
+            } else if self.rollback(&journal) {
+                self.cleanup(&journal.batch_id, &jpath);
+            } else {
+                // Incomplete rollback: keep the journal + backups for the next
+                // attempt rather than opening a half-rolled-back vault as healthy.
+                all_recovered = false;
             }
-            self.cleanup(&journal.batch_id, &jpath);
         }
-        Ok(())
+        if all_recovered {
+            Ok(())
+        } else {
+            Err(Error::io(
+                "transaction recovery incomplete; some rollbacks could not finish",
+            ))
+        }
     }
 
     fn apply_op(
@@ -236,7 +263,12 @@ impl Vault {
         self.ensure_parent(to)?;
         self.dir()
             .rename(from, self.dir(), to)
-            .map_err(|e| Error::io(format!("rename {from} -> {to}: {e}")))
+            .map_err(|e| Error::io(format!("rename {from} -> {to}: {e}")))?;
+        // Make both ends of the rename durable (the entry vanished from `from`
+        // and appeared under `to`).
+        self.fsync_parent(to);
+        self.fsync_parent(from);
+        Ok(())
     }
 
     fn unique_trash_path(&self, path: &str) -> String {
@@ -250,40 +282,40 @@ impl Vault {
             .unwrap_or_else(|| format!("{base}.x"))
     }
 
-    fn remove_path(&self, path: &str) {
+    fn remove_path(&self, path: &str) -> std::io::Result<()> {
         match self.dir().symlink_metadata(path) {
-            Ok(m) if m.is_dir() => {
-                let _ = self.dir().remove_dir_all(path);
-            }
-            Ok(_) => {
-                let _ = self.dir().remove_file(path);
-            }
-            Err(_) => {}
+            Ok(m) if m.is_dir() => self.dir().remove_dir_all(path),
+            Ok(_) => self.dir().remove_file(path),
+            Err(_) => Ok(()), // already gone
         }
     }
 
-    fn rollback(&self, journal: &Journal) {
+    /// Replay undo steps in reverse. Returns `true` only if every step that had
+    /// work to do succeeded; on any failure the backups/journal are kept so the
+    /// next open can retry rather than losing the original.
+    fn rollback(&self, journal: &Journal) -> bool {
+        let mut ok = true;
         for step in journal.undo.iter().rev() {
-            match step {
-                UndoStep::DeletePath { path } => self.remove_path(path),
+            let step_ok = match step {
+                UndoStep::DeletePath { path } => self.remove_path(path).is_ok(),
                 UndoStep::RestoreFromBackup { backup, path }
                 | UndoStep::RestoreFromTrash {
                     trash: backup,
                     path,
                 } => {
-                    if self.dir().exists(backup) {
-                        let _ = self.ensure_parent(path);
-                        let _ = self.dir().rename(backup, self.dir(), path);
-                    }
+                    !self.dir().exists(backup)
+                        || (self.ensure_parent(path).is_ok()
+                            && self.dir().rename(backup, self.dir(), path).is_ok())
                 }
                 UndoStep::ReverseMove { from, to } => {
-                    if self.dir().exists(to) && !self.dir().exists(from) {
-                        let _ = self.ensure_parent(from);
-                        let _ = self.dir().rename(to, self.dir(), from);
-                    }
+                    !(self.dir().exists(to) && !self.dir().exists(from))
+                        || (self.ensure_parent(from).is_ok()
+                            && self.dir().rename(to, self.dir(), from).is_ok())
                 }
-            }
+            };
+            ok &= step_ok;
         }
+        ok
     }
 
     fn cleanup(&self, batch_id: &str, journal_path: &str) {
@@ -449,6 +481,32 @@ mod tests {
             "recovery should have rolled back"
         );
         assert!(!dir.path().join(".md-mcp/journal/planted.json").exists());
+    }
+
+    #[test]
+    fn incomplete_rollback_keeps_journal_and_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let vault = Vault::open(dir.path()).unwrap();
+            vault
+                .write_atomic(".md-mcp/backup/x/0", b"original")
+                .unwrap();
+        }
+        // A non-empty directory at the restore target blocks the undo rename.
+        std::fs::create_dir_all(dir.path().join("target.md")).unwrap();
+        std::fs::write(dir.path().join("target.md/inner"), b"x").unwrap();
+        let jdir = dir.path().join(".md-mcp/journal");
+        std::fs::create_dir_all(&jdir).unwrap();
+        std::fs::write(
+            jdir.join("stuck.json"),
+            br#"{"batch_id":"stuck","committed":false,"undo":[{"RestoreFromBackup":{"backup":".md-mcp/backup/x/0","path":"target.md"}}]}"#,
+        )
+        .unwrap();
+
+        // Recovery cannot finish the restore: open errors, journal + backup survive.
+        assert!(Vault::open(dir.path()).is_err());
+        assert!(dir.path().join(".md-mcp/journal/stuck.json").exists());
+        assert!(dir.path().join(".md-mcp/backup/x/0").exists());
     }
 
     #[test]
