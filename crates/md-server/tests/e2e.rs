@@ -60,10 +60,7 @@ async fn client_lists_all_tools_and_calls_one() {
         .expect("call read_notes");
     assert_ne!(result.is_error, Some(true));
 
-    let structured: Value = result
-        .structured_content
-        .expect("structured content")
-        .into();
+    let structured: Value = result.structured_content.expect("structured content");
     let notes = structured["notes"].as_array().unwrap();
     assert_eq!(notes.len(), 2);
     assert_eq!(notes[0]["exists"], json!(true));
