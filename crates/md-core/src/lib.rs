@@ -9,11 +9,13 @@
 pub mod document;
 pub mod error;
 pub mod frontmatter;
+pub mod patch;
 pub mod section;
 pub mod text;
 pub mod vault;
 
 pub use document::{Document, Heading, OutlineEntry};
 pub use error::{Code, Error, Result};
+pub use patch::{Edit, Operation, patch_sections};
 pub use section::Scope;
 pub use vault::Vault;
