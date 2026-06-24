@@ -16,3 +16,4 @@ immutable; a changed decision supersedes the old one with a new ADR.
 - [0005](0005-content-hash.md) — Per-section content hash
 - [0006](0006-vault-path-jail-and-atomic-write.md) — Vault path jail and atomic write
 - [0007](0007-multi-file-transaction.md) — Multi-file transaction: journal, backup, and crash recovery
+- [0008](0008-concurrency-and-isolation.md) — Concurrency and isolation
