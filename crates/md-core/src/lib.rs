@@ -8,6 +8,7 @@
 
 pub mod document;
 pub mod error;
+pub mod frontmatter;
 pub mod section;
 pub mod text;
 pub mod vault;
