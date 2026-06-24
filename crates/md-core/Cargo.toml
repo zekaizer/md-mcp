@@ -11,5 +11,6 @@ publish = false
 workspace = true
 
 [dependencies]
+unicode-normalization.workspace = true
 
 [dev-dependencies]

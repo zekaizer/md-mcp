@@ -6,11 +6,4 @@
 //! can be unit-tested without a runtime; the server crate wires these into MCP
 //! tools.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn workspace_builds() {
-        // Smoke test: the crate compiles and the test harness runs.
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub mod text;
