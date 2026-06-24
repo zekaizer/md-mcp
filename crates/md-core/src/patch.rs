@@ -393,7 +393,12 @@ fn detect_overlaps(splices: &[(usize, Splice)], errors: &mut Vec<BatchError>) {
             let b = &splices[j].1;
             let same_target = a.target == b.target;
             let nested = a.footprint.0 < b.footprint.1 && b.footprint.0 < a.footprint.1;
-            if same_target || nested {
+            // Two zero-width insertions from different edits at the very same byte
+            // offset (e.g. append-to-A's end == insert-before-B's start at the
+            // A|B seam) would land in an arbitrary, order-dependent order. Reject
+            // them as overlapping so the result is never ambiguous.
+            let same_point_insert = a.start == a.end && b.start == b.end && a.start == b.start;
+            if same_target || nested || same_point_insert {
                 conflict[i] = true;
                 conflict[j] = true;
             }
@@ -634,6 +639,25 @@ mod tests {
         };
         let errs = patch_sections(src, &[parent, child]).unwrap_err();
         assert!(errs.iter().any(|e| e.error.code == Code::Overlap));
+    }
+
+    #[test]
+    fn batch_two_zero_width_inserts_at_one_seam_are_rejected() {
+        // Appending to A's end and inserting before B both land at the A|B seam;
+        // their order would be arbitrary, so the batch is rejected.
+        let src = "# A\nax\n# B\nbx\n";
+        let append_a = Edit {
+            scope: Scope::Section,
+            content: Some("APP".into()),
+            ..edit(&["A"], Operation::Append)
+        };
+        let insert_b = Edit {
+            content: Some("# New\nn\n".into()),
+            ..edit(&["B"], Operation::InsertBefore)
+        };
+        let errs = patch_sections(src, &[append_a, insert_b]).unwrap_err();
+        assert_eq!(errs.len(), 2);
+        assert!(errs.iter().all(|e| e.error.code == Code::Overlap));
     }
 
     #[test]
