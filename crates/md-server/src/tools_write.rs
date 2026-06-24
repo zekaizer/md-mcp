@@ -136,8 +136,28 @@ pub struct EditItem {
     pub content: Option<String>,
     #[serde(default)]
     pub new_heading: Option<String>,
+    /// Destination for the `move` operation.
+    #[serde(default)]
+    pub destination: Option<DestinationArg>,
     #[serde(default)]
     pub expected_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[schemars(crate = "rmcp::schemars")]
+pub enum PositionArg {
+    Before,
+    After,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct DestinationArg {
+    pub heading_path: Vec<String>,
+    #[serde(default)]
+    pub occurrence: Option<usize>,
+    pub position: PositionArg,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -169,14 +189,16 @@ fn to_core_edit(item: &EditItem) -> Result<md_core::Edit, ApiError> {
         OperationArg::InsertBefore => md_core::Operation::InsertBefore,
         OperationArg::InsertAfter => md_core::Operation::InsertAfter,
         OperationArg::Rename => md_core::Operation::Rename,
-        OperationArg::Move => {
-            return Err(ApiError {
-                code: Code::MissingContent.as_str().to_string(),
-                message: "the move operation is not yet supported".to_string(),
-                index: None,
-            });
-        }
+        OperationArg::Move => md_core::Operation::Move,
     };
+    let destination = item.destination.as_ref().map(|d| md_core::Destination {
+        heading_path: d.heading_path.clone(),
+        occurrence: d.occurrence,
+        position: match d.position {
+            PositionArg::Before => md_core::Position::Before,
+            PositionArg::After => md_core::Position::After,
+        },
+    });
     Ok(md_core::Edit {
         heading_path: item.heading_path.clone(),
         occurrence: item.occurrence,
@@ -184,6 +206,7 @@ fn to_core_edit(item: &EditItem) -> Result<md_core::Edit, ApiError> {
         scope: item.scope.into(),
         content: item.content.clone(),
         new_heading: item.new_heading.clone(),
+        destination,
         expected_hash: item.expected_hash.clone(),
     })
 }
@@ -662,6 +685,7 @@ mod tests {
                     scope: ScopeArg::Body,
                     content: Some("new".into()),
                     new_heading: None,
+                    destination: None,
                     expected_hash: None,
                 }],
             }))
@@ -683,6 +707,7 @@ mod tests {
                         scope: ScopeArg::Body,
                         content: Some("zzz".into()),
                         new_heading: None,
+                        destination: None,
                         expected_hash: None,
                     },
                     EditItem {
@@ -693,6 +718,7 @@ mod tests {
                         scope: ScopeArg::Body,
                         content: Some("x".into()),
                         new_heading: None,
+                        destination: None,
                         expected_hash: None,
                     },
                 ],
@@ -703,6 +729,39 @@ mod tests {
         assert!(!bad.ok);
         assert!(!bad.errors.is_empty());
         assert_eq!(s.vault().read_note("a.md").unwrap(), "# A\nnew\n");
+    }
+
+    #[tokio::test]
+    async fn edit_sections_move_relocates_a_section() {
+        let (_d, s) = server(&[("a.md", "# A\nax\n# B\nbx\n")]);
+        let resp = s
+            .edit_sections(Parameters(EditSectionsRequest {
+                edits: vec![EditItem {
+                    path: "a.md".into(),
+                    heading_path: vec!["A".into()],
+                    occurrence: None,
+                    operation: OperationArg::Move,
+                    scope: ScopeArg::Section,
+                    content: None,
+                    new_heading: None,
+                    destination: Some(DestinationArg {
+                        heading_path: vec!["B".into()],
+                        occurrence: None,
+                        position: PositionArg::After,
+                    }),
+                    expected_hash: None,
+                }],
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(ok_or_dump(&resp));
+        assert_eq!(s.vault().read_note("a.md").unwrap(), "# B\nbx\n# A\nax\n");
+    }
+
+    fn ok_or_dump(r: &EditSectionsResponse) -> bool {
+        assert!(r.ok, "edit failed: {:?}", r.errors);
+        r.ok
     }
 
     #[tokio::test]

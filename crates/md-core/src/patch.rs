@@ -3,8 +3,8 @@
 //! [`patch_sections`] resolves every edit against the **original** snapshot,
 //! rejects overlapping targets, validates inserted heading levels, and applies
 //! the surviving edits as byte splices. It is all-or-nothing: any rejected edit
-//! fails the whole batch with one error per offending item. `move` is handled
-//! separately (a two-location operation).
+//! fails the whole batch with one error per offending item. `move` is a
+//! two-location operation (cut at the source, insert at the destination).
 
 use crate::document::Document;
 use crate::error::{Code, Error};
@@ -20,6 +20,22 @@ pub enum Operation {
     InsertBefore,
     InsertAfter,
     Rename,
+    Move,
+}
+
+/// Where a `move` places its section, relative to an anchor section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Position {
+    Before,
+    After,
+}
+
+/// The destination of a `move` operation.
+#[derive(Clone, Debug)]
+pub struct Destination {
+    pub heading_path: Vec<String>,
+    pub occurrence: Option<usize>,
+    pub position: Position,
 }
 
 /// One edit in an `edit_sections` batch.
@@ -31,6 +47,7 @@ pub struct Edit {
     pub scope: Scope,
     pub content: Option<String>,
     pub new_heading: Option<String>,
+    pub destination: Option<Destination>,
     pub expected_hash: Option<String>,
 }
 
@@ -66,7 +83,7 @@ pub fn patch_sections(source: &str, edits: &[Edit]) -> Result<String, Vec<BatchE
     let mut splices: Vec<(usize, Splice)> = Vec::new();
     for (i, edit) in edits.iter().enumerate() {
         match resolve_edit(&doc, source, edit) {
-            Ok(sp) => splices.push((i, sp)),
+            Ok(sps) => splices.extend(sps.into_iter().map(|s| (i, s))),
             Err(error) => errors.push(BatchError { index: i, error }),
         }
     }
@@ -87,7 +104,7 @@ pub fn patch_sections(source: &str, edits: &[Edit]) -> Result<String, Vec<BatchE
     Ok(result)
 }
 
-fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Splice, Error> {
+fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Vec<Splice>, Error> {
     let op = edit
         .operation
         .ok_or_else(|| Error::new(Code::MissingContent, "operation is required"))?;
@@ -117,13 +134,13 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Splice, Err
             if !rep.is_empty() && !rep.ends_with('\n') && span_ends_nl {
                 rep.push('\n');
             }
-            Ok(Splice {
+            Ok(vec![Splice {
                 start: content_span.start,
                 end: content_span.end,
                 replacement: rep,
                 footprint: (content_span.start, content_span.end),
                 target,
-            })
+            }])
         }
         Operation::Append => {
             let content = require_content(edit)?;
@@ -137,26 +154,26 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Splice, Err
             if !rep.ends_with('\n') {
                 rep.push('\n');
             }
-            Ok(Splice {
+            Ok(vec![Splice {
                 start: pos,
                 end: pos,
                 replacement: rep,
                 footprint: (content_span.start, content_span.end),
                 target,
-            })
+            }])
         }
         Operation::Delete => {
             let (start, end) = match edit.scope {
                 Scope::Body => (content_span.start, content_span.end),
                 Scope::Section => section,
             };
-            Ok(Splice {
+            Ok(vec![Splice {
                 start,
                 end,
                 replacement: String::new(),
                 footprint: (start, end),
                 target,
-            })
+            }])
         }
         Operation::InsertBefore => {
             let content = require_content(edit)?;
@@ -166,13 +183,13 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Splice, Err
             if !rep.ends_with('\n') {
                 rep.push('\n');
             }
-            Ok(Splice {
+            Ok(vec![Splice {
                 start: pos,
                 end: pos,
                 replacement: rep,
                 footprint: (section.0, section.1),
                 target,
-            })
+            }])
         }
         Operation::InsertAfter => {
             let content = require_content(edit)?;
@@ -186,13 +203,13 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Splice, Err
             if !rep.ends_with('\n') {
                 rep.push('\n');
             }
-            Ok(Splice {
+            Ok(vec![Splice {
                 start: pos,
                 end: pos,
                 replacement: rep,
                 footprint: (section.0, section.1),
                 target,
-            })
+            }])
         }
         Operation::Rename => {
             let Some(i) = index else {
@@ -213,15 +230,76 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Splice, Err
                 format!("{hashes} {new_heading}")
             };
             let rep = if had_nl { format!("{line}\n") } else { line };
-            Ok(Splice {
+            Ok(vec![Splice {
                 start: h.span.start,
                 end: h.span.end,
                 replacement: rep,
                 footprint: (h.span.start, h.span.end),
                 target,
-            })
+            }])
         }
+        Operation::Move => resolve_move(doc, source, edit, index),
     }
+}
+
+/// Resolve a `move`: cut the source subtree and re-insert it at the destination,
+/// as two splices (delete at source, insert at destination).
+fn resolve_move(
+    doc: &Document,
+    source: &str,
+    edit: &Edit,
+    index: Option<usize>,
+) -> Result<Vec<Splice>, Error> {
+    let Some(src_i) = index else {
+        return Err(Error::new(Code::NotFound, "cannot move the root"));
+    };
+    let dest = edit
+        .destination
+        .as_ref()
+        .ok_or_else(|| Error::new(Code::MissingContent, "destination is required for move"))?;
+    let dest_idx = if dest.heading_path.is_empty() {
+        None
+    } else {
+        Some(doc.resolve_heading(&dest.heading_path, dest.occurrence)?)
+    };
+
+    let src_span = doc.section_span(src_i);
+    let (d_start, d_end) = section_bounds(doc, dest_idx);
+    let dest_pos = match dest.position {
+        Position::Before => d_start,
+        Position::After => d_end,
+    };
+    // Reject moving a section into its own subtree.
+    if src_span.start <= dest_pos && dest_pos <= src_span.end {
+        return Err(Error::new(
+            Code::Overlap,
+            "cannot move a section into itself",
+        ));
+    }
+
+    let mut moved = src_span.of(source).to_string();
+    if !moved.ends_with('\n') {
+        moved.push('\n');
+    }
+    let src_target = TargetKey::Heading(src_i);
+    let dest_target = dest_idx.map_or(TargetKey::Root, TargetKey::Heading);
+
+    Ok(vec![
+        Splice {
+            start: src_span.start,
+            end: src_span.end,
+            replacement: String::new(),
+            footprint: (src_span.start, src_span.end),
+            target: src_target,
+        },
+        Splice {
+            start: dest_pos,
+            end: dest_pos,
+            replacement: moved,
+            footprint: (dest_pos, dest_pos),
+            target: dest_target,
+        },
+    ])
 }
 
 /// The `(start, end)` of a target's whole section (heading line included for a
@@ -308,6 +386,9 @@ fn detect_overlaps(splices: &[(usize, Splice)], errors: &mut Vec<BatchError>) {
     let mut conflict = vec![false; n];
     for i in 0..n {
         for j in (i + 1)..n {
+            if splices[i].0 == splices[j].0 {
+                continue; // two splices of one edit (e.g. move) never self-conflict
+            }
             let a = &splices[i].1;
             let b = &splices[j].1;
             let same_target = a.target == b.target;
@@ -439,6 +520,57 @@ mod tests {
             ..edit(&["Old"], Operation::Rename)
         };
         assert_eq!(apply(src, vec![e]), "# New\nbody\n## Sub\n");
+    }
+
+    #[test]
+    fn move_section_before_another() {
+        let src = "# A\nax\n# B\nbx\n# C\ncx\n";
+        let e = Edit {
+            operation: Some(Operation::Move),
+            heading_path: vec!["C".into()],
+            destination: Some(Destination {
+                heading_path: vec!["A".into()],
+                occurrence: None,
+                position: Position::Before,
+            }),
+            ..Edit::default()
+        };
+        assert_eq!(apply(src, vec![e]), "# C\ncx\n# A\nax\n# B\nbx\n");
+    }
+
+    #[test]
+    fn move_section_after_another() {
+        let src = "# A\nax\n# B\nbx\n";
+        let e = Edit {
+            operation: Some(Operation::Move),
+            heading_path: vec!["A".into()],
+            destination: Some(Destination {
+                heading_path: vec!["B".into()],
+                occurrence: None,
+                position: Position::After,
+            }),
+            ..Edit::default()
+        };
+        assert_eq!(apply(src, vec![e]), "# B\nbx\n# A\nax\n");
+    }
+
+    #[test]
+    fn move_into_own_subtree_is_rejected() {
+        let src = "# A\nlead\n## B\nsub\n";
+        let e = Edit {
+            operation: Some(Operation::Move),
+            heading_path: vec!["A".into()],
+            destination: Some(Destination {
+                heading_path: vec!["A".into(), "B".into()],
+                occurrence: None,
+                position: Position::After,
+            }),
+            ..Edit::default()
+        };
+        assert_eq!(
+            patch_sections(src, &[e]).unwrap_err()[0].error.code,
+            Code::Overlap
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@ pub mod vault;
 
 pub use document::{Document, Heading, OutlineEntry};
 pub use error::{Code, Error, Result};
-pub use patch::{Edit, Operation, patch_sections};
+pub use patch::{Destination, Edit, Operation, Position, patch_sections};
 pub use section::Scope;
 pub use transaction::{Op, OpOutcome};
 pub use vault::Vault;
