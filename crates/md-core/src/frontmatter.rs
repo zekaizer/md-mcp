@@ -39,6 +39,21 @@ pub fn parse(source: &str) -> Result<Option<Value>> {
     Ok(Some(value))
 }
 
+/// Build a note from a frontmatter value and a body. An empty/null frontmatter
+/// yields just the body; otherwise a `---`…`---` block is prepended.
+pub fn with_frontmatter(body: &str, fm: &Value) -> Result<String> {
+    let is_empty = fm.is_null() || fm.as_object().is_some_and(serde_json::Map::is_empty);
+    if is_empty {
+        return Ok(body.to_string());
+    }
+    let mut yaml = serde_saphyr::to_string(fm)
+        .map_err(|e| Error::io(format!("serialize frontmatter: {e}")))?;
+    if !yaml.ends_with('\n') {
+        yaml.push('\n');
+    }
+    Ok(format!("---\n{yaml}---\n{body}"))
+}
+
 /// Whether the frontmatter has a top-level `key` (NFC-compared).
 pub fn has_property(source: &str, key: &str) -> Result<bool> {
     Ok(parse(source)?
@@ -361,6 +376,26 @@ mod tests {
     fn remove_absent_key_is_noop() {
         let src = "---\na: 1\n---\nbody\n";
         assert_eq!(remove_property(src, "nope").unwrap(), src);
+    }
+
+    // --- with_frontmatter ---------------------------------------------------
+
+    #[test]
+    fn with_frontmatter_builds_block_or_passes_body() {
+        let out = with_frontmatter("# Body\n", &json!({ "title": "T", "n": 1 })).unwrap();
+        assert!(out.starts_with("---\n") && out.ends_with("---\n# Body\n"));
+        let v = parse(&out).unwrap().unwrap();
+        assert_eq!(v["title"], json!("T"));
+        assert_eq!(v["n"], json!(1));
+        // empty / null frontmatter yields just the body.
+        assert_eq!(
+            with_frontmatter("# Body\n", &json!({})).unwrap(),
+            "# Body\n"
+        );
+        assert_eq!(
+            with_frontmatter("# Body\n", &Value::Null).unwrap(),
+            "# Body\n"
+        );
     }
 
     // --- has_property -------------------------------------------------------
