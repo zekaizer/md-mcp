@@ -5,11 +5,14 @@
 //! concurrently.
 
 pub mod config;
+pub mod envelope;
+pub mod tools_read;
 
 use std::sync::Arc;
 
 use md_core::Vault;
-use rmcp::{ServerHandler, tool_handler, tool_router};
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::{ServerHandler, tool_handler};
 use tokio::sync::RwLock;
 
 /// The MCP server handler. Cheap to clone (shared `Arc`s).
@@ -43,9 +46,11 @@ impl MdServer {
     }
 }
 
-#[tool_router]
 impl MdServer {
-    // Tools are added per family in later changes.
+    /// The composed tool router across all tool families.
+    pub(crate) fn tool_router() -> ToolRouter<Self> {
+        Self::read_router()
+    }
 }
 
 #[tool_handler(
