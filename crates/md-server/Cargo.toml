@@ -23,3 +23,5 @@ anyhow.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Enable rmcp's client side for the in-process end-to-end protocol test only.
+rmcp = { workspace = true, features = ["client"] }
