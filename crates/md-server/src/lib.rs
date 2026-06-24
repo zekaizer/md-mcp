@@ -7,6 +7,7 @@
 pub mod config;
 pub mod envelope;
 pub mod tools_read;
+pub mod tools_write;
 
 use std::sync::Arc;
 
@@ -49,7 +50,7 @@ impl MdServer {
 impl MdServer {
     /// The composed tool router across all tool families.
     pub(crate) fn tool_router() -> ToolRouter<Self> {
-        Self::read_router()
+        Self::read_router() + Self::write_router()
     }
 }
 
