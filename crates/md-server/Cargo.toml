@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 md-core.workspace = true
+aho-corasick.workspace = true
 rmcp = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
