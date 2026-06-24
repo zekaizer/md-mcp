@@ -12,5 +12,9 @@ workspace = true
 
 [dependencies]
 unicode-normalization.workspace = true
+cap-std.workspace = true
+cap-tempfile.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true

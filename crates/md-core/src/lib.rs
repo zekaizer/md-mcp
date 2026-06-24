@@ -6,4 +6,9 @@
 //! can be unit-tested without a runtime; the server crate wires these into MCP
 //! tools.
 
+pub mod error;
 pub mod text;
+pub mod vault;
+
+pub use error::{Code, Error, Result};
+pub use vault::Vault;
