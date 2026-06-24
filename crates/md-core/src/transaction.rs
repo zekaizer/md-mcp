@@ -303,14 +303,20 @@ impl Vault {
                     trash: backup,
                     path,
                 } => {
-                    !self.dir().exists(backup)
-                        || (self.ensure_parent(path).is_ok()
-                            && self.dir().rename(backup, self.dir(), path).is_ok())
+                    if self.dir().exists(backup) {
+                        self.ensure_parent(path).is_ok()
+                            && self.dir().rename(backup, self.dir(), path).is_ok()
+                    } else {
+                        true // nothing to restore (mutation never happened)
+                    }
                 }
                 UndoStep::ReverseMove { from, to } => {
-                    !(self.dir().exists(to) && !self.dir().exists(from))
-                        || (self.ensure_parent(from).is_ok()
-                            && self.dir().rename(to, self.dir(), from).is_ok())
+                    if self.dir().exists(to) && !self.dir().exists(from) {
+                        self.ensure_parent(from).is_ok()
+                            && self.dir().rename(to, self.dir(), from).is_ok()
+                    } else {
+                        true // the move did not happen, or was already reversed
+                    }
                 }
             };
             ok &= step_ok;
