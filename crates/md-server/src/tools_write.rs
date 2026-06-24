@@ -16,10 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::MdServer;
-use crate::envelope::ApiError;
+use crate::envelope::{ApiError, batch_limit};
 use crate::tools_read::ScopeArg;
-
-const MAX_BATCH: usize = 100;
 
 /// Distinguish an omitted `value` (remove) from an explicit `null` (set null).
 fn deserialize_some<'de, D>(d: D) -> Result<Option<Value>, D::Error>
@@ -274,14 +272,6 @@ pub struct PropertyApplied {
     pub key: String,
 }
 
-fn too_many(n: usize) -> Option<ApiError> {
-    (n > MAX_BATCH).then(|| ApiError {
-        code: "BATCH_COLLISION".to_string(),
-        message: format!("batch of {n} exceeds the limit of {MAX_BATCH}"),
-        index: None,
-    })
-}
-
 #[tool_router(router = write_router, vis = "pub(crate)")]
 impl MdServer {
     /// Create new notes (refusing to overwrite unless `overwrite` is set).
@@ -292,6 +282,7 @@ impl MdServer {
         &self,
         Parameters(req): Parameters<CreateNotesRequest>,
     ) -> Result<Json<CreateNotesResponse>, ErrorData> {
+        batch_limit(req.notes.len())?;
         let _guard = self.lock().write().await;
         let created = req
             .notes
@@ -328,6 +319,7 @@ impl MdServer {
         &self,
         Parameters(req): Parameters<AppendNotesRequest>,
     ) -> Result<Json<AppendNotesResponse>, ErrorData> {
+        batch_limit(req.appends.len())?;
         let _guard = self.lock().write().await;
         let mut appended = Vec::with_capacity(req.appends.len());
         for item in &req.appends {
@@ -344,6 +336,7 @@ impl MdServer {
         &self,
         Parameters(req): Parameters<EditSectionsRequest>,
     ) -> Result<Json<EditSectionsResponse>, ErrorData> {
+        batch_limit(req.edits.len())?;
         let _guard = self.lock().write().await;
         Ok(Json(self.run_edit_sections(&req.edits)))
     }
@@ -356,6 +349,7 @@ impl MdServer {
         &self,
         Parameters(req): Parameters<EditPropertiesRequest>,
     ) -> Result<Json<EditPropertiesResponse>, ErrorData> {
+        batch_limit(req.edits.len())?;
         let _guard = self.lock().write().await;
         Ok(Json(self.run_edit_properties(&req.edits)))
     }
@@ -402,14 +396,6 @@ impl MdServer {
     }
 
     fn run_edit_sections(&self, edits: &[EditItem]) -> EditSectionsResponse {
-        if let Some(e) = too_many(edits.len()) {
-            return EditSectionsResponse {
-                ok: false,
-                applied: vec![],
-                errors: vec![e],
-            };
-        }
-
         // Group edits by path, keeping each edit's global index.
         let mut by_path: BTreeMap<&str, Vec<(usize, &EditItem)>> = BTreeMap::new();
         for (i, e) in edits.iter().enumerate() {
@@ -495,14 +481,6 @@ impl MdServer {
     }
 
     fn run_edit_properties(&self, edits: &[PropertyEdit]) -> EditPropertiesResponse {
-        if let Some(e) = too_many(edits.len()) {
-            return EditPropertiesResponse {
-                ok: false,
-                applied: vec![],
-                errors: vec![e],
-            };
-        }
-
         // Apply per path in order, accumulating into one new content per path.
         let mut by_path: BTreeMap<&str, Vec<(usize, &PropertyEdit)>> = BTreeMap::new();
         for (i, e) in edits.iter().enumerate() {
@@ -599,6 +577,26 @@ mod tests {
             vault.write_atomic(p, b.as_bytes()).unwrap();
         }
         (dir, MdServer::new(vault))
+    }
+
+    #[tokio::test]
+    async fn batch_over_100_is_rejected() {
+        let (_d, s) = server(&[]);
+        let notes: Vec<NoteInput> = (0..101)
+            .map(|i| NoteInput {
+                path: format!("n{i}.md"),
+                content: "x".into(),
+                frontmatter: None,
+            })
+            .collect();
+        let result = s
+            .create_notes(Parameters(CreateNotesRequest {
+                notes,
+                overwrite: false,
+            }))
+            .await;
+        let err = result.err().expect("over-limit batch must be rejected");
+        assert!(format!("{err:?}").contains("exceeds"), "got: {err:?}");
     }
 
     #[tokio::test]

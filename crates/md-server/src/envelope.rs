@@ -1,7 +1,24 @@
 //! Shared structured-output types: the error shape every tool reports.
 
+use rmcp::ErrorData;
 use rmcp::schemars::JsonSchema;
 use serde::Serialize;
+
+/// The maximum number of items any batch tool accepts (server-enforced).
+pub const MAX_BATCH: usize = 100;
+
+/// Reject an over-sized batch as a protocol-level invalid-params error (a
+/// schema-class violation, not a business rejection — [tool_spec §표기 규약]).
+pub fn batch_limit(n: usize) -> Result<(), ErrorData> {
+    if n > MAX_BATCH {
+        Err(ErrorData::invalid_params(
+            format!("batch of {n} exceeds the limit of {MAX_BATCH} items"),
+            None,
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 /// A machine-readable error embedded in a tool response (per-item or per-batch).
 #[derive(Debug, Clone, Serialize, JsonSchema)]

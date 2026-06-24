@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::MdServer;
-use crate::envelope::ApiError;
+use crate::envelope::{ApiError, batch_limit};
 
 fn default_true() -> bool {
     true
@@ -302,6 +302,7 @@ impl MdServer {
         &self,
         Parameters(req): Parameters<ReadNotesRequest>,
     ) -> Result<Json<ReadNotesResponse>, ErrorData> {
+        batch_limit(req.paths.len())?;
         let _guard = self.lock().read().await;
         let notes = req
             .paths
@@ -319,6 +320,7 @@ impl MdServer {
         &self,
         Parameters(req): Parameters<ReadOutlinesRequest>,
     ) -> Result<Json<ReadOutlinesResponse>, ErrorData> {
+        batch_limit(req.paths.len())?;
         let _guard = self.lock().read().await;
         let outlines = req
             .paths
@@ -336,6 +338,7 @@ impl MdServer {
         &self,
         Parameters(req): Parameters<ReadSectionsRequest>,
     ) -> Result<Json<ReadSectionsResponse>, ErrorData> {
+        batch_limit(req.targets.len())?;
         let _guard = self.lock().read().await;
         let sections = req
             .targets

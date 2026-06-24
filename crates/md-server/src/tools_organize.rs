@@ -12,9 +12,7 @@ use rmcp::{ErrorData, tool, tool_router};
 use serde::{Deserialize, Serialize};
 
 use crate::MdServer;
-use crate::envelope::ApiError;
-
-const MAX_BATCH: usize = 100;
+use crate::envelope::{ApiError, batch_limit};
 
 // --- path helpers -----------------------------------------------------------
 
@@ -57,14 +55,6 @@ fn err(index: usize, code: Code, message: impl Into<String>) -> ApiError {
         message: message.into(),
         index: Some(index),
     }
-}
-
-fn too_many(n: usize) -> Option<ApiError> {
-    (n > MAX_BATCH).then(|| ApiError {
-        code: Code::BatchCollision.as_str().to_string(),
-        message: format!("batch of {n} exceeds the limit of {MAX_BATCH}"),
-        index: None,
-    })
 }
 
 /// Reject in-batch source/dest collisions and source overlap among move pairs.
@@ -181,6 +171,7 @@ impl MdServer {
         &self,
         Parameters(req): Parameters<DeleteNotesRequest>,
     ) -> Result<Json<DeleteNotesResponse>, ErrorData> {
+        batch_limit(req.paths.len())?;
         let _guard = self.lock().write().await;
         Ok(Json(self.run_delete(&req.paths)))
     }
@@ -193,6 +184,7 @@ impl MdServer {
         &self,
         Parameters(req): Parameters<RenameNotesRequest>,
     ) -> Result<Json<MoveResponse>, ErrorData> {
+        batch_limit(req.renames.len())?;
         let _guard = self.lock().write().await;
         Ok(Json(self.run_rename(&req.renames, req.overwrite)))
     }
@@ -205,6 +197,7 @@ impl MdServer {
         &self,
         Parameters(req): Parameters<RelocateNotesRequest>,
     ) -> Result<Json<MoveResponse>, ErrorData> {
+        batch_limit(req.moves.len())?;
         let _guard = self.lock().write().await;
         Ok(Json(self.run_relocate(&req.moves, req.overwrite)))
     }
@@ -212,13 +205,6 @@ impl MdServer {
 
 impl MdServer {
     fn run_delete(&self, paths: &[String]) -> DeleteNotesResponse {
-        if let Some(e) = too_many(paths.len()) {
-            return DeleteNotesResponse {
-                ok: false,
-                deleted: vec![],
-                errors: vec![e],
-            };
-        }
         let mut errors = Vec::new();
         for (i, p) in paths.iter().enumerate() {
             if let Err(e) = Vault::validate_rel(p) {
@@ -284,13 +270,6 @@ impl MdServer {
     }
 
     fn run_rename(&self, renames: &[RenameItem], overwrite: bool) -> MoveResponse {
-        if let Some(e) = too_many(renames.len()) {
-            return MoveResponse {
-                ok: false,
-                moved: vec![],
-                errors: vec![e],
-            };
-        }
         let mut errors = Vec::new();
         let mut pairs: Vec<(usize, String, String)> = Vec::new();
 
@@ -316,13 +295,6 @@ impl MdServer {
     }
 
     fn run_relocate(&self, moves: &[RelocateItem], overwrite: bool) -> MoveResponse {
-        if let Some(e) = too_many(moves.len()) {
-            return MoveResponse {
-                ok: false,
-                moved: vec![],
-                errors: vec![e],
-            };
-        }
         let mut errors = Vec::new();
         let mut pairs: Vec<(usize, String, String)> = Vec::new();
 
