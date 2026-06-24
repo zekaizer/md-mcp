@@ -98,10 +98,13 @@ pub fn remove_property(source: &str, key: &str) -> Result<String> {
     if !remove_key(&mut lines, key) {
         return Ok(source.to_string());
     }
-    if lines.iter().all(|l| l.trim().is_empty()) {
-        return Ok(source[span.end..].to_string());
-    }
-    Ok(rebuild(source, span, &lines))
+    let result = if lines.iter().all(|l| l.trim().is_empty()) {
+        source[span.end..].to_string()
+    } else {
+        rebuild(source, span, &lines)
+    };
+    verify_remove(source, &result, key)?;
+    Ok(result)
 }
 
 // --- internals --------------------------------------------------------------
@@ -189,27 +192,51 @@ fn is_top_level_key(line: &str, key: &str) -> bool {
     if line.starts_with([' ', '\t']) || line.starts_with('-') {
         return false;
     }
+    // A quoted key may itself contain a colon, so find the colon after the
+    // closing quote rather than the first colon on the line.
+    if let Some(quote) = line.chars().next().filter(|c| *c == '"' || *c == '\'') {
+        if let Some(close) = line[1..].find(quote) {
+            let token = &line[1..=close];
+            let after = line[close + 2..].trim_start();
+            return after.starts_with(':') && nfc(token) == nfc(key);
+        }
+        return false;
+    }
     let Some(colon) = line.find(':') else {
         return false;
     };
-    let token = line[..colon].trim();
-    let token = token
-        .strip_prefix('"')
-        .and_then(|t| t.strip_suffix('"'))
-        .or_else(|| token.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')))
-        .unwrap_or(token);
-    nfc(token) == nfc(key)
+    nfc(line[..colon].trim()) == nfc(key)
 }
 
 /// The `[start, end)` line range a top-level key occupies (its line + value
-/// continuations).
+/// continuations), tolerating blank lines *inside* a block value (a block list or
+/// block scalar) while still treating a blank line before the next key as the
+/// terminator.
 fn key_extent(lines: &[String], key: &str) -> Option<(usize, usize)> {
     let start = lines.iter().position(|l| is_top_level_key(l, key))?;
     let mut end = start + 1;
-    while end < lines.len() && is_continuation(&lines[end]) {
-        end += 1;
+    while end < lines.len() {
+        if is_continuation(&lines[end]) {
+            end += 1;
+        } else if lines[end].trim().is_empty() && next_nonblank_is_continuation(&lines[end + 1..]) {
+            end += 1; // interior blank line within the value
+        } else {
+            break; // a new top-level key, or a trailing blank before one
+        }
+    }
+    // Trailing blank lines are a separator, not part of the value.
+    while end > start + 1 && lines[end - 1].trim().is_empty() {
+        end -= 1;
     }
     Some((start, end))
+}
+
+/// Whether the first non-blank line is a value continuation (vs a new key).
+fn next_nonblank_is_continuation(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| is_continuation(l))
 }
 
 fn replace_or_append(lines: &mut Vec<String>, key: &str, emitted: &[String]) {
@@ -241,6 +268,28 @@ fn verify_set(result: &str, key: &str, value: &Value) -> Result<()> {
     } else {
         Err(Error::io(format!(
             "frontmatter write invariant failed for key {key}"
+        )))
+    }
+}
+
+/// After a remove, confirm the key is gone and every other key round-trips.
+fn verify_remove(original: &str, result: &str, key: &str) -> Result<()> {
+    let mut expected = parse(original)?
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    expected.retain(|k, _| nfc(k) != nfc(key));
+    let after = parse(result)?
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if after == expected {
+        Ok(())
+    } else {
+        Err(Error::io(format!(
+            "frontmatter remove invariant failed for key {key}"
         )))
     }
 }
@@ -396,6 +445,35 @@ mod tests {
             with_frontmatter("# Body\n", &Value::Null).unwrap(),
             "# Body\n"
         );
+    }
+
+    // --- block values spanning blank lines ----------------------------------
+
+    #[test]
+    fn remove_key_with_block_scalar_spanning_blank_line() {
+        let src = "---\ndesc: |\n  line1\n\n  line2\nstatus: draft\n---\nbody\n";
+        let out = remove_property(src, "desc").unwrap();
+        let v = parse(&out).unwrap().unwrap();
+        assert!(v.as_object().unwrap().get("desc").is_none());
+        assert_eq!(v["status"], json!("draft"));
+        assert!(out.ends_with("---\nbody\n"));
+    }
+
+    #[test]
+    fn set_key_whose_old_value_spanned_blank_line() {
+        let src = "---\ntags:\n  - a\n\n  - b\nkeep: 1\n---\nbody\n";
+        let out = set_property(src, "tags", &json!(["x"])).unwrap();
+        assert_eq!(parse(&out).unwrap().unwrap()["tags"], json!(["x"]));
+        assert_eq!(parse(&out).unwrap().unwrap()["keep"], json!(1));
+    }
+
+    #[test]
+    fn quoted_key_with_colon_is_editable() {
+        let src = "---\n\"a:b\": old\nx: 1\n---\n";
+        let out = set_property(src, "a:b", &json!("new")).unwrap();
+        let v = parse(&out).unwrap().unwrap();
+        assert_eq!(v["a:b"], json!("new"));
+        assert_eq!(v["x"], json!(1));
     }
 
     // --- has_property -------------------------------------------------------
