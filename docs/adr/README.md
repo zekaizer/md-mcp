@@ -12,5 +12,6 @@ immutable; a changed decision supersedes the old one with a new ADR.
 - [0001](0001-record-architecture-decisions.md) — Record architecture decisions
 - [0002](0002-implementation-language-and-stack.md) — Implementation language, runtime, MCP transport, and core libraries
 - [0003](0003-document-parser-and-section-model.md) — Document parser and section model
+- [0004](0004-frontmatter-parse-and-typed-splice.md) — Frontmatter: typed parse and byte-preserving splice
 - [0005](0005-content-hash.md) — Per-section content hash
 - [0006](0006-vault-path-jail-and-atomic-write.md) — Vault path jail and atomic write
