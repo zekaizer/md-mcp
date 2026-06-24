@@ -1,0 +1,69 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+authors = ["Luke Lee"]
+
+[workspace.dependencies]
+# Internal
+md-core = { path = "crates/md-core" }
+
+# MCP server (stdio transport only — no HTTP/axum). See ADR-0002.
+rmcp = { version = "1.8", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }
+
+# Serialization & schema
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# YAML frontmatter: parse/validate only (writes are a byte-preserving hand-rolled
+# splice — see ADR-0004). serde_yaml is deprecated; serde-saphyr is the modern,
+# actively-maintained YAML-1.2 deserializer. Pinned because it is pre-1.0.
+serde-saphyr = "=0.0.28"
+
+# Hashing for content_hash (ADR-0005)
+blake3 = "1"
+
+# Vault path jail (TOCTOU-free, openat2 RESOLVE_BENEATH) + atomic writes (ADR-0006)
+cap-std = "4"
+cap-tempfile = "4"
+
+# Glob filter for list_notes
+globset = "0.4"
+
+# Search: linear scan with a multi-keyword automaton (ADR-0010)
+aho-corasick = "1"
+memchr = "2"
+
+# Unicode NFC normalization for path / heading comparison
+unicode-normalization = "0.1"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Async runtime + logging (server only)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Dev / test / bench
+criterion = "0.8"
+tempfile = "3"
+insta = "1"
+proptest = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+
+# 0.y development phase: optimize release builds, keep dev fast.
+[profile.release]
+lto = "thin"
+strip = true

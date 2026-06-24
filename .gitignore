@@ -1,0 +1,10 @@
+# Rust build artifacts
+/target/
+
+# Local, environment-specific, or machine-specific state (never committed).
+# Benchmark results are written here during verification.
+/.local/
+
+# Editor / OS noise
+**/*.rs.bk
+.DS_Store
