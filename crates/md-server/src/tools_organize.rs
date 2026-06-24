@@ -353,6 +353,27 @@ impl MdServer {
         if !is_dir_path(&m.dest_dir) {
             return Err(Error::new(Code::DestNotDir, "dest_dir must end with '/'"));
         }
+        // Reject if dest_dir, or any of its existing ancestors, is occupied by a
+        // non-directory — so the failure is an indexed validation rejection, not
+        // a late create_dir_all IO error at commit time.
+        let dest = strip_slash(&m.dest_dir);
+        let mut prefix = String::new();
+        for seg in dest.split('/').filter(|s| !s.is_empty()) {
+            prefix = if prefix.is_empty() {
+                seg.to_string()
+            } else {
+                format!("{prefix}/{seg}")
+            };
+            if self.vault().exists(&prefix).unwrap_or(false)
+                && !self.vault().is_dir(&prefix).unwrap_or(false)
+            {
+                return Err(Error::new(
+                    Code::DestNotDir,
+                    format!("dest_dir path is occupied by a non-directory: {prefix}"),
+                ));
+            }
+        }
+
         let is_dir = is_dir_path(&m.source);
         let to = format!(
             "{}{}{}",
@@ -506,6 +527,26 @@ mod tests {
         assert!(ok.ok);
         assert_eq!(ok.moved[0].to, "archive/a.md");
         assert!(s.vault().exists("archive/a.md").unwrap());
+    }
+
+    #[tokio::test]
+    async fn relocate_into_a_file_occupied_dest_is_rejected_with_index() {
+        let (_d, s) = server(&[("a.md", "x"), ("archive", "i am a file")]);
+        let resp = s
+            .relocate_notes(Parameters(RelocateNotesRequest {
+                moves: vec![RelocateItem {
+                    source: "a.md".into(),
+                    dest_dir: "archive/".into(),
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!resp.ok);
+        assert_eq!(resp.errors[0].code, "DEST_NOT_DIR");
+        assert_eq!(resp.errors[0].index, Some(0));
+        assert!(s.vault().exists("a.md").unwrap());
     }
 
     #[tokio::test]

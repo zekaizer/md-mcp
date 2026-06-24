@@ -124,6 +124,16 @@ impl Vault {
         Ok(self.root.exists(clean))
     }
 
+    /// Whether `rel` exists and is a directory.
+    pub fn is_dir(&self, rel: &str) -> Result<bool> {
+        let clean = Self::validate_rel(rel)?;
+        Ok(self
+            .root
+            .metadata(clean)
+            .map(|m| m.is_dir())
+            .unwrap_or(false))
+    }
+
     /// Read a note's raw text (as stored on disk, UTF-8). The internal state
     /// directory is hidden — reading inside it reports the note as absent.
     pub fn read_note(&self, rel: &str) -> Result<String> {

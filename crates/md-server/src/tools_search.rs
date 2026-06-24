@@ -127,20 +127,15 @@ impl MdServer {
     ) -> Result<Json<ListNotesResponse>, ErrorData> {
         let _guard = self.lock().read().await;
         let limit = req.limit.clamp(1, 1000);
-        let entries = match self.vault().list_entries(
-            &req.directory,
-            req.recursive,
-            req.glob.as_deref(),
-            req.include_dirs,
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                return Ok(Json(ListNotesResponse {
-                    items: vec![],
-                    next_cursor: Some(format!("error: {}", e.message)),
-                }));
-            }
-        };
+        let entries = self
+            .vault()
+            .list_entries(
+                &req.directory,
+                req.recursive,
+                req.glob.as_deref(),
+                req.include_dirs,
+            )
+            .map_err(|e| ErrorData::invalid_params(e.message.clone(), None))?;
 
         let after = req.cursor.unwrap_or_default();
         let filtered: Vec<_> = entries
@@ -168,6 +163,13 @@ impl MdServer {
         &self,
         Parameters(req): Parameters<SearchNotesRequest>,
     ) -> Result<Json<SearchNotesResponse>, ErrorData> {
+        let has_query = req.query.as_deref().is_some_and(|q| !q.trim().is_empty());
+        if !has_query && req.frontmatter.is_none() && req.frontmatter_exists.is_none() {
+            return Err(ErrorData::invalid_params(
+                "provide at least one of query, frontmatter, or frontmatter_exists",
+                None,
+            ));
+        }
         let _guard = self.lock().read().await;
         Ok(Json(self.run_search(&req)))
     }
@@ -177,12 +179,9 @@ impl MdServer {
     fn run_search(&self, req: &SearchNotesRequest) -> SearchNotesResponse {
         let has_query = req.query.as_deref().is_some_and(|q| !q.trim().is_empty());
         if !has_query && req.frontmatter.is_none() && req.frontmatter_exists.is_none() {
-            // Surface the misuse as an empty result with a sentinel cursor.
             return SearchNotesResponse {
                 items: vec![],
-                next_cursor: Some(
-                    "error: provide query, frontmatter, or frontmatter_exists".into(),
-                ),
+                next_cursor: None,
             };
         }
         let limit = req.limit.clamp(1, 100);
@@ -474,12 +473,10 @@ mod tests {
     #[tokio::test]
     async fn search_requires_a_criterion() {
         let (_d, s) = server(&[("a.md", "x")]);
-        let r = s
-            .search_notes(Parameters(search_req(None)))
-            .await
-            .unwrap()
-            .0;
-        assert!(r.items.is_empty());
-        assert!(r.next_cursor.unwrap().starts_with("error:"));
+        let result = s.search_notes(Parameters(search_req(None))).await;
+        assert!(
+            result.is_err(),
+            "missing criterion must be a protocol error"
+        );
     }
 }

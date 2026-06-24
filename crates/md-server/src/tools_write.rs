@@ -209,26 +209,45 @@ fn to_core_edit(item: &EditItem) -> Result<md_core::Edit, ApiError> {
     })
 }
 
-/// Post-edit content_hash and (for rename) new heading path, best-effort.
+/// Post-edit content_hash and the resulting heading path (for rename/move),
+/// best-effort. `occ` is the occurrence to resolve the post-edit path by.
 fn edit_outcome(new_source: &str, item: &EditItem) -> (Option<Vec<String>>, Option<String>) {
     let doc = Document::parse(new_source);
-    let (path, scope, new_path) = match item.operation {
+    let (path, scope, new_path, occ) = match item.operation {
         OperationArg::Rename => {
             let mut p = item.heading_path.clone();
             if let (Some(last), Some(nh)) = (p.last_mut(), item.new_heading.as_ref()) {
                 *last = nh.clone();
             }
-            (p.clone(), Scope::Section, Some(p))
+            (p.clone(), Scope::Section, Some(p), item.occurrence)
         }
-        OperationArg::Replace | OperationArg::Append | OperationArg::Delete => {
-            (item.heading_path.clone(), item.scope.into(), None)
+        OperationArg::Move => {
+            // The moved section keeps its own heading text; it becomes a sibling
+            // of the destination anchor (or a top-level section at the root).
+            let (Some(dest), Some(leaf)) = (item.destination.as_ref(), item.heading_path.last())
+            else {
+                return (None, None);
+            };
+            let mut p = dest.heading_path.clone();
+            if p.is_empty() {
+                p.push(leaf.clone());
+            } else {
+                *p.last_mut().expect("non-empty") = leaf.clone();
+            }
+            (p.clone(), Scope::Section, Some(p), None)
         }
+        OperationArg::Replace | OperationArg::Append | OperationArg::Delete => (
+            item.heading_path.clone(),
+            item.scope.into(),
+            None,
+            item.occurrence,
+        ),
         _ => return (None, None),
     };
     let idx = if path.is_empty() {
         Some(None)
     } else {
-        doc.resolve_heading(&path, item.occurrence).ok().map(Some)
+        doc.resolve_heading(&path, occ).ok().map(Some)
     };
     (
         new_path,
@@ -766,6 +785,12 @@ mod tests {
             .0;
         assert!(ok_or_dump(&resp));
         assert_eq!(s.vault().read_note("a.md").unwrap(), "# B\nbx\n# A\nax\n");
+        // The move echoes the section's new heading path and content_hash.
+        assert_eq!(
+            resp.applied[0].new_heading_path,
+            Some(vec!["A".to_string()])
+        );
+        assert!(resp.applied[0].content_hash.is_some());
     }
 
     fn ok_or_dump(r: &EditSectionsResponse) -> bool {

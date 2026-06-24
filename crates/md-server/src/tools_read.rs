@@ -242,6 +242,9 @@ pub struct SectionRead {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+    /// Why the heading path did not resolve (e.g. `AMBIGUOUS` vs `NOT_FOUND`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ApiError>,
 }
 
 fn read_one_section(vault: &Vault, t: &SectionTarget) -> SectionRead {
@@ -254,6 +257,7 @@ fn read_one_section(vault: &Vault, t: &SectionTarget) -> SectionRead {
         found: false,
         content: None,
         content_hash: None,
+        error: None,
     };
 
     let Ok(raw) = vault.read_note(&t.path) else {
@@ -262,17 +266,16 @@ fn read_one_section(vault: &Vault, t: &SectionTarget) -> SectionRead {
     let normalized = md_core::text::normalize_newlines(&raw).into_owned();
     let doc = Document::parse(&normalized);
 
-    // `Some(None)` = the root; `Some(Some(i))` = a resolved heading; `None` = not found.
-    let resolved: Option<Option<usize>> = if t.heading_path.is_empty() {
-        Some(None)
+    // `Ok(None)` = the root; `Ok(Some(i))` = a resolved heading; `Err` keeps the
+    // reason (AMBIGUOUS vs NOT_FOUND), which the spec separates.
+    let resolved = if t.heading_path.is_empty() {
+        Ok(None)
     } else {
-        doc.resolve_heading(&t.heading_path, t.occurrence)
-            .ok()
-            .map(Some)
+        doc.resolve_heading(&t.heading_path, t.occurrence).map(Some)
     };
 
     match resolved {
-        Some(idx) => {
+        Ok(idx) => {
             let scope: Scope = t.scope.into();
             let content = doc.section_content(&normalized, idx, scope).to_string();
             let hash = doc.content_hash(&normalized, idx, scope);
@@ -284,9 +287,10 @@ fn read_one_section(vault: &Vault, t: &SectionTarget) -> SectionRead {
                 ..base
             }
         }
-        None => SectionRead {
+        Err(e) => SectionRead {
             note_exists: true,
             found: false,
+            error: Some(ApiError::from_core(&e)),
             ..base
         },
     }
@@ -431,6 +435,20 @@ mod tests {
         };
         let s2 = read_one_section(&v, &missing);
         assert!(!s2.note_exists && !s2.found);
+    }
+
+    #[test]
+    fn section_ambiguous_is_reported_distinctly() {
+        let (_d, v) = vault_with(&[("s.md", "# A\n# A\n")]);
+        let t = SectionTarget {
+            path: "s.md".into(),
+            heading_path: vec!["A".into()],
+            occurrence: None,
+            scope: ScopeArg::Section,
+        };
+        let s = read_one_section(&v, &t);
+        assert!(s.note_exists && !s.found);
+        assert_eq!(s.error.unwrap().code, "AMBIGUOUS");
     }
 
     #[tokio::test]
