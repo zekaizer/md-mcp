@@ -11,3 +11,4 @@ immutable; a changed decision supersedes the old one with a new ADR.
 
 - [0001](0001-record-architecture-decisions.md) — Record architecture decisions
 - [0002](0002-implementation-language-and-stack.md) — Implementation language, runtime, MCP transport, and core libraries
+- [0006](0006-vault-path-jail-and-atomic-write.md) — Vault path jail and atomic write
