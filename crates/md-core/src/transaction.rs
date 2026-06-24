@@ -70,6 +70,21 @@ fn strip_slash(path: &str) -> &str {
 impl Vault {
     /// Apply a batch of ops atomically. On any failure nothing is left changed.
     pub fn commit_batch(&self, ops: &[Op]) -> Result<Vec<OpOutcome>> {
+        // Agent ops may never target the internal `.md-mcp/` state directory.
+        for op in ops {
+            let paths: Vec<&str> = match op {
+                Op::Write { path, .. } | Op::Delete { path } => vec![path.as_str()],
+                Op::Move { from, to } => vec![from.as_str(), to.as_str()],
+            };
+            for p in paths {
+                if Self::is_internal_path(p) {
+                    return Err(Error::traversal(format!(
+                        "cannot target the internal state directory: {p}"
+                    )));
+                }
+            }
+        }
+
         let batch_id = new_batch_id();
         let journal_path = format!("{JOURNAL_DIR}/{batch_id}.json");
         let mut journal = Journal {
@@ -375,6 +390,38 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, crate::error::Code::NotFound);
         assert!(!vault.exists("created.md").unwrap());
+    }
+
+    #[test]
+    fn commit_batch_refuses_internal_state_paths() {
+        let (_d, vault) = temp_vault();
+        vault.write_atomic("a.md", b"x").unwrap();
+        // Provoke the internal dir.
+        vault
+            .commit_batch(&[Op::Delete {
+                path: "a.md".into(),
+            }])
+            .unwrap();
+        vault.write_atomic("b.md", b"y").unwrap();
+
+        for op in [
+            Op::Write {
+                path: ".md-mcp/journal/x.json".into(),
+                content: b"!".to_vec(),
+            },
+            Op::Delete {
+                path: ".md-mcp/trash/a.md".into(),
+            },
+            Op::Move {
+                from: "b.md".into(),
+                to: ".md-mcp/evil.md".into(),
+            },
+        ] {
+            let e = vault.commit_batch(&[op]).unwrap_err();
+            assert_eq!(e.code, crate::error::Code::Traversal);
+        }
+        // b.md was not moved into the internal dir.
+        assert!(vault.exists("b.md").unwrap());
     }
 
     #[test]

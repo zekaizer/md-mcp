@@ -15,6 +15,9 @@ use cap_tempfile::TempFile;
 
 use crate::error::{Error, Result};
 
+/// The server's internal state directory, off-limits to agent note operations.
+pub(crate) const INTERNAL_DIR: &str = ".md-mcp";
+
 /// A capability-jailed handle to a vault root directory.
 pub struct Vault {
     root: Dir,
@@ -82,15 +85,41 @@ impl Vault {
         Ok(clean.to_string())
     }
 
+    /// Whether `rel` targets the server's internal state directory (`.md-mcp/`),
+    /// which agent-facing note operations must not touch.
+    #[must_use]
+    pub fn is_internal_path(rel: &str) -> bool {
+        match Self::validate_rel(rel) {
+            Ok(clean) => clean == INTERNAL_DIR || clean.starts_with(&format!("{INTERNAL_DIR}/")),
+            Err(_) => false,
+        }
+    }
+
+    /// Validate an agent-supplied note path: traversal-safe and not inside the
+    /// internal `.md-mcp/` state directory.
+    pub fn validate_note_rel(rel: &str) -> Result<String> {
+        let clean = Self::validate_rel(rel)?;
+        if clean == INTERNAL_DIR || clean.starts_with(&format!("{INTERNAL_DIR}/")) {
+            return Err(Error::traversal(format!(
+                "cannot target the internal state directory: {rel}"
+            )));
+        }
+        Ok(clean)
+    }
+
     /// Whether a note or directory exists at `rel`.
     pub fn exists(&self, rel: &str) -> Result<bool> {
         let clean = Self::validate_rel(rel)?;
         Ok(self.root.exists(clean))
     }
 
-    /// Read a note's raw text (as stored on disk, UTF-8).
+    /// Read a note's raw text (as stored on disk, UTF-8). The internal state
+    /// directory is hidden — reading inside it reports the note as absent.
     pub fn read_note(&self, rel: &str) -> Result<String> {
         let clean = Self::validate_rel(rel)?;
+        if Self::is_internal_path(rel) {
+            return Err(Error::not_found(format!("note not found: {rel}")));
+        }
         self.root
             .read_to_string(&clean)
             .map_err(|e| match e.kind() {
@@ -143,7 +172,7 @@ impl Vault {
     /// `overwrite` is set. A pre-existing symlink (even dangling) counts as
     /// occupied and is refused.
     pub fn create_note(&self, rel: &str, bytes: &[u8], overwrite: bool) -> Result<()> {
-        let clean = Self::validate_rel(rel)?;
+        let clean = Self::validate_note_rel(rel)?;
         if !overwrite && self.root.symlink_metadata(&clean).is_ok() {
             return Err(Error::conflict(format!("note already exists: {rel}")));
         }
@@ -307,6 +336,40 @@ mod tests {
         vault.create_note("a.md", b"first", false).unwrap();
         vault.create_note("a.md", b"second", true).unwrap();
         assert_eq!(vault.read_note("a.md").unwrap(), "second");
+    }
+
+    // --- internal state isolation -------------------------------------------
+
+    #[test]
+    fn internal_paths_are_recognized() {
+        assert!(Vault::is_internal_path(".md-mcp"));
+        assert!(Vault::is_internal_path(".md-mcp/journal/x.json"));
+        assert!(Vault::is_internal_path("./.md-mcp/trash/a.md"));
+        assert!(!Vault::is_internal_path("notes/.md-mcp.md"));
+        assert!(!Vault::is_internal_path("a.md"));
+    }
+
+    #[test]
+    fn read_hides_internal_state() {
+        let (_v, vault) = temp_vault();
+        vault.write_atomic("a.md", b"x").unwrap();
+        // Provoke a real .md-mcp/ via a committed delete, then a backup write.
+        vault
+            .commit_batch(&[crate::Op::Delete {
+                path: "a.md".into(),
+            }])
+            .unwrap();
+        let e = vault.read_note(".md-mcp/trash/a.md").unwrap_err();
+        assert_eq!(e.code, Code::NotFound);
+    }
+
+    #[test]
+    fn create_refuses_internal_path() {
+        let (_v, vault) = temp_vault();
+        let e = vault
+            .create_note(".md-mcp/journal/evil.md", b"x", false)
+            .unwrap_err();
+        assert_eq!(e.code, Code::Traversal);
     }
 
     #[test]
