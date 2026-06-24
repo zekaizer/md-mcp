@@ -58,18 +58,12 @@ pub struct BatchError {
     pub error: Error,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TargetKey {
-    Root,
-    Heading(usize),
-}
-
 struct Splice {
     start: usize,
     end: usize,
     replacement: String,
+    /// The byte region (zero-width for insertions) used for overlap detection.
     footprint: (usize, usize),
-    target: TargetKey,
 }
 
 /// Apply a batch of section edits to LF-normalized source. All-or-nothing: on any
@@ -118,28 +112,36 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Vec<Splice>
 
     let section = section_bounds(doc, index);
     let content_span = doc.content_span(index, edit.scope);
-    let target = index.map_or(TargetKey::Root, TargetKey::Heading);
 
     match op {
         Operation::Replace => {
             let content = require_content(edit)?;
             validate_inserted_levels(content, inside_level(doc, index))?;
+            let bytes = source.as_bytes();
             let mut rep = content.to_string();
-            // Preserve line-termination: if the replaced span ended with a
-            // newline (it ran up to the next heading or a newline-terminated
-            // EOF), keep the replacement newline-terminated so it neither merges
-            // into the following heading nor drops the note's trailing newline.
-            let span_ends_nl = content_span.end > content_span.start
-                && source.as_bytes()[content_span.end - 1] == b'\n';
-            if !rep.is_empty() && !rep.ends_with('\n') && span_ends_nl {
-                rep.push('\n');
+            if !rep.is_empty() {
+                // Separate the body from the heading line above it (e.g. replacing
+                // the empty body of a heading with no trailing newline).
+                if content_span.start > 0 && bytes[content_span.start - 1] != b'\n' {
+                    rep.insert(0, '\n');
+                }
+                // Keep the replacement newline-terminated when content follows the
+                // splice (a heading/text) or when the replaced span itself ended
+                // with a newline — so it neither merges into the following heading
+                // nor drops the note's trailing newline.
+                let following_is_content =
+                    content_span.end < source.len() && bytes[content_span.end] != b'\n';
+                let span_ended_nl =
+                    content_span.end > content_span.start && bytes[content_span.end - 1] == b'\n';
+                if !rep.ends_with('\n') && (following_is_content || span_ended_nl) {
+                    rep.push('\n');
+                }
             }
             Ok(vec![Splice {
                 start: content_span.start,
                 end: content_span.end,
                 replacement: rep,
                 footprint: (content_span.start, content_span.end),
-                target,
             }])
         }
         Operation::Append => {
@@ -159,7 +161,6 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Vec<Splice>
                 end: pos,
                 replacement: rep,
                 footprint: (content_span.start, content_span.end),
-                target,
             }])
         }
         Operation::Delete => {
@@ -172,7 +173,6 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Vec<Splice>
                 end,
                 replacement: String::new(),
                 footprint: (start, end),
-                target,
             }])
         }
         Operation::InsertBefore => {
@@ -187,8 +187,7 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Vec<Splice>
                 start: pos,
                 end: pos,
                 replacement: rep,
-                footprint: (section.0, section.1),
-                target,
+                footprint: (pos, pos),
             }])
         }
         Operation::InsertAfter => {
@@ -207,8 +206,7 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Vec<Splice>
                 start: pos,
                 end: pos,
                 replacement: rep,
-                footprint: (section.0, section.1),
-                target,
+                footprint: (pos, pos),
             }])
         }
         Operation::Rename => {
@@ -235,7 +233,6 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Vec<Splice>
                 end: h.span.end,
                 replacement: rep,
                 footprint: (h.span.start, h.span.end),
-                target,
             }])
         }
         Operation::Move => resolve_move(doc, source, edit, index),
@@ -263,26 +260,29 @@ fn resolve_move(
         Some(doc.resolve_heading(&dest.heading_path, dest.occurrence)?)
     };
 
+    // Reject moving a section into itself or its own subtree, by heading
+    // ancestry — a sibling move whose destination touches the source span
+    // boundary is legitimate and must not be a false self-move.
+    if let Some(d) = dest_idx
+        && doc.is_within(d, src_i)
+    {
+        return Err(Error::new(
+            Code::Overlap,
+            "cannot move a section into its own subtree",
+        ));
+    }
+
     let src_span = doc.section_span(src_i);
     let (d_start, d_end) = section_bounds(doc, dest_idx);
     let dest_pos = match dest.position {
         Position::Before => d_start,
         Position::After => d_end,
     };
-    // Reject moving a section into its own subtree.
-    if src_span.start <= dest_pos && dest_pos <= src_span.end {
-        return Err(Error::new(
-            Code::Overlap,
-            "cannot move a section into itself",
-        ));
-    }
 
     let mut moved = src_span.of(source).to_string();
     if !moved.ends_with('\n') {
         moved.push('\n');
     }
-    let src_target = TargetKey::Heading(src_i);
-    let dest_target = dest_idx.map_or(TargetKey::Root, TargetKey::Heading);
 
     Ok(vec![
         Splice {
@@ -290,14 +290,12 @@ fn resolve_move(
             end: src_span.end,
             replacement: String::new(),
             footprint: (src_span.start, src_span.end),
-            target: src_target,
         },
         Splice {
             start: dest_pos,
             end: dest_pos,
             replacement: moved,
             footprint: (dest_pos, dest_pos),
-            target: dest_target,
         },
     ])
 }
@@ -391,14 +389,17 @@ fn detect_overlaps(splices: &[(usize, Splice)], errors: &mut Vec<BatchError>) {
             }
             let a = &splices[i].1;
             let b = &splices[j].1;
-            let same_target = a.target == b.target;
-            let nested = a.footprint.0 < b.footprint.1 && b.footprint.0 < a.footprint.1;
-            // Two zero-width insertions from different edits at the very same byte
-            // offset (e.g. append-to-A's end == insert-before-B's start at the
-            // A|B seam) would land in an arbitrary, order-dependent order. Reject
-            // them as overlapping so the result is never ambiguous.
+            // Real byte-range intersection (open interval): a zero-width insertion
+            // footprint collides only when it lies strictly inside another range,
+            // so editing different byte regions of the same heading (e.g.
+            // insert_after + replace-body) is allowed while overlapping content
+            // edits still reject.
+            let overlap = a.footprint.0 < b.footprint.1 && b.footprint.0 < a.footprint.1;
+            // Two zero-width insertions at the very same offset (e.g. append-to-A's
+            // end == insert-before-B's start at the A|B seam) would apply in an
+            // arbitrary, order-dependent order — reject so the result is defined.
             let same_point_insert = a.start == a.end && b.start == b.end && a.start == b.start;
-            if same_target || nested || same_point_insert {
+            if overlap || same_point_insert {
                 conflict[i] = true;
                 conflict[j] = true;
             }
@@ -475,6 +476,66 @@ mod tests {
             ..edit(&["A"], Operation::Append)
         };
         assert_eq!(apply(src, vec![e]), "# A\nlead\n## B\nsub\ntail\n# C\n");
+    }
+
+    #[test]
+    fn replace_empty_body_does_not_glue_to_next_heading() {
+        // Regression: replacing the (empty) body of a heading that is immediately
+        // followed by a subheading must not merge into it.
+        let src = "# A\n## B\nsub\n";
+        let e = Edit {
+            scope: Scope::Body,
+            content: Some("X".into()),
+            ..edit(&["A"], Operation::Replace)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\nX\n## B\nsub\n");
+    }
+
+    #[test]
+    fn replace_body_on_heading_only_note_separates_from_heading() {
+        // Regression: a heading-only note with no trailing newline.
+        let src = "# A";
+        let e = Edit {
+            scope: Scope::Body,
+            content: Some("X".into()),
+            ..edit(&["A"], Operation::Replace)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\nX");
+    }
+
+    #[test]
+    fn move_to_adjacent_sibling_boundary_is_allowed() {
+        // Regression: a sibling move whose destination touches the source span
+        // boundary must not be a false self-move.
+        let src = "# A\nax\n# B\nbx\n";
+        let e = Edit {
+            operation: Some(Operation::Move),
+            heading_path: vec!["A".into()],
+            destination: Some(Destination {
+                heading_path: vec!["B".into()],
+                occurrence: None,
+                position: Position::Before,
+            }),
+            ..Edit::default()
+        };
+        assert!(patch_sections(src, &[e]).is_ok());
+    }
+
+    #[test]
+    fn insert_after_and_replace_body_of_same_heading_do_not_conflict() {
+        // Regression: editing different byte regions of one heading is allowed.
+        let src = "# A\nbody\n# B\nb\n";
+        let ins = Edit {
+            content: Some("# New\nn\n".into()),
+            ..edit(&["A"], Operation::InsertAfter)
+        };
+        let rep = Edit {
+            scope: Scope::Body,
+            content: Some("new".into()),
+            ..edit(&["A"], Operation::Replace)
+        };
+        let out = apply(src, vec![ins, rep]);
+        assert_eq!(out, "# A\nnew\n# New\nn\n# B\nb\n");
     }
 
     #[test]

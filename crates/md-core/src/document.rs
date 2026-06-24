@@ -155,6 +155,19 @@ impl Document {
         self.chain(i).into_iter().map(str::to_string).collect()
     }
 
+    /// Whether heading `node` is `ancestor` itself or nested within its subtree.
+    #[must_use]
+    pub fn is_within(&self, node: usize, ancestor: usize) -> bool {
+        let mut cur = Some(node);
+        while let Some(c) = cur {
+            if c == ancestor {
+                return true;
+            }
+            cur = self.headings[c].parent;
+        }
+        false
+    }
+
     fn chain(&self, i: usize) -> Vec<&str> {
         let mut v = Vec::new();
         let mut cur = Some(i);
