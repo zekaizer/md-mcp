@@ -18,4 +18,5 @@ immutable; a changed decision supersedes the old one with a new ADR.
 - [0007](0007-multi-file-transaction.md) — Multi-file transaction: journal, backup, and crash recovery
 - [0008](0008-concurrency-and-isolation.md) — Concurrency and isolation
 - [0009](0009-delete-recovery-and-move-validation.md) — Delete recovery model and move validation
+- [0010](0010-search-strategy.md) — Search and listing strategy
 - [0011](0011-error-envelope-and-structured-output.md) — Error envelope and structured output
