@@ -84,7 +84,7 @@ _Avoid_: index, nth.
 Which span of a section a read or edit touches: `body` = lead body only;
 `section` = lead body plus all subsections. Shared by `read_sections` and
 `edit_sections` so a read and its follow-up edit address identical bytes. See
-[ADR on section read/edit scope](docs/adr/README.md).
+[ADR on section read/edit scope](docs/adr/0003-document-parser-and-section-model.md).
 
 **outline**:
 A note's table of contents — its headings only, in document order, without bodies.
@@ -120,7 +120,7 @@ note from directory, across every tool.
 A tool that removes or overwrites existing content — `edit_sections`,
 `edit_properties`, `rename_notes`, `relocate_notes`, `delete_notes`. A
 destructive batch is **all-or-nothing**: one rejected item rejects the whole
-batch and nothing is written. See [ADR on the transaction model](docs/adr/README.md).
+batch and nothing is written. See [ADR on the transaction model](docs/adr/0007-multi-file-transaction.md).
 _Avoid_: dangerous, unsafe.
 
 **non-destructive tool**:
@@ -148,7 +148,7 @@ it over the target, so a crash never leaves a partial file.
 The server-internal guarantee that a destructive multi-file batch lands entirely
 or not at all: back up originals, write all temps, commit by bulk rename, roll
 back on any failure, and recover an incomplete batch on restart. See
-[ADR on the transaction model](docs/adr/README.md).
+[ADR on the transaction model](docs/adr/0007-multi-file-transaction.md).
 _Avoid_: commit, savepoint.
 
 **trash**:
@@ -168,4 +168,4 @@ never surface them.
 Writes are serialized and the commit step is exclusive with reads, so a multi-note
 read never sees a torn snapshot (some notes new, some old). External-change
 detection is a separate layer, handled by `content hash`. See
-[ADR on concurrency](docs/adr/README.md).
+[ADR on concurrency](docs/adr/0008-concurrency-and-isolation.md).
