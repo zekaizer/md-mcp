@@ -38,7 +38,8 @@ impl Vault {
         let base = directory.strip_suffix('/').unwrap_or(directory);
         if !base.is_empty() {
             Vault::validate_rel(base)?;
-            if !self.exists(base)? {
+            // The internal state directory is never listed, even if named directly.
+            if Vault::is_internal_path(base) || !self.exists(base)? {
                 return Ok(Vec::new());
             }
         }
@@ -224,6 +225,27 @@ mod tests {
         v.write_atomic("b.md", b"y").unwrap();
         let e = v.list_entries("", true, None, true).unwrap();
         assert!(e.iter().all(|x| !x.path.starts_with(".md-mcp")));
+    }
+
+    #[test]
+    fn internal_directory_listed_directly_is_empty() {
+        let (_d, v) = vault_with(&[("a.md", "x")]);
+        // Provoke .md-mcp/trash with a trashed .md note.
+        v.commit_batch(&[crate::Op::Delete {
+            path: "a.md".into(),
+        }])
+        .unwrap();
+        // Explicitly listing the internal trash must not leak the trashed note.
+        assert!(
+            v.list_entries(".md-mcp/trash/", true, None, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            v.list_entries(".md-mcp", true, None, true)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
