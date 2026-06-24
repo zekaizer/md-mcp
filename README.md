@@ -7,9 +7,20 @@ YAML frontmatter) to AI agents, with structure-aware tools — outline reads,
 section-level edits, frontmatter properties, safe batch writes — instead of
 treating the vault as a flat pile of files.
 
-**Status:** early implementation. The tool surface is specified; the server is
-being built foundations-first (path safety → parser → frontmatter → transaction →
-tools), test-driven.
+**Status:** the full 12-tool surface is implemented and tested (read, search,
+section/property edits, safe batch moves and deletes) over a crash-safe
+transaction engine. Built foundations-first (path safety → parser → frontmatter →
+transaction → tools), test-driven.
+
+## Build & run
+
+```sh
+cargo build --release            # produces target/release/md-server
+MD_VAULT=/path/to/vault target/release/md-server   # speaks MCP over stdio
+```
+
+Register `md-server` as a stdio MCP server in your client, with `MD_VAULT` set to
+the vault directory. The server logs to stderr (stdout is the JSON-RPC channel).
 
 ## Documentation
 
