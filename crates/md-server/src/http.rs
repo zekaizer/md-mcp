@@ -28,6 +28,7 @@ use tokio::net::TcpListener;
 
 use crate::MdServer;
 use crate::config::HttpConfig;
+use crate::oauth::{self, OAuthState};
 
 /// Build the axum router serving the MCP endpoint at `/mcp`, wiring the Host and
 /// Origin guards and (when a token is configured) bearer auth.
@@ -57,12 +58,24 @@ pub fn router(server: MdServer, cfg: &HttpConfig) -> Router {
         sh_config,
     );
 
-    let mut app = Router::new().route_service("/mcp", service);
-    if let Some(token) = &cfg.token {
-        let token: Arc<str> = Arc::from(token.as_str());
-        app = app.layer(middleware::from_fn_with_state(token, require_bearer));
+    let mcp = Router::new().route_service("/mcp", service);
+
+    // OAuth is enabled exactly when a static token is set (ADR-0014): the token is the
+    // `/authorize` ownership gate and the Claude Code (CLI) bearer. Without it, the
+    // loopback-dev default stays unguarded as in ADR-0013.
+    match &cfg.token {
+        None => mcp,
+        Some(token) => {
+            let oauth = OAuthState::load(token.clone(), cfg.state_dir.join("oauth-state.json"));
+            let guarded = mcp.layer(middleware::from_fn_with_state(
+                oauth.clone(),
+                require_bearer,
+            ));
+            // OAuth discovery + flow routes stay unauthenticated (they are the auth flow);
+            // only `/mcp` is guarded.
+            oauth::routes(oauth).merge(guarded)
+        }
     }
-    app
 }
 
 /// The loopback origins a same-machine browser would send for `port`. A
@@ -143,20 +156,41 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received");
 }
 
-/// Reject any request whose `Authorization` header is not a bearer token matching
-/// the configured secret.
-async fn require_bearer(State(expected): State<Arc<str>>, req: Request, next: Next) -> Response {
-    let authorized = req
+/// Reject any request to `/mcp` whose bearer is neither a live issued OAuth access token
+/// nor the static `MD_HTTP_TOKEN`. On failure, advertise the protected-resource metadata
+/// so the claude.ai connector can start the OAuth flow (ADR-0014).
+async fn require_bearer(
+    State(oauth): State<Arc<OAuthState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let token = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(parse_bearer)
-        .is_some_and(|token| token_matches(token, &expected));
-    if authorized {
-        next.run(req).await
-    } else {
-        (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
+        .map(str::to_owned);
+    match token {
+        Some(token) if oauth.validate_bearer(&token) => next.run(request).await,
+        _ => unauthorized(&request),
     }
+}
+
+/// `401` carrying the RFC 9728 `WWW-Authenticate` challenge pointing at this server's
+/// protected-resource metadata (host from the tunnel-forwarded `Host`).
+fn unauthorized(request: &Request) -> Response {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    let challenge =
+        format!("Bearer resource_metadata=\"https://{host}/.well-known/oauth-protected-resource\"");
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, challenge)],
+    )
+        .into_response()
 }
 
 /// Extract the credential from an `Authorization` value. Per RFC 7235/6750 the
@@ -171,7 +205,8 @@ fn parse_bearer(value: &str) -> Option<&str> {
 
 /// Compare two tokens in constant time, without leaking either length: BLAKE3
 /// digests are fixed-width (32 bytes) and `blake3::Hash`'s `==` is constant-time.
-fn token_matches(provided: &str, expected: &str) -> bool {
+/// Shared with [`crate::oauth`] for the static-token gate and PKCE compare.
+pub(crate) fn token_matches(provided: &str, expected: &str) -> bool {
     blake3::hash(provided.as_bytes()) == blake3::hash(expected.as_bytes())
 }
 

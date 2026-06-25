@@ -17,10 +17,16 @@ md-core = { path = "crates/md-core" }
 # served via axum). See ADR-0002 (original transport choice) and ADR-0013 (HTTP).
 rmcp = { version = "1.8", default-features = false, features = ["server", "macros", "schemars", "transport-io", "transport-streamable-http-server"] }
 
-# HTTP transport harness for rmcp's StreamableHttpService (ADR-0013). Minimal
-# features: the code uses only Router/route_service, middleware, axum::serve over
-# HTTP/1 — no extractors/json/query/multipart.
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# HTTP transport harness for rmcp's StreamableHttpService (ADR-0013), plus the
+# co-hosted OAuth 2.1 server (ADR-0014). `form`/`query`/`json` are the OAuth
+# endpoints' extractors; the rest is Router/middleware/serve over HTTP/1.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "form", "query", "json"] }
+
+# Co-hosted OAuth 2.1 authorization server (ADR-0014): opaque token entropy,
+# PKCE S256, base64url. No JWT/OAuth crate — hand-rolled and auditable.
+getrandom = "0.3"
+sha2 = "0.10"
+base64 = "0.22"
 
 # Serialization & schema
 serde = { version = "1", features = ["derive"] }

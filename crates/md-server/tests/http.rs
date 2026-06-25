@@ -23,7 +23,10 @@ async fn spawn_server(token: Option<&str>) -> (SocketAddr, tokio::task::JoinHand
     vault
         .write_atomic("hello.md", b"---\ntitle: Hi\n---\n# Heading\nbody\n")
         .unwrap();
-    std::mem::forget(dir); // keep the temp dir alive for the server's lifetime
+    let state = tempfile::tempdir().unwrap();
+    let state_dir = state.path().to_path_buf();
+    std::mem::forget(dir); // keep the temp dirs alive for the server's lifetime
+    std::mem::forget(state);
     let server = MdServer::new(vault);
 
     let cfg = HttpConfig {
@@ -31,6 +34,7 @@ async fn spawn_server(token: Option<&str>) -> (SocketAddr, tokio::task::JoinHand
         token: token.map(str::to_string),
         allowed_hosts: None,
         allowed_origins: None,
+        state_dir,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
