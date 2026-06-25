@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Accepted — the "MCP SDK and transport" decision (stdio-only, no HTTP) is
+partially superseded by [ADR-0013](0013-http-transport.md), which adds a
+Streamable HTTP transport. Everything else in this ADR stands.
 
 ## Context
 
