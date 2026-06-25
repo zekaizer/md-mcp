@@ -53,6 +53,7 @@ impl ScopeArg {
 #[schemars(crate = "rmcp::schemars")]
 pub struct ReadNotesRequest {
     /// Vault-relative note paths to read.
+    #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
     pub paths: Vec<String>,
     /// Include the note body (frontmatter block excluded).
     #[serde(default = "default_true")]
@@ -135,6 +136,7 @@ fn read_one_note(vault: &Vault, path: &str, include_body: bool, include_fm: bool
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct ReadOutlinesRequest {
+    #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
     pub paths: Vec<String>,
 }
 
@@ -207,6 +209,7 @@ fn read_one_outline(vault: &Vault, path: &str) -> NoteOutline {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct ReadSectionsRequest {
+    #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
     pub targets: Vec<SectionTarget>,
 }
 

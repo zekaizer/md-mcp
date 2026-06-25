@@ -92,6 +92,7 @@ fn check_move_collisions(pairs: &[(usize, String, String)], errors: &mut Vec<Api
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct DeleteNotesRequest {
+    #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
     pub paths: Vec<String>,
 }
 
@@ -115,6 +116,7 @@ pub struct DeletedItem {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct RenameNotesRequest {
+    #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
     pub renames: Vec<RenameItem>,
     #[serde(default)]
     pub overwrite: bool,
@@ -131,6 +133,7 @@ pub struct RenameItem {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct RelocateNotesRequest {
+    #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
     pub moves: Vec<RelocateItem>,
     #[serde(default)]
     pub overwrite: bool,

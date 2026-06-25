@@ -70,3 +70,73 @@ async fn client_lists_all_tools_and_calls_one() {
     client.cancel().await.ok();
     server_task.abort();
 }
+
+/// The advertised inputSchema must surface the constraints `docs/tool_spec.md`
+/// defines: batch arrays cap at maxItems:100, the paged `limit`s carry their
+/// maximum, search `mode` defaults to "both", and `edit_sections` documents the
+/// `move` operation in its description (not only its enum).
+#[tokio::test]
+async fn tool_schemas_expose_spec_constraints() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = Vault::open(dir.path()).unwrap();
+    let server = MdServer::new(vault);
+
+    let (client_transport, server_transport) = tokio::io::duplex(16 * 1024);
+    let server_task = tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_transport).await {
+            running.waiting().await.ok();
+        }
+    });
+    let client = serve_client((), client_transport)
+        .await
+        .expect("client handshake");
+    let tools = client.list_all_tools().await.expect("list tools");
+
+    let schema = |name: &str| -> Value {
+        let tool = tools
+            .iter()
+            .find(|t| t.name.as_ref() == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"));
+        Value::Object((*tool.input_schema).clone())
+    };
+
+    // Every batch array advertises maxItems:100 (the batch_limit cap).
+    for (tool, array) in [
+        ("read_notes", "paths"),
+        ("read_outlines", "paths"),
+        ("read_sections", "targets"),
+        ("create_notes", "notes"),
+        ("append_notes", "appends"),
+        ("edit_sections", "edits"),
+        ("edit_properties", "edits"),
+        ("delete_notes", "paths"),
+        ("rename_notes", "renames"),
+        ("relocate_notes", "moves"),
+    ] {
+        assert_eq!(
+            schema(tool)["properties"][array]["maxItems"],
+            json!(100),
+            "{tool}.{array} must advertise maxItems:100"
+        );
+    }
+
+    // Paged limits carry their maximum.
+    assert_eq!(schema("list_notes")["properties"]["limit"]["maximum"], json!(1000));
+    assert_eq!(schema("search_notes")["properties"]["limit"]["maximum"], json!(100));
+
+    // search `mode` defaults to "both".
+    assert_eq!(schema("search_notes")["properties"]["mode"]["default"], json!("both"));
+
+    // edit_sections description names the `move` operation.
+    let desc = tools
+        .iter()
+        .find(|t| t.name.as_ref() == "edit_sections")
+        .unwrap()
+        .description
+        .as_deref()
+        .unwrap_or_default();
+    assert!(desc.contains("move"), "edit_sections description: {desc}");
+
+    client.cancel().await.ok();
+    server_task.abort();
+}
