@@ -95,9 +95,6 @@ impl Vault {
         for entry in read {
             let Ok(entry) = entry else { continue };
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue; // skip dot entries (incl. .md-mcp)
-            }
             let rel = if dir_rel.is_empty() {
                 name.clone()
             } else {
@@ -106,6 +103,12 @@ impl Vault {
             let Ok(ft) = entry.file_type() else { continue };
 
             if ft.is_dir() {
+                // Hide dot-directories only: the internal `.md-mcp/` state and
+                // external tool dirs (.git/, .obsidian/). Dot-FILES such as
+                // `.NET.md` are legitimate notes and stay listable.
+                if name.starts_with('.') {
+                    continue;
+                }
                 if include_dirs {
                     out.push(Entry {
                         path: format!("{rel}/"),
@@ -184,6 +187,24 @@ mod tests {
         let (_d, v) = vault_with(&[("b.md", "x"), ("a.md", "y"), ("sub/c.md", "z")]);
         let e = v.list_entries("", true, None, false).unwrap();
         assert_eq!(paths(&e), ["a.md", "b.md", "sub/c.md"]);
+    }
+
+    #[test]
+    fn lists_dot_prefixed_note_files() {
+        // Real-world notes like ".NET.md" or ".env.md" are legitimate and must
+        // stay listable/searchable — only dot-DIRECTORIES (the internal
+        // .md-mcp/ state, external tool dirs) are hidden, not dot-FILES.
+        let (_d, v) = vault_with(&[(".NET.md", "x"), (".env.md", "y"), ("a.md", "z")]);
+        let e = v.list_entries("", true, None, false).unwrap();
+        assert_eq!(paths(&e), [".NET.md", ".env.md", "a.md"]);
+    }
+
+    #[test]
+    fn skips_dot_directories_but_keeps_dot_files() {
+        let (_d, v) = vault_with(&[(".hidden/secret.md", "x"), (".NET.md", "y"), ("a.md", "z")]);
+        let e = v.list_entries("", true, None, false).unwrap();
+        // .hidden/ directory excluded; the .NET.md dot-file remains.
+        assert_eq!(paths(&e), [".NET.md", "a.md"]);
     }
 
     #[test]
