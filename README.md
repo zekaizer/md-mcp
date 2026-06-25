@@ -16,11 +16,37 @@ transaction → tools), test-driven.
 
 ```sh
 cargo build --release            # produces target/release/md-server
-MD_VAULT=/path/to/vault target/release/md-server   # speaks MCP over stdio
+
+# Streamable HTTP (default) — serves MCP at http://127.0.0.1:7654/mcp
+MD_VAULT=/path/to/vault target/release/md-server
+
+# stdio — for desktop MCP clients that launch the server themselves
+MD_VAULT=/path/to/vault target/release/md-server --stdio
 ```
 
-Register `md-server` as a stdio MCP server in your client, with `MD_VAULT` set to
-the vault directory. The server logs to stderr (stdout is the JSON-RPC channel).
+`MD_VAULT` (the vault directory) is required. The transport is selected by the
+`--http` / `--stdio` flag, else the `MD_TRANSPORT` env var (`http` | `stdio`),
+else HTTP. The server logs to stderr (under stdio, stdout is the JSON-RPC
+channel). See [ADR-0013](docs/adr/0013-http-transport.md).
+
+### HTTP options
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MD_HTTP_ADDR` | `127.0.0.1:7654` | bind address; `0.0.0.0:…` to expose beyond loopback |
+| `MD_HTTP_TOKEN` | unset | when set, every request must send `Authorization: Bearer <token>` |
+| `MD_HTTP_ALLOWED_HOSTS` | unset | comma-separated `Host` allowlist; `*` disables the guard |
+| `MD_HTTP_ALLOWED_ORIGINS` | unset | comma-separated `Origin` allowlist; `*` disables the guard |
+
+The default bind is loopback with no auth. Two browser-facing guards are on by
+default: the `Host` allowlist (loopback) and the `Origin` allowlist (the loopback
+origins for the bound port — this is what stops a random web page from driving the
+tools at `http://127.0.0.1:7654/mcp`; non-browser clients send no `Origin` and are
+unaffected). Exposing the server (a non-loopback `MD_HTTP_ADDR`) means setting
+`MD_HTTP_TOKEN`, and listing the served host(s) in `MD_HTTP_ALLOWED_HOSTS` (and,
+for browser clients, the origin in `MD_HTTP_ALLOWED_ORIGINS`) — or `*` to disable a
+guard. There is no in-process TLS — terminate TLS upstream (reverse proxy /
+tunnel) for remote use.
 
 ## Documentation
 
