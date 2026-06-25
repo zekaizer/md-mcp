@@ -28,6 +28,7 @@ use tokio::net::TcpListener;
 
 use crate::MdServer;
 use crate::config::HttpConfig;
+use crate::oauth::{self, OAuthState};
 
 /// Build the axum router serving the MCP endpoint at `/mcp`, wiring the Host and
 /// Origin guards and (when a token is configured) bearer auth.
@@ -57,12 +58,67 @@ pub fn router(server: MdServer, cfg: &HttpConfig) -> Router {
         sh_config,
     );
 
-    let mut app = Router::new().route_service("/mcp", service);
-    if let Some(token) = &cfg.token {
-        let token: Arc<str> = Arc::from(token.as_str());
-        app = app.layer(middleware::from_fn_with_state(token, require_bearer));
+    let mcp = Router::new().route_service("/mcp", service);
+
+    // OAuth is enabled exactly when a static token is set (ADR-0014): the token is the
+    // `/authorize` ownership gate and the Claude Code (CLI) bearer. Without it, the
+    // loopback-dev default stays unguarded as in ADR-0013.
+    match &cfg.token {
+        None => mcp,
+        Some(token) => {
+            let oauth = OAuthState::load(token.clone(), cfg.state_dir.join("oauth-state.json"));
+            let guarded = mcp.layer(middleware::from_fn_with_state(
+                oauth.clone(),
+                require_bearer,
+            ));
+            // OAuth discovery + flow routes stay unauthenticated (they are the auth flow);
+            // only `/mcp` is guarded. A single outer Host guard validates the `Host` before
+            // any handler derives a public base URL / the 401 challenge from it (ADR-0014).
+            let allowed = Arc::new(effective_allowed_hosts(&cfg.allowed_hosts));
+            oauth::routes(oauth)
+                .merge(guarded)
+                .layer(middleware::from_fn_with_state(allowed, host_guard))
+        }
     }
-    app
+}
+
+/// The effective `Host` allowlist for the edge guard: rmcp's loopback set when unset,
+/// empty (= allow all, the `*` escape hatch) when disabled, else the configured list.
+fn effective_allowed_hosts(configured: &Option<Vec<String>>) -> Vec<String> {
+    match configured {
+        None => vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
+        Some(list) => list.clone(),
+    }
+}
+
+/// Lowercased host with any IPv6 brackets stripped, for allowlist comparison.
+fn normalize_host(h: &str) -> String {
+    h.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+/// Reject any request whose `Host` is not allowlisted, so the OAuth metadata and the 401
+/// challenge only ever reflect a validated host. An empty allowlist (`*`) disables it.
+async fn host_guard(
+    State(allowed): State<Arc<Vec<String>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if allowed.is_empty() {
+        return next.run(request).await;
+    }
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|hh| hh.parse::<axum::http::uri::Authority>().ok())
+        .map(|a| normalize_host(a.host()));
+    match host {
+        Some(h) if allowed.iter().any(|a| normalize_host(a) == h) => next.run(request).await,
+        _ => (StatusCode::BAD_REQUEST, "Bad Request: Host not allowed").into_response(),
+    }
 }
 
 /// The loopback origins a same-machine browser would send for `port`. A
@@ -143,20 +199,41 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received");
 }
 
-/// Reject any request whose `Authorization` header is not a bearer token matching
-/// the configured secret.
-async fn require_bearer(State(expected): State<Arc<str>>, req: Request, next: Next) -> Response {
-    let authorized = req
+/// Reject any request to `/mcp` whose bearer is neither a live issued OAuth access token
+/// nor the static `MD_HTTP_TOKEN`. On failure, advertise the protected-resource metadata
+/// so the claude.ai connector can start the OAuth flow (ADR-0014).
+async fn require_bearer(
+    State(oauth): State<Arc<OAuthState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let token = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(parse_bearer)
-        .is_some_and(|token| token_matches(token, &expected));
-    if authorized {
-        next.run(req).await
-    } else {
-        (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
+        .map(str::to_owned);
+    match token {
+        Some(token) if oauth.validate_bearer(&token) => next.run(request).await,
+        _ => unauthorized(&request),
     }
+}
+
+/// `401` carrying the RFC 9728 `WWW-Authenticate` challenge pointing at this server's
+/// protected-resource metadata (host from the tunnel-forwarded `Host`).
+fn unauthorized(request: &Request) -> Response {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    let challenge =
+        format!("Bearer resource_metadata=\"https://{host}/.well-known/oauth-protected-resource\"");
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, challenge)],
+    )
+        .into_response()
 }
 
 /// Extract the credential from an `Authorization` value. Per RFC 7235/6750 the
@@ -171,13 +248,38 @@ fn parse_bearer(value: &str) -> Option<&str> {
 
 /// Compare two tokens in constant time, without leaking either length: BLAKE3
 /// digests are fixed-width (32 bytes) and `blake3::Hash`'s `==` is constant-time.
-fn token_matches(provided: &str, expected: &str) -> bool {
+/// Shared with [`crate::oauth`] for the static-token gate and PKCE compare.
+pub(crate) fn token_matches(provided: &str, expected: &str) -> bool {
     blake3::hash(provided.as_bytes()) == blake3::hash(expected.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{loopback_origins, parse_bearer, token_matches};
+    use super::{
+        effective_allowed_hosts, loopback_origins, normalize_host, parse_bearer, token_matches,
+    };
+
+    #[test]
+    fn host_allowlist_default_and_normalization() {
+        assert_eq!(
+            effective_allowed_hosts(&None),
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "::1".to_string()
+            ]
+        );
+        // `*` (Some(empty)) disables the guard (allow all).
+        assert!(effective_allowed_hosts(&Some(vec![])).is_empty());
+        // A configured list is used verbatim.
+        assert_eq!(
+            effective_allowed_hosts(&Some(vec!["notes.example.com".into()])),
+            vec!["notes.example.com".to_string()]
+        );
+        // Bracket-stripping + case folding so `[::1]` matches `::1`.
+        assert_eq!(normalize_host("[::1]"), "::1");
+        assert_eq!(normalize_host("Example.COM"), "example.com");
+    }
 
     #[test]
     fn parse_bearer_accepts_rfc_variants() {

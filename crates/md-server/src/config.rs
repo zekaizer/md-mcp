@@ -49,6 +49,9 @@ pub struct HttpConfig {
     /// loopback-origin default (blocks cross-site browser requests while letting
     /// header-less non-browser clients through); `Some(vec![])` disables the guard.
     pub allowed_origins: Option<Vec<String>>,
+    /// Directory for server state (`MD_STATE_DIR`) — holds the OAuth token store
+    /// (ADR-0014). Used only when OAuth is enabled (`token` set).
+    pub state_dir: PathBuf,
 }
 
 impl HttpConfig {
@@ -58,6 +61,7 @@ impl HttpConfig {
         token: Option<String>,
         allowed_hosts: Option<String>,
         allowed_origins: Option<String>,
+        state_dir: PathBuf,
     ) -> Result<Self> {
         let addr_str = addr
             .filter(|s| !s.trim().is_empty())
@@ -81,8 +85,36 @@ impl HttpConfig {
             token,
             allowed_hosts,
             allowed_origins,
+            state_dir,
         })
     }
+
+    /// True when the co-hosted OAuth server should run: HTTP with a token set (the
+    /// token is the `/authorize` ownership gate — ADR-0014).
+    #[must_use]
+    pub fn oauth_enabled(&self) -> bool {
+        self.token.is_some()
+    }
+}
+
+/// Resolve the server state directory: `MD_STATE_DIR`, else `$XDG_STATE_HOME/md-mcp`,
+/// else `$HOME/.local/state/md-mcp`, else a relative fallback (created on first write).
+fn resolve_state_dir(
+    md_state_dir: Option<String>,
+    xdg_state_home: Option<String>,
+    home: Option<String>,
+) -> PathBuf {
+    let non_empty = |s: String| (!s.trim().is_empty()).then_some(s);
+    if let Some(dir) = md_state_dir.and_then(non_empty) {
+        return PathBuf::from(dir.trim());
+    }
+    if let Some(xdg) = xdg_state_home.and_then(non_empty) {
+        return PathBuf::from(xdg.trim()).join("md-mcp");
+    }
+    if let Some(home) = home.and_then(non_empty) {
+        return PathBuf::from(home.trim()).join(".local/state/md-mcp");
+    }
+    PathBuf::from(".md-mcp-state")
 }
 
 /// Parse a comma-separated allowlist. `None`/blank → `None` (caller's secure
@@ -139,6 +171,11 @@ impl Config {
                 std::env::var("MD_HTTP_TOKEN").ok(),
                 std::env::var("MD_HTTP_ALLOWED_HOSTS").ok(),
                 std::env::var("MD_HTTP_ALLOWED_ORIGINS").ok(),
+                resolve_state_dir(
+                    std::env::var("MD_STATE_DIR").ok(),
+                    std::env::var("XDG_STATE_HOME").ok(),
+                    std::env::var("HOME").ok(),
+                ),
             )?),
         };
 
@@ -188,6 +225,10 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn sd() -> PathBuf {
+        PathBuf::from("/tmp/md-mcp-test-state")
     }
 
     #[test]
@@ -240,11 +281,12 @@ mod tests {
 
     #[test]
     fn http_config_defaults_to_loopback_7654() {
-        let cfg = HttpConfig::resolve(None, None, None, None).unwrap();
+        let cfg = HttpConfig::resolve(None, None, None, None, sd()).unwrap();
         assert_eq!(cfg.addr, "127.0.0.1:7654".parse().unwrap());
         assert!(cfg.token.is_none());
         assert!(cfg.allowed_hosts.is_none());
         assert!(cfg.allowed_origins.is_none());
+        assert!(!cfg.oauth_enabled(), "no token → OAuth off");
     }
 
     #[test]
@@ -254,10 +296,12 @@ mod tests {
             Some("s3cret".into()),
             Some("example.com, 10.0.0.5".into()),
             Some("https://example.com".into()),
+            sd(),
         )
         .unwrap();
         assert_eq!(cfg.addr, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(cfg.token.as_deref(), Some("s3cret"));
+        assert!(cfg.oauth_enabled(), "token set → OAuth on");
         assert_eq!(
             cfg.allowed_hosts,
             Some(vec!["example.com".to_string(), "10.0.0.5".to_string()])
@@ -275,6 +319,7 @@ mod tests {
             Some(String::new()),
             Some("*".into()),
             Some("*".into()),
+            sd(),
         )
         .unwrap();
         assert!(cfg.token.is_none(), "empty token must mean no auth");
@@ -289,11 +334,39 @@ mod tests {
     #[test]
     fn http_config_trims_token_and_drops_whitespace_only() {
         // A trailing newline (common from `$(cat secret)`) is trimmed.
-        let cfg = HttpConfig::resolve(None, Some("s3cret\n".into()), None, None).unwrap();
+        let cfg = HttpConfig::resolve(None, Some("s3cret\n".into()), None, None, sd()).unwrap();
         assert_eq!(cfg.token.as_deref(), Some("s3cret"));
         // A whitespace-only token is treated as no auth, not a phantom secret.
-        let cfg = HttpConfig::resolve(None, Some("   ".into()), None, None).unwrap();
+        let cfg = HttpConfig::resolve(None, Some("   ".into()), None, None, sd()).unwrap();
         assert!(cfg.token.is_none());
+    }
+
+    #[test]
+    fn state_dir_resolution_precedence() {
+        // MD_STATE_DIR wins.
+        assert_eq!(
+            resolve_state_dir(
+                Some("/explicit".into()),
+                Some("/xdg".into()),
+                Some("/home".into())
+            ),
+            PathBuf::from("/explicit")
+        );
+        // else XDG_STATE_HOME/md-mcp.
+        assert_eq!(
+            resolve_state_dir(None, Some("/xdg".into()), Some("/home".into())),
+            PathBuf::from("/xdg/md-mcp")
+        );
+        // else HOME/.local/state/md-mcp.
+        assert_eq!(
+            resolve_state_dir(None, None, Some("/home".into())),
+            PathBuf::from("/home/.local/state/md-mcp")
+        );
+        // blank values are skipped.
+        assert_eq!(
+            resolve_state_dir(Some("  ".into()), None, Some("/home".into())),
+            PathBuf::from("/home/.local/state/md-mcp")
+        );
     }
 
     #[test]
@@ -312,6 +385,6 @@ mod tests {
 
     #[test]
     fn http_config_rejects_bad_addr() {
-        assert!(HttpConfig::resolve(Some("not-an-addr".into()), None, None, None).is_err());
+        assert!(HttpConfig::resolve(Some("not-an-addr".into()), None, None, None, sd()).is_err());
     }
 }
