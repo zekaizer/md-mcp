@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -38,6 +39,12 @@ const CODE_TTL_SECS: u64 = 5 * 60;
 /// State schema version. Bump on a breaking change; an unreadable/old file starts empty,
 /// which forces a one-time re-auth.
 const STATE_VERSION: u32 = 1;
+
+/// Bound the persisted store: `/register` is unauthenticated (it must be, per the
+/// discovery flow), so cap stored clients (evicting the oldest) and redirect URIs per
+/// registration to keep an internet-reachable endpoint from growing the file without end.
+const MAX_CLIENTS: usize = 50;
+const MAX_REDIRECT_URIS: usize = 8;
 
 /// On-disk, persisted across restarts. Bearer material at rest — written `0600`.
 #[derive(Serialize, Deserialize)]
@@ -75,6 +82,9 @@ struct TokenRec {
 #[derive(Clone, Serialize, Deserialize)]
 struct ClientRec {
     redirect_uris: Vec<String>,
+    /// Unix-seconds registration time, for eviction order. `0` for legacy records.
+    #[serde(default)]
+    created_at: u64,
 }
 
 /// In-memory only (one-time, short-lived).
@@ -153,7 +163,13 @@ impl OAuthState {
             tracing::error!(%error, "failed to create oauth state dir");
             return;
         }
-        let tmp = self.state_file.with_extension("json.tmp");
+        // Unique temp path per write: concurrent persists must not share one temp file
+        // (a shared path lets interleaved truncate/write/rename corrupt the store).
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = self
+            .state_file
+            .with_extension(format!("tmp.{}.{seq}", std::process::id()));
         let write = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -169,11 +185,25 @@ impl OAuthState {
 
     fn register_client(&self, redirect_uris: Vec<String>) -> String {
         let client_id = random_token();
-        self.store
-            .lock()
-            .unwrap()
-            .clients
-            .insert(client_id.clone(), ClientRec { redirect_uris });
+        {
+            let mut store = self.store.lock().unwrap();
+            if store.clients.len() >= MAX_CLIENTS
+                && let Some(oldest) = store
+                    .clients
+                    .iter()
+                    .min_by_key(|(_, c)| c.created_at)
+                    .map(|(id, _)| id.clone())
+            {
+                store.clients.remove(&oldest);
+            }
+            store.clients.insert(
+                client_id.clone(),
+                ClientRec {
+                    redirect_uris,
+                    created_at: now_secs(),
+                },
+            );
+        }
         self.persist();
         client_id
     }
@@ -356,8 +386,15 @@ async fn register(
     State(oauth): State<Arc<OAuthState>>,
     Json(req): Json<RegisterRequest>,
 ) -> Response {
-    if req.redirect_uris.is_empty() {
-        tracing::warn!("oauth: client registration rejected (no redirect_uris)");
+    if req.redirect_uris.is_empty() || req.redirect_uris.len() > MAX_REDIRECT_URIS {
+        tracing::warn!(
+            count = req.redirect_uris.len(),
+            "oauth: client registration rejected (redirect_uris empty or over cap)"
+        );
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri");
+    }
+    if !req.redirect_uris.iter().all(|u| is_absolute_http(u)) {
+        tracing::warn!("oauth: client registration rejected (non-http(s) redirect_uri)");
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri");
     }
     let client_id = oauth.register_client(req.redirect_uris.clone());
@@ -384,6 +421,8 @@ struct AuthorizeQuery {
     code_challenge: String,
     #[serde(default)]
     code_challenge_method: Option<String>,
+    #[serde(default)]
+    response_type: Option<String>,
     #[serde(default)]
     state: Option<String>,
 }
@@ -421,6 +460,7 @@ async fn authorize_post(
         redirect_uri: form.redirect_uri,
         code_challenge: form.code_challenge,
         code_challenge_method: form.code_challenge_method,
+        response_type: None,
         state: form.state,
     };
     if let Err(message) = validate_authorize(&oauth, &q) {
@@ -467,6 +507,9 @@ fn validate_authorize(oauth: &OAuthState, q: &AuthorizeQuery) -> Result<(), &'st
     }
     if q.code_challenge_method.as_deref().unwrap_or("S256") != "S256" {
         return Err("unsupported code_challenge_method (S256 only)");
+    }
+    if q.response_type.as_deref().unwrap_or("code") != "code" {
+        return Err("unsupported response_type (code only)");
     }
     if !oauth.client_allows_redirect(&q.client_id, &q.redirect_uri) {
         return Err("unknown client_id or unregistered redirect_uri");
@@ -561,6 +604,11 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// True if `uri` parses as an absolute `http`/`https` URL (DCR redirect sanity check).
+fn is_absolute_http(uri: &str) -> bool {
+    url::Url::parse(uri).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+}
+
 /// 32 bytes of OS entropy, base64url (no padding) — for client ids, codes, and tokens.
 fn random_token() -> String {
     let mut buf = [0u8; 32];
@@ -577,37 +625,37 @@ fn pkce_matches(verifier: &str, challenge: &str) -> bool {
 
 /// Exact match, or a loopback redirect (`http://localhost` / `127.0.0.1`) differing only
 /// by port — the claude.ai connector's per-session callback port varies (RFC 8252).
+///
+/// Loopback comparison parses the authority with a real URL parser, never string
+/// prefixes: a crafted `http://localhost:1@evil.com/cb` resolves to host `evil.com`
+/// (and `http://localhost.evil.com` to that host) and is rejected, so a registered
+/// loopback callback can never be coerced into leaking the code to another origin.
 fn redirect_uri_matches(registered: &str, requested: &str) -> bool {
     if registered == requested {
         return true;
     }
-    match (
-        strip_loopback_port(registered),
-        strip_loopback_port(requested),
-    ) {
+    match (loopback_key(registered), loopback_key(requested)) {
         (Some(a), Some(b)) => a == b,
         _ => false,
     }
 }
 
-/// For an `http://localhost[:port]/...` or `http://127.0.0.1[:port]/...` URL, return it
-/// with the port removed; otherwise `None` (non-loopback URLs only ever match exactly).
-fn strip_loopback_port(uri: &str) -> Option<String> {
-    for host in ["localhost", "127.0.0.1"] {
-        let prefix = format!("http://{host}");
-        if let Some(rest) = uri.strip_prefix(&prefix) {
-            // rest is "" or ":port/..." or "/..."
-            let rest = match rest.strip_prefix(':') {
-                Some(after_colon) => match after_colon.find('/') {
-                    Some(slash) => &after_colon[slash..],
-                    None => "",
-                },
-                None => rest,
-            };
-            return Some(format!("{prefix}{rest}"));
-        }
+/// The port-independent identity `(host, path, query)` of an `http://localhost` or
+/// `http://127.0.0.1` URL with **no userinfo**; otherwise `None` (non-loopback or
+/// malformed URLs only ever match exactly, via the equality check above).
+fn loopback_key(uri: &str) -> Option<(String, String, Option<String>)> {
+    let url = url::Url::parse(uri).ok()?;
+    if url.scheme() != "http" || !url.username().is_empty() || url.password().is_some() {
+        return None;
     }
-    None
+    match url.host_str()? {
+        host @ ("localhost" | "127.0.0.1") => Some((
+            host.to_string(),
+            url.path().to_string(),
+            url.query().map(str::to_string),
+        )),
+        _ => None,
+    }
 }
 
 /// Minimal percent-encoding for a query-string value (RFC 3986 unreserved pass through).
@@ -691,6 +739,7 @@ mod tests {
             "http://127.0.0.1/cb",
             "http://127.0.0.1:8080/cb"
         ));
+        // different path must not match
         assert!(!redirect_uri_matches(
             "http://localhost:1/a",
             "http://localhost:1/b"
@@ -703,6 +752,34 @@ mod tests {
         assert!(!redirect_uri_matches(
             "https://claude.ai/cb",
             "https://evil.example/cb"
+        ));
+    }
+
+    #[test]
+    fn loopback_redirect_rejects_authority_smuggling() {
+        let registered = "http://localhost:8723/callback";
+        // userinfo moves the real host to evil.com — must NOT match.
+        assert!(!redirect_uri_matches(
+            registered,
+            "http://localhost:53@evil.com/callback"
+        ));
+        // extra labels / lookalike hosts must NOT match.
+        assert!(!redirect_uri_matches(
+            registered,
+            "http://localhost.evil.com/callback"
+        ));
+        assert!(!redirect_uri_matches(
+            registered,
+            "http://localhost:1234.evil.com/callback"
+        ));
+        assert!(!redirect_uri_matches(
+            registered,
+            "http://localhostEVIL/callback"
+        ));
+        // a different loopback path must NOT match.
+        assert!(!redirect_uri_matches(
+            registered,
+            "http://localhost:9/other"
         ));
     }
 

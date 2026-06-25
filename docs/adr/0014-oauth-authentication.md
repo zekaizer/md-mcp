@@ -68,10 +68,17 @@ module, mounted alongside the guarded `/mcp`:**
 - `GET/POST /authorize`: validate client/redirect/PKCE; the human pastes `MD_HTTP_TOKEN`
   once on a minimal HTML page (constant-time check); on success 302 to the client
   `redirect_uri` with a one-time `code` bound to (client_id, redirect_uri,
-  code_challenge, resource).
+  code_challenge). Loopback `redirect_uri`s are matched port-independently via a real URL
+  parser (never string prefixes), so a registered loopback callback cannot be coerced
+  into leaking the code to another origin.
 - `POST /token` (`application/x-www-form-urlencoded`): `authorization_code` (verify PKCE
   S256, one-time code) and `refresh_token` (rotated) grants; issues opaque `access_token`
   (~1 h) + `refresh_token` (~90 d).
+
+This AS serves exactly one resource (`/mcp`), so we do **not** implement RFC 8707
+resource indicators or token audiences — there is no second resource to disambiguate.
+`/register` is unauthenticated (the connector self-registers via DCR), so stored clients
+and per-registration redirect URIs are capped (oldest-evicted) to bound the state file.
 
 **`/mcp` (the only guarded route):** the bearer layer accepts **either** a live issued
 access token **or** the static `MD_HTTP_TOKEN` (the latter keeps Claude Code working).

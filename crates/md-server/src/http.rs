@@ -72,9 +72,52 @@ pub fn router(server: MdServer, cfg: &HttpConfig) -> Router {
                 require_bearer,
             ));
             // OAuth discovery + flow routes stay unauthenticated (they are the auth flow);
-            // only `/mcp` is guarded.
-            oauth::routes(oauth).merge(guarded)
+            // only `/mcp` is guarded. A single outer Host guard validates the `Host` before
+            // any handler derives a public base URL / the 401 challenge from it (ADR-0014).
+            let allowed = Arc::new(effective_allowed_hosts(&cfg.allowed_hosts));
+            oauth::routes(oauth)
+                .merge(guarded)
+                .layer(middleware::from_fn_with_state(allowed, host_guard))
         }
+    }
+}
+
+/// The effective `Host` allowlist for the edge guard: rmcp's loopback set when unset,
+/// empty (= allow all, the `*` escape hatch) when disabled, else the configured list.
+fn effective_allowed_hosts(configured: &Option<Vec<String>>) -> Vec<String> {
+    match configured {
+        None => vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
+        Some(list) => list.clone(),
+    }
+}
+
+/// Lowercased host with any IPv6 brackets stripped, for allowlist comparison.
+fn normalize_host(h: &str) -> String {
+    h.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+/// Reject any request whose `Host` is not allowlisted, so the OAuth metadata and the 401
+/// challenge only ever reflect a validated host. An empty allowlist (`*`) disables it.
+async fn host_guard(
+    State(allowed): State<Arc<Vec<String>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if allowed.is_empty() {
+        return next.run(request).await;
+    }
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|hh| hh.parse::<axum::http::uri::Authority>().ok())
+        .map(|a| normalize_host(a.host()));
+    match host {
+        Some(h) if allowed.iter().any(|a| normalize_host(a) == h) => next.run(request).await,
+        _ => (StatusCode::BAD_REQUEST, "Bad Request: Host not allowed").into_response(),
     }
 }
 
@@ -212,7 +255,31 @@ pub(crate) fn token_matches(provided: &str, expected: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{loopback_origins, parse_bearer, token_matches};
+    use super::{
+        effective_allowed_hosts, loopback_origins, normalize_host, parse_bearer, token_matches,
+    };
+
+    #[test]
+    fn host_allowlist_default_and_normalization() {
+        assert_eq!(
+            effective_allowed_hosts(&None),
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "::1".to_string()
+            ]
+        );
+        // `*` (Some(empty)) disables the guard (allow all).
+        assert!(effective_allowed_hosts(&Some(vec![])).is_empty());
+        // A configured list is used verbatim.
+        assert_eq!(
+            effective_allowed_hosts(&Some(vec!["notes.example.com".into()])),
+            vec!["notes.example.com".to_string()]
+        );
+        // Bracket-stripping + case folding so `[::1]` matches `::1`.
+        assert_eq!(normalize_host("[::1]"), "::1");
+        assert_eq!(normalize_host("Example.COM"), "example.com");
+    }
 
     #[test]
     fn parse_bearer_accepts_rfc_variants() {

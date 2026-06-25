@@ -27,6 +27,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 getrandom = "0.3"
 sha2 = "0.10"
 base64 = "0.22"
+# Robust authority parsing for redirect-URI and Host validation (no string-munging).
+url = "2"
 
 # Serialization & schema
 serde = { version = "1", features = ["derive"] }
