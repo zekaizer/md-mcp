@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted
+Accepted — the single-client / stdio operating premise is revised by
+[ADR-0013](0013-http-transport.md): concurrency now spans multiple HTTP sessions.
+The readers-writer mechanism decided here is unchanged and is shared across those
+sessions (each gets a clone of the one `MdServer`).
 
 ## Context
 

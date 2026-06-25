@@ -13,6 +13,8 @@ workspace = true
 [dependencies]
 md-core.workspace = true
 aho-corasick.workspace = true
+axum.workspace = true
+blake3.workspace = true
 rmcp = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -23,5 +25,7 @@ anyhow.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-# Enable rmcp's client side for the in-process end-to-end protocol test only.
-rmcp = { workspace = true, features = ["client"] }
+# Client side for the in-process e2e test; the reqwest streamable-http client +
+# `tokio` time drive the HTTP transport e2e test (ADR-0013).
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }
+tokio = { workspace = true, features = ["time"] }

@@ -13,8 +13,14 @@ authors = ["Luke Lee"]
 # Internal
 md-core = { path = "crates/md-core" }
 
-# MCP server (stdio transport only — no HTTP/axum). See ADR-0002.
-rmcp = { version = "1.8", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }
+# MCP server. stdio (transport-io) + Streamable HTTP (transport-streamable-http-server,
+# served via axum). See ADR-0002 (original transport choice) and ADR-0013 (HTTP).
+rmcp = { version = "1.8", default-features = false, features = ["server", "macros", "schemars", "transport-io", "transport-streamable-http-server"] }
+
+# HTTP transport harness for rmcp's StreamableHttpService (ADR-0013). Minimal
+# features: the code uses only Router/route_service, middleware, axum::serve over
+# HTTP/1 — no extractors/json/query/multipart.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 
 # Serialization & schema
 serde = { version = "1", features = ["derive"] }
@@ -46,8 +52,8 @@ unicode-normalization = "0.1"
 thiserror = "2"
 anyhow = "1"
 
-# Async runtime + logging (server only)
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+# Async runtime + logging (server only). `net` for the HTTP TCP listener (ADR-0013).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

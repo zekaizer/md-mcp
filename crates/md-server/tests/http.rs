@@ -1,0 +1,183 @@
+//! End-to-end tests over the real Streamable HTTP transport (ADR-0013): rmcp's
+//! HTTP client drives the axum server on an ephemeral loopback port — covering
+//! the tool surface, bearer auth, and the cross-session concurrency invariant
+//! (all sessions share one vault and one write lock; ADR-0008).
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use md_core::Vault;
+use md_server::MdServer;
+use md_server::config::HttpConfig;
+use rmcp::model::CallToolRequestParams;
+use rmcp::serve_client;
+use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use serde_json::{Value, json};
+
+/// Start the HTTP server on an ephemeral loopback port; returns its address and
+/// the serving task handle. The vault is seeded with `hello.md`.
+async fn spawn_server(token: Option<&str>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = Vault::open(dir.path()).unwrap();
+    vault
+        .write_atomic("hello.md", b"---\ntitle: Hi\n---\n# Heading\nbody\n")
+        .unwrap();
+    std::mem::forget(dir); // keep the temp dir alive for the server's lifetime
+    let server = MdServer::new(vault);
+
+    let cfg = HttpConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        token: token.map(str::to_string),
+        allowed_hosts: None,
+        allowed_origins: None,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = md_server::http::router(server, &cfg);
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    (addr, handle)
+}
+
+fn create_args(path: &str, body: &str) -> serde_json::Map<String, Value> {
+    let mut args = serde_json::Map::new();
+    args.insert("notes".into(), json!([{ "path": path, "content": body }]));
+    args
+}
+
+fn append_args(path: &str, body: &str) -> serde_json::Map<String, Value> {
+    let mut args = serde_json::Map::new();
+    args.insert("appends".into(), json!([{ "path": path, "content": body }]));
+    args
+}
+
+#[tokio::test]
+async fn http_client_lists_tools_and_calls_one() {
+    let (addr, handle) = spawn_server(None).await;
+    let transport = StreamableHttpClientTransport::from_uri(format!("http://{addr}/mcp"));
+    let client = serve_client((), transport).await.expect("client handshake");
+
+    let tools = client.list_all_tools().await.expect("list tools");
+    assert_eq!(
+        tools.len(),
+        12,
+        "expected the full 12-tool surface over HTTP"
+    );
+
+    let mut args = serde_json::Map::new();
+    args.insert("paths".into(), json!(["hello.md", "missing.md"]));
+    let result = client
+        .call_tool(CallToolRequestParams::new("read_notes").with_arguments(args))
+        .await
+        .expect("call read_notes");
+    let structured: Value = result.structured_content.expect("structured content");
+    let notes = structured["notes"].as_array().unwrap();
+    assert_eq!(notes.len(), 2);
+    assert_eq!(notes[0]["frontmatter"]["title"], json!("Hi"));
+    assert_eq!(notes[1]["exists"], json!(false));
+
+    client.cancel().await.ok();
+    handle.abort();
+}
+
+#[tokio::test]
+async fn http_requires_bearer_when_token_set() {
+    let (addr, handle) = spawn_server(Some("s3cret")).await;
+    let url = format!("http://{addr}/mcp");
+
+    // No bearer → the initialize handshake is rejected (401).
+    let anon = StreamableHttpClientTransport::from_uri(url.clone());
+    let handshake = tokio::time::timeout(Duration::from_secs(10), serve_client((), anon)).await;
+    assert!(
+        matches!(handshake, Ok(Err(_))),
+        "handshake without a bearer token must be rejected, got {handshake:?}"
+    );
+
+    // Correct bearer → handshake succeeds and the tool surface is available.
+    let authed = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(url).auth_header("s3cret"),
+    );
+    let client = serve_client((), authed).await.expect("authed handshake");
+    assert_eq!(client.list_all_tools().await.expect("list tools").len(), 12);
+
+    client.cancel().await.ok();
+    handle.abort();
+}
+
+/// Two independent HTTP sessions must share ONE vault and ONE write lock. The two
+/// sessions concurrently append to the SAME note — a read-modify-write that, if
+/// the sessions held independent locks (or none), would drop updates under
+/// contention. Every appended line surviving proves the commit lock serializes
+/// writes across sessions (ADR-0008), and session 2 reading session 1's note
+/// proves the shared `Arc<Vault>`. Runs on a multi-thread runtime so the appends
+/// truly race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_sessions_share_one_vault_and_serialize_writes() {
+    let (addr, handle) = spawn_server(None).await;
+    let url = format!("http://{addr}/mcp");
+
+    let s1 = serve_client((), StreamableHttpClientTransport::from_uri(url.clone()))
+        .await
+        .expect("session 1 handshake");
+    let s2 = serve_client((), StreamableHttpClientTransport::from_uri(url.clone()))
+        .await
+        .expect("session 2 handshake");
+
+    // Session 1 seeds a shared note.
+    s1.call_tool(
+        CallToolRequestParams::new("create_notes")
+            .with_arguments(create_args("shared.md", "# Shared\n")),
+    )
+    .await
+    .expect("create shared.md");
+
+    // Both sessions hammer the same note concurrently, round after round.
+    const ROUNDS: usize = 8;
+    for i in 0..ROUNDS {
+        let a = s1.call_tool(
+            CallToolRequestParams::new("append_notes")
+                .with_arguments(append_args("shared.md", &format!("s1-{i}\n"))),
+        );
+        let b = s2.call_tool(
+            CallToolRequestParams::new("append_notes")
+                .with_arguments(append_args("shared.md", &format!("s2-{i}\n"))),
+        );
+        let (ra, rb) = tokio::join!(a, b);
+        assert_ne!(ra.expect("s1 append").is_error, Some(true));
+        assert_ne!(rb.expect("s2 append").is_error, Some(true));
+    }
+
+    // Session 2 reads back the note session 1 created and both appended to.
+    let mut args = serde_json::Map::new();
+    args.insert("paths".into(), json!(["shared.md"]));
+    let read = s2
+        .call_tool(CallToolRequestParams::new("read_notes").with_arguments(args))
+        .await
+        .expect("read shared.md");
+    let notes = read.structured_content.expect("structured")["notes"]
+        .as_array()
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        notes[0]["exists"],
+        json!(true),
+        "shared note seen by session 2"
+    );
+    let content = notes[0]["content"].as_str().unwrap_or_default();
+    for i in 0..ROUNDS {
+        assert!(
+            content.contains(&format!("s1-{i}")),
+            "lost s1-{i}: {content:?}"
+        );
+        assert!(
+            content.contains(&format!("s2-{i}")),
+            "lost s2-{i}: {content:?}"
+        );
+    }
+
+    s1.cancel().await.ok();
+    s2.cancel().await.ok();
+    handle.abort();
+}
