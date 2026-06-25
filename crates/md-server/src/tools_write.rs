@@ -37,6 +37,7 @@ fn body_has_frontmatter(content: &str) -> bool {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct CreateNotesRequest {
+    #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
     pub notes: Vec<NoteInput>,
     #[serde(default)]
     pub overwrite: bool,
@@ -72,6 +73,7 @@ pub struct CreateResult {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct AppendNotesRequest {
+    #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
     pub appends: Vec<AppendInput>,
 }
 
@@ -117,6 +119,7 @@ pub enum OperationArg {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct EditSectionsRequest {
+    #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
     pub edits: Vec<EditItem>,
 }
 
@@ -260,6 +263,7 @@ fn edit_outcome(new_source: &str, item: &EditItem) -> (Option<Vec<String>>, Opti
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct EditPropertiesRequest {
+    #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
     pub edits: Vec<PropertyEdit>,
 }
 
@@ -349,7 +353,7 @@ impl MdServer {
 
     /// Edit note sections by heading path (all-or-nothing).
     #[tool(
-        description = "Edit sections by heading_path: replace/append/delete (by scope body|section), insert_before/insert_after, rename. All-or-nothing: any rejected edit (unresolved/ambiguous heading, overlap, HASH_MISMATCH, HEADING_LEVEL) rejects the whole batch and nothing is written. Pass expected_hash from read_sections for optimistic concurrency."
+        description = "Edit sections by heading_path: replace/append/delete (by scope body|section), insert_before/insert_after, rename (new_heading), move (to a destination section). All-or-nothing: any rejected edit (unresolved/ambiguous heading, overlap, HASH_MISMATCH, HEADING_LEVEL) rejects the whole batch and nothing is written. Pass expected_hash from read_sections for optimistic concurrency."
     )]
     pub async fn edit_sections(
         &self,

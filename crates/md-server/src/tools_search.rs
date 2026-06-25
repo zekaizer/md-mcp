@@ -26,9 +26,6 @@ fn default_search_limit() -> usize {
 fn default_context_lines() -> usize {
     2
 }
-fn default_mode() -> SearchMode {
-    SearchMode::Both
-}
 
 // --- list_notes -------------------------------------------------------------
 
@@ -44,6 +41,7 @@ pub struct ListNotesRequest {
     #[serde(default)]
     pub include_dirs: bool,
     #[serde(default = "default_list_limit")]
+    #[schemars(range(max = 1000))] // server clamps to 1..=1000
     pub limit: usize,
     #[serde(default)]
     pub cursor: Option<String>,
@@ -68,7 +66,7 @@ pub struct ListItem {
 
 // --- search_notes -----------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 #[schemars(crate = "rmcp::schemars")]
 pub enum SearchMode {
@@ -83,13 +81,14 @@ pub enum SearchMode {
 pub struct SearchNotesRequest {
     #[serde(default)]
     pub query: Option<String>,
-    #[serde(default = "default_mode")]
+    #[serde(default)]
     pub mode: SearchMode,
     #[serde(default)]
     pub frontmatter: Option<Map<String, Value>>,
     #[serde(default)]
     pub frontmatter_exists: Option<Map<String, Value>>,
     #[serde(default = "default_search_limit")]
+    #[schemars(range(max = 100))] // server clamps to 1..=100
     pub limit: usize,
     #[serde(default = "default_context_lines")]
     pub context_lines: usize,
