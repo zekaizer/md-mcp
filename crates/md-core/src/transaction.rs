@@ -85,6 +85,37 @@ impl Vault {
             }
         }
 
+        // Resolve op paths against the on-disk tree (NFC component matching),
+        // so an NFC-spelled batch operates on notes stored in NFD. A trailing
+        // '/' (directory convention) is preserved for the outcome echo.
+        let resolve = |p: &String| -> Result<String> {
+            let resolved = self.resolve_rel(strip_slash(p))?;
+            Ok(if p.ends_with('/') {
+                format!("{resolved}/")
+            } else {
+                resolved
+            })
+        };
+        let ops: Vec<Op> = ops
+            .iter()
+            .map(|op| {
+                Ok(match op {
+                    Op::Write { path, content } => Op::Write {
+                        path: resolve(path)?,
+                        content: content.clone(),
+                    },
+                    Op::Delete { path } => Op::Delete {
+                        path: resolve(path)?,
+                    },
+                    Op::Move { from, to } => Op::Move {
+                        from: resolve(from)?,
+                        to: resolve(to)?,
+                    },
+                })
+            })
+            .collect::<Result<_>>()?;
+        let ops = &ops[..];
+
         let batch_id = new_batch_id();
         let journal_path = format!("{JOURNAL_DIR}/{batch_id}.json");
         let mut journal = Journal {
