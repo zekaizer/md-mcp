@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use md_core::Vault;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool_handler};
 use tokio::sync::RwLock;
 
@@ -58,10 +59,23 @@ impl MdServer {
     }
 }
 
-#[tool_handler(
-    instructions = "md-mcp manages a single vault of pure-Markdown notes (.md + YAML frontmatter). Address notes by vault-relative path; read large notes via read_outlines then read_sections. Destructive batches are all-or-nothing."
-)]
-impl ServerHandler for MdServer {}
+#[tool_handler]
+impl ServerHandler for MdServer {
+    fn get_info(&self) -> ServerInfo {
+        // ServerInfo/Implementation are #[non_exhaustive]: mutate defaults.
+        let mut info = ServerInfo::default();
+        info.server_info.name = "md-mcp".into();
+        info.server_info.version = env!("CARGO_PKG_VERSION").into();
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.instructions = Some(
+            "md-mcp manages a single vault of pure-Markdown notes (.md + YAML frontmatter). \
+             Address notes by vault-relative path; read large notes via read_outlines then \
+             read_sections. Destructive batches are all-or-nothing."
+                .into(),
+        );
+        info
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -87,5 +101,13 @@ mod tests {
             instructions.contains("md-mcp"),
             "instructions: {instructions}"
         );
+    }
+
+    #[test]
+    fn identifies_itself_as_md_mcp() {
+        // Clients show serverInfo in UIs/logs; it must not be the framework's.
+        let info = server().get_info();
+        assert_eq!(info.server_info.name, "md-mcp");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
     }
 }
