@@ -387,6 +387,14 @@ impl MdServer {
             if is_dir { "/" } else { "" }
         );
         Vault::validate_rel(&to)?;
+        // A no-op rename would otherwise reach the commit stage, where backing
+        // up the destination removes the source and a raw IO error leaks out.
+        if strip_slash(&to) == strip_slash(&r.path) {
+            return Err(Error::new(
+                Code::Conflict,
+                format!("new_name is already the current name: {}", r.path),
+            ));
+        }
         Ok(to)
     }
 
@@ -524,6 +532,29 @@ mod tests {
         assert!(ok.ok);
         assert!(ok.deleted[0].trashed_to.starts_with(".md-mcp/trash/"));
         assert!(!s.vault().exists("a.md").unwrap());
+    }
+
+    #[tokio::test]
+    async fn noop_rename_is_an_indexed_validation_error() {
+        // Renaming to the current name used to fail at commit time with a raw
+        // un-indexed IO error (after a backup/rollback round-trip).
+        let (_d, s) = server(&[("a.md", "x")]);
+        let bad = s
+            .rename_notes(Parameters(RenameNotesRequest {
+                renames: vec![RenameItem {
+                    path: "a.md".into(),
+                    new_name: "a.md".into(),
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!bad.ok);
+        assert_eq!(bad.errors[0].code, "CONFLICT");
+        assert_eq!(bad.errors[0].index, Some(0));
+        assert!(bad.errors[0].message.contains("current name"));
+        assert!(s.vault().exists("a.md").unwrap());
     }
 
     #[tokio::test]
