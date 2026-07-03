@@ -394,7 +394,8 @@ fn check_expected_hash(
     } else {
         Err(Error::new(
             Code::HashMismatch,
-            "expected_hash does not match the current section",
+            "expected_hash does not match the current section; check that the read \
+             scope (body|section) matches this edit's scope, then re-read the section",
         ))
     }
 }
