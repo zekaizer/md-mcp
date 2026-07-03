@@ -328,7 +328,7 @@ frontmatter 편집기 — **item 하나 = (노트, key) 하나**의 atomic 단�
   "required": ["moves"]
 }
 ```
-디렉토리로 이동. `source`의 basename을 유지한 채 `dest_dir` 안으로 옮긴다.
+디렉토리로 이동. `source`의 basename을 유지한 채 `dest_dir` 안으로 옮긴다. `dest_dir: "/"`는 vault root(최상위)를 뜻한다.
 - **N → 1-dir**: 여러 item에 같은 `dest_dir`를 주면 여러 노트를 한 폴더로 모음.
 - **dir → dir**: `source`가 디렉토리면 subtree 통째 이동.
 - `dest_dir`가 없으면 중간 경로 포함 자동 생성(`create_notes`의 parent 생성과 동일 관례). 단 그 위치에 **노트(비-디렉토리)가 있으면 거부**.
