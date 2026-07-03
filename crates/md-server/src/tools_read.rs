@@ -348,8 +348,15 @@ impl MdServer {
             .iter()
             .map(|p| read_one_note(self.vault(), p, req.include_body, req.include_frontmatter))
             .collect();
-        let omitted =
-            enforce_content_budget(&mut notes, |n| n.content.as_deref().map_or(0, str::len));
+        // A note's response weight is its body plus its serialized frontmatter
+        // — a huge frontmatter must not slip past the budget.
+        let omitted = enforce_content_budget(&mut notes, |n| {
+            n.content.as_deref().map_or(0, str::len)
+                + n.frontmatter
+                    .as_ref()
+                    .and_then(|f| serde_json::to_string(f).ok())
+                    .map_or(0, |s| s.len())
+        });
         Ok(Json(ReadNotesResponse { notes, omitted }))
     }
 
@@ -524,6 +531,26 @@ mod tests {
         assert_eq!(s.note_exists, Some(true));
         assert!(!s.found);
         assert_eq!(s.error.unwrap().code, "AMBIGUOUS");
+    }
+
+    #[tokio::test]
+    async fn oversized_frontmatter_counts_against_the_budget() {
+        let items: String = (0..3500).map(|i| format!("- item-{i}-{}\n", "x".repeat(70))).collect();
+        let big = format!("---\ndata:\n{items}---\nsmall body\n");
+        let (_d, v) = vault_with(&[("bigfm.md", &big), ("small.md", "# S\nok\n")]);
+        let server = MdServer::new(v);
+        let resp = server
+            .read_notes(Parameters(ReadNotesRequest {
+                paths: vec!["bigfm.md".into(), "small.md".into()],
+                include_body: true,
+                include_frontmatter: true,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.omitted, vec![0]);
+        assert_eq!(resp.notes.len(), 1);
+        assert_eq!(resp.notes[0].path, "small.md");
     }
 
     #[tokio::test]
