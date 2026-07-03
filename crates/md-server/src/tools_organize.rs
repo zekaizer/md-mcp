@@ -321,6 +321,9 @@ impl MdServer {
 
     fn compute_rename(&self, r: &RenameItem) -> Result<String, Error> {
         Vault::validate_rel(&r.path)?;
+        if !self.vault().exists(&r.path).unwrap_or(false) {
+            return Err(Error::not_found(format!("source not found: {}", r.path)));
+        }
         if r.new_name.contains('/') {
             return Err(Error::new(
                 Code::Suffix,
@@ -353,6 +356,9 @@ impl MdServer {
 
     fn compute_relocate(&self, m: &RelocateItem) -> Result<String, Error> {
         Vault::validate_rel(&m.source)?;
+        if !self.vault().exists(&m.source).unwrap_or(false) {
+            return Err(Error::not_found(format!("source not found: {}", m.source)));
+        }
         if !is_dir_path(&m.dest_dir) {
             return Err(Error::new(Code::DestNotDir, "dest_dir must end with '/'"));
         }
@@ -530,6 +536,49 @@ mod tests {
         assert!(ok.ok);
         assert_eq!(ok.moved[0].to, "archive/a.md");
         assert!(s.vault().exists("archive/a.md").unwrap());
+    }
+
+    #[tokio::test]
+    async fn missing_source_is_an_indexed_not_found() {
+        // A missing source must fail validation as NOT_FOUND with the item's
+        // index — not leak a raw IO rename error from the commit stage.
+        let (_d, s) = server(&[("a.md", "x")]);
+        let bad = s
+            .relocate_notes(Parameters(RelocateNotesRequest {
+                moves: vec![
+                    RelocateItem {
+                        source: "a.md".into(),
+                        dest_dir: "archive/".into(),
+                    },
+                    RelocateItem {
+                        source: "ghost.md".into(),
+                        dest_dir: "archive/".into(),
+                    },
+                ],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!bad.ok);
+        assert_eq!(bad.errors[0].code, "NOT_FOUND");
+        assert_eq!(bad.errors[0].index, Some(1));
+        assert!(s.vault().exists("a.md").unwrap(), "all-or-nothing: a.md stays");
+
+        let bad = s
+            .rename_notes(Parameters(RenameNotesRequest {
+                renames: vec![RenameItem {
+                    path: "ghost.md".into(),
+                    new_name: "still-ghost.md".into(),
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!bad.ok);
+        assert_eq!(bad.errors[0].code, "NOT_FOUND");
+        assert_eq!(bad.errors[0].index, Some(0));
     }
 
     #[tokio::test]
