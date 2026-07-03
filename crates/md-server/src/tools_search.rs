@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::MdServer;
+use crate::envelope::limit_bounds;
 
 fn default_recursive() -> bool {
     true
@@ -41,7 +42,7 @@ pub struct ListNotesRequest {
     #[serde(default)]
     pub include_dirs: bool,
     #[serde(default = "default_list_limit")]
-    #[schemars(range(max = 1000))] // server clamps to 1..=1000
+    #[schemars(range(min = 1, max = 1000))] // server-enforced, see limit_bounds
     pub limit: usize,
     #[serde(default)]
     pub cursor: Option<String>,
@@ -88,7 +89,7 @@ pub struct SearchNotesRequest {
     #[serde(default)]
     pub frontmatter_exists: Option<Map<String, Value>>,
     #[serde(default = "default_search_limit")]
-    #[schemars(range(max = 100))] // server clamps to 1..=100
+    #[schemars(range(min = 1, max = 100))] // server-enforced, see limit_bounds
     pub limit: usize,
     #[serde(default = "default_context_lines")]
     pub context_lines: usize,
@@ -124,8 +125,9 @@ impl MdServer {
         &self,
         Parameters(req): Parameters<ListNotesRequest>,
     ) -> Result<Json<ListNotesResponse>, ErrorData> {
+        limit_bounds(req.limit, 1000)?;
         let _guard = self.lock().read().await;
-        let limit = req.limit.clamp(1, 1000);
+        let limit = req.limit;
         let entries = self
             .vault()
             .list_entries(
@@ -169,6 +171,7 @@ impl MdServer {
                 None,
             ));
         }
+        limit_bounds(req.limit, 100)?;
         let _guard = self.lock().read().await;
         Ok(Json(self.run_search(&req)))
     }
@@ -183,7 +186,7 @@ impl MdServer {
                 next_cursor: None,
             };
         }
-        let limit = req.limit.clamp(1, 100);
+        let limit = req.limit;
 
         let keywords: Vec<String> = req
             .query
@@ -345,6 +348,38 @@ mod tests {
             vault.write_atomic(p, b.as_bytes()).unwrap();
         }
         (dir, MdServer::new(vault))
+    }
+
+    #[tokio::test]
+    async fn out_of_range_limit_is_rejected() {
+        // The schema's min/max are not framework-enforced; the server rejects
+        // instead of silently clamping.
+        let (_d, s) = server(&[("a.md", "x")]);
+        for bad in [0usize, 1001] {
+            let r = s
+                .list_notes(Parameters(ListNotesRequest {
+                    directory: String::new(),
+                    recursive: true,
+                    glob: None,
+                    include_dirs: false,
+                    limit: bad,
+                    cursor: None,
+                }))
+                .await;
+            assert!(r.is_err(), "list limit {bad} must be rejected");
+        }
+        let r = s
+            .search_notes(Parameters(SearchNotesRequest {
+                query: Some("x".into()),
+                mode: SearchMode::default(),
+                frontmatter: None,
+                frontmatter_exists: None,
+                limit: 500,
+                context_lines: 2,
+                cursor: None,
+            }))
+            .await;
+        assert!(r.is_err(), "search limit 500 must be rejected");
     }
 
     #[tokio::test]
