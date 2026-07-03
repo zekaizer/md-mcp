@@ -332,7 +332,15 @@ impl MdServer {
         for (i, m) in moves.iter().enumerate() {
             match self.compute_relocate(m) {
                 Ok(to) => {
-                    if !overwrite && self.vault().exists(&to).unwrap_or(false) {
+                    if strip_slash(&to) == strip_slash(&m.source) {
+                        // A no-op move reads as "already exists" otherwise,
+                        // suggesting a different file is in the way.
+                        errors.push(err(
+                            i,
+                            Code::Conflict,
+                            format!("source is already in dest_dir: {}", m.source),
+                        ));
+                    } else if !overwrite && self.vault().exists(&to).unwrap_or(false) {
                         errors.push(err(
                             i,
                             Code::Conflict,
@@ -516,6 +524,28 @@ mod tests {
         assert!(ok.ok);
         assert!(ok.deleted[0].trashed_to.starts_with(".md-mcp/trash/"));
         assert!(!s.vault().exists("a.md").unwrap());
+    }
+
+    #[tokio::test]
+    async fn noop_relocate_names_the_actual_problem() {
+        let (_d, s) = server(&[("d/n.md", "x")]);
+        let bad = s
+            .relocate_notes(Parameters(RelocateNotesRequest {
+                moves: vec![RelocateItem {
+                    source: "d/n.md".into(),
+                    dest_dir: "d/".into(),
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!bad.ok);
+        assert!(
+            bad.errors[0].message.contains("already in dest_dir"),
+            "message: {}",
+            bad.errors[0].message
+        );
     }
 
     #[tokio::test]
