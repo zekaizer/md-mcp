@@ -49,6 +49,17 @@ fn overlap(a: &str, b: &str) -> bool {
     contains(a, b) || contains(b, a)
 }
 
+/// Echo an on-disk path with the directory suffix convention: when the caller
+/// addressed a directory (trailing `/`), the echoed path ends with `/` too, so
+/// it can be fed straight back into dest_dir/path arguments.
+fn with_dir_suffix(actual: String, requested: &str) -> String {
+    if is_dir_path(requested) && !actual.ends_with('/') {
+        format!("{actual}/")
+    } else {
+        actual
+    }
+}
+
 fn err(index: usize, code: Code, message: impl Into<String>) -> ApiError {
     ApiError {
         code: code.as_str().to_string(),
@@ -159,6 +170,16 @@ pub struct MoveResponse {
 
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
+pub struct RenameResponse {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub renamed: Vec<MovedItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<ApiError>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 pub struct MovedItem {
     pub from: String,
     pub to: String,
@@ -186,10 +207,15 @@ impl MdServer {
     pub async fn rename_notes(
         &self,
         Parameters(req): Parameters<RenameNotesRequest>,
-    ) -> Result<Json<MoveResponse>, ErrorData> {
+    ) -> Result<Json<RenameResponse>, ErrorData> {
         batch_limit(req.renames.len())?;
         let _guard = self.lock().write().await;
-        Ok(Json(self.run_rename(&req.renames, req.overwrite)))
+        let r = self.run_rename(&req.renames, req.overwrite);
+        Ok(Json(RenameResponse {
+            ok: r.ok,
+            renamed: r.moved,
+            errors: r.errors,
+        }))
     }
 
     /// Move notes or directories into a destination directory. All-or-nothing.
@@ -251,10 +277,12 @@ impl MdServer {
             Ok(outcomes) => {
                 let deleted = outcomes
                     .into_iter()
-                    .filter_map(|o| match o {
-                        OpOutcome::Deleted { path, trashed_to } => {
-                            Some(DeletedItem { path, trashed_to })
-                        }
+                    .zip(paths)
+                    .filter_map(|(o, requested)| match o {
+                        OpOutcome::Deleted { path, trashed_to } => Some(DeletedItem {
+                            path: with_dir_suffix(path, requested),
+                            trashed_to,
+                        }),
                         _ => None,
                     })
                     .collect();
@@ -426,8 +454,12 @@ impl MdServer {
             Ok(outcomes) => {
                 let moved = outcomes
                     .into_iter()
-                    .filter_map(|o| match o {
-                        OpOutcome::Moved { from, to } => Some(MovedItem { from, to }),
+                    .zip(&pairs)
+                    .filter_map(|(o, (_, pfrom, pto))| match o {
+                        OpOutcome::Moved { from, to } => Some(MovedItem {
+                            from: with_dir_suffix(from, pfrom),
+                            to: with_dir_suffix(to, pto),
+                        }),
                         _ => None,
                     })
                     .collect();
@@ -487,6 +519,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dir_echoes_keep_the_trailing_slash() {
+        // Echoed directory paths follow the suffix convention so they can be
+        // fed straight back into path/dest_dir arguments.
+        let (_d, s) = server(&[("d/n.md", "x")]);
+        let ok = s
+            .rename_notes(Parameters(RenameNotesRequest {
+                renames: vec![RenameItem {
+                    path: "d/".into(),
+                    new_name: "e".into(),
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(ok.renamed[0].from, "d/");
+        assert_eq!(ok.renamed[0].to, "e/");
+
+        let ok = s
+            .relocate_notes(Parameters(RelocateNotesRequest {
+                moves: vec![RelocateItem {
+                    source: "e/".into(),
+                    dest_dir: "arch/".into(),
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(ok.moved[0].to, "arch/e/");
+
+        let ok = s
+            .delete_notes(Parameters(DeleteNotesRequest {
+                paths: vec!["arch/e/".into()],
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(ok.deleted[0].path, "arch/e/");
+    }
+
+    #[tokio::test]
     async fn rename_in_place_with_suffix_rules() {
         let (_d, s) = server(&[("note.md", "x")]);
         let ok = s
@@ -501,7 +575,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(ok.ok);
-        assert_eq!(ok.moved[0].to, "renamed.md");
+        assert_eq!(ok.renamed[0].to, "renamed.md");
         assert!(s.vault().exists("renamed.md").unwrap());
 
         // A slash in new_name is rejected.
