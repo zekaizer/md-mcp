@@ -13,7 +13,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use cap_tempfile::TempFile;
 
-use crate::error::{Error, Result};
+use crate::error::{Code, Error, Result};
 
 /// The server's internal state directory, off-limits to agent note operations.
 pub(crate) const INTERNAL_DIR: &str = ".md-mcp";
@@ -155,6 +155,14 @@ impl Vault {
     /// renames it over the target — so a reader sees the old or the complete new
     /// file, never a torn one.
     pub fn write_atomic(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        // A trailing '/' denotes a directory (suffix convention); silently
+        // stripping it would write a file where the caller expected a directory.
+        if rel.ends_with('/') {
+            return Err(Error::new(
+                Code::Suffix,
+                format!("a note path must not end with '/': {rel}"),
+            ));
+        }
         let clean = Self::validate_rel(rel)?;
         let clean_path = Path::new(&clean);
         let name = clean_path
@@ -342,6 +350,17 @@ mod tests {
     }
 
     // --- create guard -------------------------------------------------------
+
+    #[test]
+    fn create_rejects_directory_suffix_path() {
+        // `new/dir/` must not silently become a regular file named `dir`.
+        let (_v, vault) = temp_vault();
+        for p in ["new/dir/", "top/"] {
+            let e = vault.create_note(p, b"x", false).unwrap_err();
+            assert_eq!(e.code, Code::Suffix, "expected SUFFIX for {p:?}");
+            assert!(!vault.exists(p).unwrap(), "nothing must be created for {p:?}");
+        }
+    }
 
     #[test]
     fn create_refuses_existing_without_overwrite() {
