@@ -148,6 +148,11 @@ pub struct ReadOutlinesRequest {
 #[schemars(crate = "rmcp::schemars")]
 pub struct ReadOutlinesResponse {
     pub outlines: Vec<NoteOutline>,
+    /// Request indexes dropped to keep the response under the content budget
+    /// (a pathological note with thousands of headings); narrow the request
+    /// or read the note via read_sections.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub omitted: Vec<usize>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -339,12 +344,19 @@ impl MdServer {
     ) -> Result<Json<ReadOutlinesResponse>, ErrorData> {
         batch_limit(req.paths.len())?;
         let _guard = self.lock().read().await;
-        let outlines = req
+        let mut outlines: Vec<NoteOutline> = req
             .paths
             .iter()
             .map(|p| read_one_outline(self.vault(), p))
             .collect();
-        Ok(Json(ReadOutlinesResponse { outlines }))
+        // An outline's cost is its serialized headings, not note content.
+        let omitted = enforce_content_budget(&mut outlines, |o| {
+            o.headings
+                .as_ref()
+                .and_then(|h| serde_json::to_string(h).ok())
+                .map_or(0, |s| s.len())
+        });
+        Ok(Json(ReadOutlinesResponse { outlines, omitted }))
     }
 
     /// Read specific sections by heading path, with their content_hash.
@@ -464,6 +476,26 @@ mod tests {
         let s = read_one_section(&v, &t);
         assert!(s.note_exists && !s.found);
         assert_eq!(s.error.unwrap().code, "AMBIGUOUS");
+    }
+
+    #[tokio::test]
+    async fn oversized_outline_is_dropped_and_reported_omitted() {
+        // ~3500 headings serialize past the content budget.
+        let big: String = (0..3500)
+            .map(|i| format!("# Heading number {i} with some padding\nx\n"))
+            .collect();
+        let (_d, v) = vault_with(&[("many.md", &big), ("small.md", "# S\nok\n")]);
+        let server = MdServer::new(v);
+        let resp = server
+            .read_outlines(Parameters(ReadOutlinesRequest {
+                paths: vec!["many.md".into(), "small.md".into()],
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.omitted, vec![0]);
+        assert_eq!(resp.outlines.len(), 1);
+        assert_eq!(resp.outlines[0].path, "small.md");
     }
 
     #[tokio::test]
