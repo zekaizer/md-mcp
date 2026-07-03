@@ -30,12 +30,8 @@ pub fn parse(source: &str) -> Result<Option<Value>> {
     if inner.trim().is_empty() {
         return Ok(Some(Value::Object(serde_json::Map::new())));
     }
-    let value = serde_saphyr::from_str_with_options::<Value>(inner, de_options()).map_err(|e| {
-        Error::new(
-            Code::FrontmatterParse,
-            format!("invalid frontmatter YAML: {e}"),
-        )
-    })?;
+    let value = serde_saphyr::from_str_with_options::<Value>(inner, de_options())
+        .map_err(|e| parse_error(&e))?;
     Ok(Some(value))
 }
 
@@ -129,12 +125,37 @@ fn validate_block(inner: &str) -> Result<()> {
     }
     serde_saphyr::from_str_with_options::<Value>(inner, de_options())
         .map(|_: Value| ())
-        .map_err(|e| {
-            Error::new(
-                Code::FrontmatterParse,
-                format!("invalid frontmatter YAML: {e}"),
-            )
-        })
+        .map_err(|e| parse_error(&e))
+}
+
+/// Build a `FrontmatterParse` error, stripping the deserializer's Rust-facing
+/// remediation hints (e.g. "set DuplicateKeyPolicy in Options if acceptable")
+/// that mean nothing to a tool caller.
+fn parse_error(e: &impl std::fmt::Display) -> Error {
+    let msg = e
+        .to_string()
+        .replace(", set DuplicateKeyPolicy in Options if acceptable", "");
+    Error::new(
+        Code::FrontmatterParse,
+        format!("invalid frontmatter YAML: {msg}"),
+    )
+}
+
+#[cfg(test)]
+mod parse_error_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_key_message_drops_library_hint() {
+        let e = parse("---\nk: 1\nk: 2\n---\nbody\n").unwrap_err();
+        assert_eq!(e.code, Code::FrontmatterParse);
+        assert!(
+            !e.message.contains("DuplicateKeyPolicy"),
+            "message leaks library internals: {}",
+            e.message
+        );
+        assert!(e.message.contains("duplicate mapping key"));
+    }
 }
 
 fn split_inner(inner: &str) -> Vec<String> {
