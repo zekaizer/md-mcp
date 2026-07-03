@@ -77,7 +77,10 @@ pub struct ReadNotesResponse {
 #[schemars(crate = "rmcp::schemars")]
 pub struct NoteRead {
     pub path: String,
-    pub exists: bool,
+    /// `true`/`false` when known; omitted when the read failed for a reason
+    /// other than absence (e.g. TRAVERSAL), where existence is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exists: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,7 +95,7 @@ fn read_one_note(vault: &Vault, path: &str, include_body: bool, include_fm: bool
         Err(e) if e.code == md_core::Code::NotFound => {
             return NoteRead {
                 path: path.to_string(),
-                exists: false,
+                exists: Some(false),
                 content: None,
                 frontmatter: None,
                 error: None,
@@ -101,7 +104,7 @@ fn read_one_note(vault: &Vault, path: &str, include_body: bool, include_fm: bool
         Err(e) => {
             return NoteRead {
                 path: path.to_string(),
-                exists: true,
+                exists: None,
                 content: None,
                 frontmatter: None,
                 error: Some(ApiError::from_core(&e)),
@@ -128,7 +131,7 @@ fn read_one_note(vault: &Vault, path: &str, include_body: bool, include_fm: bool
 
     NoteRead {
         path: path.to_string(),
-        exists: true,
+        exists: Some(true),
         content,
         frontmatter,
         error,
@@ -148,13 +151,21 @@ pub struct ReadOutlinesRequest {
 #[schemars(crate = "rmcp::schemars")]
 pub struct ReadOutlinesResponse {
     pub outlines: Vec<NoteOutline>,
+    /// Request indexes dropped to keep the response under the content budget
+    /// (a pathological note with thousands of headings); narrow the request
+    /// or read the note via read_sections.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub omitted: Vec<usize>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct NoteOutline {
     pub path: String,
-    pub exists: bool,
+    /// `true`/`false` when known; omitted when the read failed for a reason
+    /// other than absence, where existence is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exists: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headings: Option<Vec<HeadingEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,20 +199,20 @@ fn read_one_outline(vault: &Vault, path: &str) -> NoteOutline {
                 .collect();
             NoteOutline {
                 path: path.to_string(),
-                exists: true,
+                exists: Some(true),
                 headings: Some(headings),
                 error: None,
             }
         }
         Err(e) if e.code == md_core::Code::NotFound => NoteOutline {
             path: path.to_string(),
-            exists: false,
+            exists: Some(false),
             headings: None,
             error: None,
         },
         Err(e) => NoteOutline {
             path: path.to_string(),
-            exists: true,
+            exists: None,
             headings: None,
             error: Some(ApiError::from_core(&e)),
         },
@@ -247,7 +258,10 @@ pub struct SectionRead {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub occurrence: Option<usize>,
     pub scope: String,
-    pub note_exists: bool,
+    /// `true`/`false` when known; omitted when the read failed for a reason
+    /// other than absence, where existence is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_exists: Option<bool>,
     pub found: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -264,15 +278,25 @@ fn read_one_section(vault: &Vault, t: &SectionTarget) -> SectionRead {
         heading_path: t.heading_path.clone(),
         occurrence: t.occurrence,
         scope: ScopeArg::as_str(t.scope).to_string(),
-        note_exists: false,
+        note_exists: Some(false),
         found: false,
         content: None,
         content_hash: None,
         error: None,
     };
 
-    let Ok(raw) = vault.read_note(&t.path) else {
-        return base;
+    let raw = match vault.read_note(&t.path) {
+        Ok(raw) => raw,
+        Err(e) if e.code == md_core::Code::NotFound => return base,
+        // A non-absence failure (e.g. TRAVERSAL): existence is unknown and the
+        // reason must not be swallowed.
+        Err(e) => {
+            return SectionRead {
+                note_exists: None,
+                error: Some(ApiError::from_core(&e)),
+                ..base
+            };
+        }
     };
     let normalized = md_core::text::normalize_newlines(&raw).into_owned();
     let doc = Document::parse(&normalized);
@@ -291,7 +315,7 @@ fn read_one_section(vault: &Vault, t: &SectionTarget) -> SectionRead {
             let content = doc.section_content(&normalized, idx, scope).to_string();
             let hash = doc.content_hash(&normalized, idx, scope);
             SectionRead {
-                note_exists: true,
+                note_exists: Some(true),
                 found: true,
                 content: Some(content),
                 content_hash: Some(hash),
@@ -299,7 +323,7 @@ fn read_one_section(vault: &Vault, t: &SectionTarget) -> SectionRead {
             }
         }
         Err(e) => SectionRead {
-            note_exists: true,
+            note_exists: Some(true),
             found: false,
             error: Some(ApiError::from_core(&e)),
             ..base
@@ -339,12 +363,19 @@ impl MdServer {
     ) -> Result<Json<ReadOutlinesResponse>, ErrorData> {
         batch_limit(req.paths.len())?;
         let _guard = self.lock().read().await;
-        let outlines = req
+        let mut outlines: Vec<NoteOutline> = req
             .paths
             .iter()
             .map(|p| read_one_outline(self.vault(), p))
             .collect();
-        Ok(Json(ReadOutlinesResponse { outlines }))
+        // An outline's cost is its serialized headings, not note content.
+        let omitted = enforce_content_budget(&mut outlines, |o| {
+            o.headings
+                .as_ref()
+                .and_then(|h| serde_json::to_string(h).ok())
+                .map_or(0, |s| s.len())
+        });
+        Ok(Json(ReadOutlinesResponse { outlines, omitted }))
     }
 
     /// Read specific sections by heading path, with their content_hash.
@@ -385,7 +416,7 @@ mod tests {
     fn read_note_returns_body_without_frontmatter() {
         let (_d, v) = vault_with(&[("n.md", "---\ntitle: T\n---\n# Body\ntext\n")]);
         let r = read_one_note(&v, "n.md", true, true);
-        assert!(r.exists);
+        assert_eq!(r.exists, Some(true));
         assert_eq!(r.content.as_deref(), Some("# Body\ntext\n"));
         assert_eq!(r.frontmatter.unwrap()["title"], serde_json::json!("T"));
     }
@@ -394,15 +425,40 @@ mod tests {
     fn read_note_missing_reports_exists_false() {
         let (_d, v) = vault_with(&[]);
         let r = read_one_note(&v, "nope.md", true, true);
-        assert!(!r.exists);
+        assert_eq!(r.exists, Some(false));
         assert!(r.error.is_none());
+    }
+
+    #[test]
+    fn read_error_without_absence_leaves_existence_unknown() {
+        // A TRAVERSAL failure says nothing about existence: don't claim true.
+        let (_d, v) = vault_with(&[]);
+        let r = read_one_note(&v, "../outside.md", true, true);
+        assert_eq!(r.exists, None);
+        assert_eq!(r.error.unwrap().code, "TRAVERSAL");
+
+        let o = read_one_outline(&v, "../outside.md");
+        assert_eq!(o.exists, None);
+        assert_eq!(o.error.unwrap().code, "TRAVERSAL");
+
+        // read_sections used to swallow the error entirely and report
+        // note_exists:false — indistinguishable from a missing note.
+        let t = SectionTarget {
+            path: "../outside.md".into(),
+            heading_path: vec![],
+            occurrence: None,
+            scope: ScopeArg::Section,
+        };
+        let s = read_one_section(&v, &t);
+        assert_eq!(s.note_exists, None);
+        assert_eq!(s.error.unwrap().code, "TRAVERSAL");
     }
 
     #[test]
     fn read_note_broken_frontmatter_reports_error() {
         let (_d, v) = vault_with(&[("b.md", "---\nx: : :\n bad\n---\nbody\n")]);
         let r = read_one_note(&v, "b.md", true, true);
-        assert!(r.exists);
+        assert_eq!(r.exists, Some(true));
         assert_eq!(r.error.unwrap().code, "FRONTMATTER_PARSE");
     }
 
@@ -425,7 +481,8 @@ mod tests {
             scope: ScopeArg::Body,
         };
         let s = read_one_section(&v, &t);
-        assert!(s.note_exists && s.found);
+        assert_eq!(s.note_exists, Some(true));
+        assert!(s.found);
         assert_eq!(s.content.as_deref(), Some("lead\n"));
         assert_eq!(s.content_hash.unwrap().len(), 64);
     }
@@ -440,7 +497,8 @@ mod tests {
             scope: ScopeArg::Section,
         };
         let s = read_one_section(&v, &t);
-        assert!(s.note_exists && !s.found);
+        assert_eq!(s.note_exists, Some(true));
+        assert!(!s.found);
 
         let missing = SectionTarget {
             path: "no.md".into(),
@@ -449,7 +507,8 @@ mod tests {
             scope: ScopeArg::Section,
         };
         let s2 = read_one_section(&v, &missing);
-        assert!(!s2.note_exists && !s2.found);
+        assert_eq!(s2.note_exists, Some(false));
+        assert!(!s2.found);
     }
 
     #[test]
@@ -462,8 +521,29 @@ mod tests {
             scope: ScopeArg::Section,
         };
         let s = read_one_section(&v, &t);
-        assert!(s.note_exists && !s.found);
+        assert_eq!(s.note_exists, Some(true));
+        assert!(!s.found);
         assert_eq!(s.error.unwrap().code, "AMBIGUOUS");
+    }
+
+    #[tokio::test]
+    async fn oversized_outline_is_dropped_and_reported_omitted() {
+        // ~3500 headings serialize past the content budget.
+        let big: String = (0..3500)
+            .map(|i| format!("# Heading number {i} with some padding\nx\n"))
+            .collect();
+        let (_d, v) = vault_with(&[("many.md", &big), ("small.md", "# S\nok\n")]);
+        let server = MdServer::new(v);
+        let resp = server
+            .read_outlines(Parameters(ReadOutlinesRequest {
+                paths: vec!["many.md".into(), "small.md".into()],
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.omitted, vec![0]);
+        assert_eq!(resp.outlines.len(), 1);
+        assert_eq!(resp.outlines[0].path, "small.md");
     }
 
     #[tokio::test]
@@ -524,7 +604,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.0.notes.len(), 2);
-        assert!(resp.0.notes[0].exists);
-        assert!(!resp.0.notes[1].exists);
+        assert_eq!(resp.0.notes[0].exists, Some(true));
+        assert_eq!(resp.0.notes[1].exists, Some(false));
     }
 }

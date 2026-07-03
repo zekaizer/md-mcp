@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::MdServer;
+use crate::envelope::limit_bounds;
 
 fn default_recursive() -> bool {
     true
@@ -41,7 +42,7 @@ pub struct ListNotesRequest {
     #[serde(default)]
     pub include_dirs: bool,
     #[serde(default = "default_list_limit")]
-    #[schemars(range(max = 1000))] // server clamps to 1..=1000
+    #[schemars(range(min = 1, max = 1000))] // server-enforced, see limit_bounds
     pub limit: usize,
     #[serde(default)]
     pub cursor: Option<String>,
@@ -88,7 +89,7 @@ pub struct SearchNotesRequest {
     #[serde(default)]
     pub frontmatter_exists: Option<Map<String, Value>>,
     #[serde(default = "default_search_limit")]
-    #[schemars(range(max = 100))] // server clamps to 1..=100
+    #[schemars(range(min = 1, max = 100))] // server-enforced, see limit_bounds
     pub limit: usize,
     #[serde(default = "default_context_lines")]
     pub context_lines: usize,
@@ -110,6 +111,10 @@ pub struct SearchItem {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
+    /// Number of body lines with a keyword hit; the snippet shows only the
+    /// first, so a value > 1 means there is more than what the snippet shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frontmatter: Option<Value>,
 }
@@ -124,8 +129,9 @@ impl MdServer {
         &self,
         Parameters(req): Parameters<ListNotesRequest>,
     ) -> Result<Json<ListNotesResponse>, ErrorData> {
+        limit_bounds(req.limit, 1000)?;
         let _guard = self.lock().read().await;
-        let limit = req.limit.clamp(1, 1000);
+        let limit = req.limit;
         let entries = self
             .vault()
             .list_entries(
@@ -169,6 +175,7 @@ impl MdServer {
                 None,
             ));
         }
+        limit_bounds(req.limit, 100)?;
         let _guard = self.lock().read().await;
         Ok(Json(self.run_search(&req)))
     }
@@ -183,7 +190,7 @@ impl MdServer {
                 next_cursor: None,
             };
         }
-        let limit = req.limit.clamp(1, 100);
+        let limit = req.limit;
 
         let keywords: Vec<String> = req
             .query
@@ -226,7 +233,7 @@ impl MdServer {
                 .whole_body_span()
                 .of(&normalized)
                 .to_string();
-            let (text_ok, snippet) =
+            let (text_ok, snippet, match_count) =
                 self.match_query(req, &keywords, automaton.as_ref(), &entry.path, &body);
             if has_query && !text_ok {
                 continue;
@@ -247,6 +254,7 @@ impl MdServer {
             matches.push(SearchItem {
                 path: entry.path,
                 snippet,
+                match_count,
                 frontmatter: echoed_fm,
             });
             if matches.len() > limit {
@@ -296,7 +304,7 @@ impl MdServer {
         automaton: Option<&AhoCorasick>,
         path: &str,
         body: &str,
-    ) -> (bool, Option<String>) {
+    ) -> (bool, Option<String>, Option<usize>) {
         let want_content = matches!(req.mode, SearchMode::Content | SearchMode::Both);
         let want_filename = matches!(req.mode, SearchMode::Filename | SearchMode::Both);
         let query_lower = req.query.as_deref().unwrap_or_default().to_lowercase();
@@ -306,19 +314,23 @@ impl MdServer {
 
         let mut content_hit = false;
         let mut snippet = None;
+        let mut match_count = None;
         if want_content && let Some(ac) = automaton {
             let mut seen = vec![false; keywords.len()];
             let mut first: Option<usize> = None;
+            let mut hit_lines = std::collections::BTreeSet::new();
             for m in ac.find_iter(body) {
                 seen[m.pattern().as_usize()] = true;
                 first.get_or_insert(m.start());
+                hit_lines.insert(body[..m.start()].bytes().filter(|&b| b == b'\n').count());
             }
             if seen.iter().all(|&s| s) {
                 content_hit = true;
                 snippet = first.map(|off| build_snippet(body, off, req.context_lines));
+                match_count = Some(hit_lines.len());
             }
         }
-        (filename_hit || content_hit, snippet)
+        (filename_hit || content_hit, snippet, match_count)
     }
 }
 
@@ -345,6 +357,58 @@ mod tests {
             vault.write_atomic(p, b.as_bytes()).unwrap();
         }
         (dir, MdServer::new(vault))
+    }
+
+    #[tokio::test]
+    async fn match_count_reveals_hits_beyond_the_snippet() {
+        let (_d, s) = server(&[("m.md", "# One\nfindme a.\nfiller\nfindme b.\n\n# Two\nfindme c.\n")]);
+        let r = s
+            .search_notes(Parameters(SearchNotesRequest {
+                query: Some("findme".into()),
+                mode: SearchMode::default(),
+                frontmatter: None,
+                frontmatter_exists: None,
+                limit: 20,
+                context_lines: 0,
+                cursor: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(r.items[0].match_count, Some(3));
+        assert_eq!(r.items[0].snippet.as_deref(), Some("findme a."));
+    }
+
+    #[tokio::test]
+    async fn out_of_range_limit_is_rejected() {
+        // The schema's min/max are not framework-enforced; the server rejects
+        // instead of silently clamping.
+        let (_d, s) = server(&[("a.md", "x")]);
+        for bad in [0usize, 1001] {
+            let r = s
+                .list_notes(Parameters(ListNotesRequest {
+                    directory: String::new(),
+                    recursive: true,
+                    glob: None,
+                    include_dirs: false,
+                    limit: bad,
+                    cursor: None,
+                }))
+                .await;
+            assert!(r.is_err(), "list limit {bad} must be rejected");
+        }
+        let r = s
+            .search_notes(Parameters(SearchNotesRequest {
+                query: Some("x".into()),
+                mode: SearchMode::default(),
+                frontmatter: None,
+                frontmatter_exists: None,
+                limit: 500,
+                context_lines: 2,
+                cursor: None,
+            }))
+            .await;
+        assert!(r.is_err(), "search limit 500 must be rejected");
     }
 
     #[tokio::test]

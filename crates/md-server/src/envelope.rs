@@ -20,6 +20,20 @@ pub fn batch_limit(n: usize) -> Result<(), ErrorData> {
     }
 }
 
+/// Reject an out-of-range `limit` as invalid params instead of silently
+/// clamping — the inputSchema's declared bounds are otherwise decorative
+/// (the framework does not enforce numeric min/max).
+pub fn limit_bounds(limit: usize, max: usize) -> Result<(), ErrorData> {
+    if limit == 0 || limit > max {
+        Err(ErrorData::invalid_params(
+            format!("limit must be between 1 and {max}, got {limit}"),
+            None,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Total content-byte budget for one content-bearing read response
 /// ([tool_spec §4 토큰 비용 통제]). Items past the budget are dropped whole and
 /// reported by index in `omitted` — content is never truncated mid-item; a big
