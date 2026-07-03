@@ -788,7 +788,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(ok_or_dump(&resp));
-        assert_eq!(s.vault().read_note("a.md").unwrap(), "# B\nbx\n# A\nax\n");
+        assert_eq!(s.vault().read_note("a.md").unwrap(), "# B\nbx\n\n# A\nax\n");
         // The move echoes the section's new heading path and content_hash.
         assert_eq!(
             resp.applied[0].new_heading_path,

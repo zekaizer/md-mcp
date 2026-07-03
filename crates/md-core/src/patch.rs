@@ -304,6 +304,20 @@ fn resolve_move(
         moved.push('\n');
     }
 
+    // Keep a blank line at both insertion seams (only ever adds, never
+    // removes) so the moved section is not glued to its new neighbours.
+    let bytes = source.as_bytes();
+    if dest_pos > 0 {
+        if bytes[dest_pos - 1] != b'\n' {
+            moved.insert_str(0, "\n\n");
+        } else if dest_pos >= 2 && bytes[dest_pos - 2] != b'\n' {
+            moved.insert(0, '\n');
+        }
+    }
+    if dest_pos < source.len() && !moved.ends_with("\n\n") {
+        moved.push('\n');
+    }
+
     Ok(vec![
         Splice {
             start: src_span.start,
@@ -622,7 +636,7 @@ mod tests {
             }),
             ..Edit::default()
         };
-        assert_eq!(apply(src, vec![e]), "# C\ncx\n# A\nax\n# B\nbx\n");
+        assert_eq!(apply(src, vec![e]), "# C\ncx\n\n# A\nax\n# B\nbx\n");
     }
 
     #[test]
@@ -638,7 +652,7 @@ mod tests {
             }),
             ..Edit::default()
         };
-        assert_eq!(apply(src, vec![e]), "# B\nbx\n# A\nax\n");
+        assert_eq!(apply(src, vec![e]), "# B\nbx\n\n# A\nax\n");
     }
 
     #[test]
@@ -751,7 +765,7 @@ mod tests {
             }),
             ..Edit::default()
         };
-        assert_eq!(apply(src, vec![e]), "# A\nax\n# B\nbx\n## B1\nb1\n## A1\na1\n");
+        assert_eq!(apply(src, vec![e]), "# A\nax\n# B\nbx\n## B1\nb1\n\n## A1\na1\n");
     }
 
     #[test]
