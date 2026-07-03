@@ -218,9 +218,20 @@ impl Vault {
 
         let owned_parent = match parent {
             Some(p) => {
-                self.root
-                    .create_dir_all(p)
-                    .map_err(|e| Error::io(format!("mkdir {}: {e}", p.display())))?;
+                self.root.create_dir_all(p).map_err(|e| {
+                    // create_dir_all only reports these when an existing entry
+                    // on the way is a file, not a directory.
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory
+                    ) {
+                        Error::conflict(format!(
+                            "a parent of {rel} is occupied by a note, not a directory"
+                        ))
+                    } else {
+                        Error::io(format!("mkdir {}: {e}", p.display()))
+                    }
+                })?;
                 Some(
                     self.root
                         .open_dir(p)
@@ -432,6 +443,16 @@ mod tests {
             .unwrap();
         assert!(matches!(&outcomes[0], crate::OpOutcome::Deleted { path, .. } if path == nfd));
         assert!(!vault.exists(nfd).unwrap());
+    }
+
+    #[test]
+    fn create_under_a_note_occupied_parent_is_a_conflict() {
+        let (_v, vault) = temp_vault();
+        vault.create_note("a.md", b"x", false).unwrap();
+        for p in ["a.md/child.md", "a.md/deep/child.md"] {
+            let e = vault.create_note(p, b"y", false).unwrap_err();
+            assert_eq!(e.code, Code::Conflict, "expected CONFLICT for {p:?}: {e}");
+        }
     }
 
     #[test]

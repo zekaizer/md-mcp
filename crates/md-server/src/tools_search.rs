@@ -192,10 +192,16 @@ impl MdServer {
         }
         let limit = req.limit;
 
+        // Keywords and scanned text are NFC-normalized (tool_spec §4): an NFC
+        // query must find NFD-authored content synced from macOS.
         let keywords: Vec<String> = req
             .query
             .as_deref()
-            .map(|q| q.split_whitespace().map(str::to_lowercase).collect())
+            .map(|q| {
+                q.split_whitespace()
+                    .map(|w| md_core::text::nfc(w).to_lowercase())
+                    .collect()
+            })
             .unwrap_or_default();
         let automaton = (!keywords.is_empty())
             .then(|| {
@@ -233,6 +239,7 @@ impl MdServer {
                 .whole_body_span()
                 .of(&normalized)
                 .to_string();
+            let body = md_core::text::nfc(&body).into_owned();
             let (text_ok, snippet, match_count) =
                 self.match_query(req, &keywords, automaton.as_ref(), &entry.path, &body);
             if has_query && !text_ok {
@@ -307,10 +314,11 @@ impl MdServer {
     ) -> (bool, Option<String>, Option<usize>) {
         let want_content = matches!(req.mode, SearchMode::Content | SearchMode::Both);
         let want_filename = matches!(req.mode, SearchMode::Filename | SearchMode::Both);
-        let query_lower = req.query.as_deref().unwrap_or_default().to_lowercase();
+        let query_lower = md_core::text::nfc(req.query.as_deref().unwrap_or_default()).to_lowercase();
 
-        let filename_hit =
-            want_filename && !query_lower.is_empty() && path.to_lowercase().contains(&query_lower);
+        let filename_hit = want_filename
+            && !query_lower.is_empty()
+            && md_core::text::nfc(path).to_lowercase().contains(&query_lower);
 
         let mut content_hit = false;
         let mut snippet = None;
@@ -357,6 +365,44 @@ mod tests {
             vault.write_atomic(p, b.as_bytes()).unwrap();
         }
         (dir, MdServer::new(vault))
+    }
+
+    #[tokio::test]
+    async fn nfc_query_finds_nfd_content_and_filename() {
+        // "\u{d55c}\u{ae00}" (NFC) vs NFD jamo sequence on disk.
+        let nfd_word = "\u{1112}\u{1161}\u{11ab}\u{1100}\u{1173}\u{11af}"; // 한글 in NFD
+        let body = format!("# T\n{nfd_word} content here\n");
+        let nfd_name = format!("{nfd_word}.md");
+        let (_d, s) = server(&[(nfd_name.as_str(), body.as_str())]);
+        let r = s
+            .search_notes(Parameters(SearchNotesRequest {
+                query: Some("\u{d55c}\u{ae00}".into()),
+                mode: SearchMode::default(),
+                frontmatter: None,
+                frontmatter_exists: None,
+                limit: 20,
+                context_lines: 0,
+                cursor: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(r.items.len(), 1, "NFC query must match NFD content");
+        assert!(r.items[0].snippet.is_some());
+        let r = s
+            .search_notes(Parameters(SearchNotesRequest {
+                query: Some("\u{d55c}\u{ae00}".into()),
+                mode: SearchMode::Filename,
+                frontmatter: None,
+                frontmatter_exists: None,
+                limit: 20,
+                context_lines: 0,
+                cursor: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(r.items.len(), 1, "NFC query must match NFD filename");
     }
 
     #[tokio::test]

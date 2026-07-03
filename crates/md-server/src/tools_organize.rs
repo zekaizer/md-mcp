@@ -154,7 +154,8 @@ pub struct RelocateNotesRequest {
 #[schemars(crate = "rmcp::schemars")]
 pub struct RelocateItem {
     pub source: String,
-    /// Destination directory (ends with `/`); the source basename is kept.
+    /// Destination directory (ends with `/`; `/` alone is the vault root);
+    /// the source basename is kept.
     pub dest_dir: String,
 }
 
@@ -387,6 +388,14 @@ impl MdServer {
             if is_dir { "/" } else { "" }
         );
         Vault::validate_rel(&to)?;
+        // A no-op rename would otherwise reach the commit stage, where backing
+        // up the destination removes the source and a raw IO error leaks out.
+        if strip_slash(&to) == strip_slash(&r.path) {
+            return Err(Error::new(
+                Code::Conflict,
+                format!("new_name is already the current name: {}", r.path),
+            ));
+        }
         Ok(to)
     }
 
@@ -395,13 +404,19 @@ impl MdServer {
         if !self.vault().exists(&m.source).unwrap_or(false) {
             return Err(Error::not_found(format!("source not found: {}", m.source)));
         }
-        if !is_dir_path(&m.dest_dir) {
+        // "/" is the suffix convention's spelling of the vault root — without
+        // it there is no way to relocate a note back to the top level.
+        let dest_prefix: &str = if m.dest_dir == "/" {
+            ""
+        } else if is_dir_path(&m.dest_dir) {
+            &m.dest_dir
+        } else {
             return Err(Error::new(Code::DestNotDir, "dest_dir must end with '/'"));
-        }
+        };
         // Reject if dest_dir, or any of its existing ancestors, is occupied by a
         // non-directory — so the failure is an indexed validation rejection, not
         // a late create_dir_all IO error at commit time.
-        let dest = strip_slash(&m.dest_dir);
+        let dest = strip_slash(dest_prefix);
         let mut prefix = String::new();
         for seg in dest.split('/').filter(|s| !s.is_empty()) {
             prefix = if prefix.is_empty() {
@@ -422,13 +437,13 @@ impl MdServer {
         let is_dir = is_dir_path(&m.source);
         let to = format!(
             "{}{}{}",
-            m.dest_dir,
+            dest_prefix,
             basename(&m.source),
             if is_dir { "/" } else { "" }
         );
         Vault::validate_rel(&to)?;
         // A directory cannot move into its own subtree.
-        if is_dir && contains(&m.source, &m.dest_dir) {
+        if is_dir && !dest_prefix.is_empty() && contains(&m.source, dest_prefix) {
             return Err(Error::new(
                 Code::Overlap,
                 "cannot move a directory into its own subtree",
@@ -524,6 +539,63 @@ mod tests {
         assert!(ok.ok);
         assert!(ok.deleted[0].trashed_to.starts_with(".md-mcp/trash/"));
         assert!(!s.vault().exists("a.md").unwrap());
+    }
+
+    #[tokio::test]
+    async fn relocate_to_the_vault_root_via_slash() {
+        let (_d, s) = server(&[("deep/n.md", "x")]);
+        let ok = s
+            .relocate_notes(Parameters(RelocateNotesRequest {
+                moves: vec![RelocateItem {
+                    source: "deep/n.md".into(),
+                    dest_dir: "/".into(),
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(ok.ok, "{:?}", ok.errors);
+        assert_eq!(ok.moved[0].to, "n.md");
+        assert!(s.vault().exists("n.md").unwrap());
+
+        // A directory also relocates to the root; a top-level dir is a no-op.
+        let ok = s
+            .relocate_notes(Parameters(RelocateNotesRequest {
+                moves: vec![RelocateItem {
+                    source: "deep/".into(),
+                    dest_dir: "/".into(),
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!ok.ok, "top-level dir into root is a no-op");
+        assert!(ok.errors[0].message.contains("already in dest_dir"));
+    }
+
+    #[tokio::test]
+    async fn noop_rename_is_an_indexed_validation_error() {
+        // Renaming to the current name used to fail at commit time with a raw
+        // un-indexed IO error (after a backup/rollback round-trip).
+        let (_d, s) = server(&[("a.md", "x")]);
+        let bad = s
+            .rename_notes(Parameters(RenameNotesRequest {
+                renames: vec![RenameItem {
+                    path: "a.md".into(),
+                    new_name: "a.md".into(),
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!bad.ok);
+        assert_eq!(bad.errors[0].code, "CONFLICT");
+        assert_eq!(bad.errors[0].index, Some(0));
+        assert!(bad.errors[0].message.contains("current name"));
+        assert!(s.vault().exists("a.md").unwrap());
     }
 
     #[tokio::test]

@@ -189,14 +189,46 @@ impl Document {
             ));
         }
         let path_nfc: Vec<String> = path.iter().map(|s| nfc(s).into_owned()).collect();
-        let matches: Vec<usize> = (0..self.headings.len())
-            .filter(|&i| is_suffix(&self.chain(i), &path_nfc))
+        // Exact full-chain matches first: this is the group read_outlines
+        // computes occurrence/ambiguous over, so the numbers line up. Only when
+        // nothing matches exactly does the path fall back to suffix matching —
+        // a convenience for deep notes — and then occurrence is refused, since
+        // a suffix-match index has no counterpart in the outline.
+        let exact: Vec<usize> = (0..self.headings.len())
+            .filter(|&i| {
+                let chain = self.chain(i);
+                chain.len() == path_nfc.len() && is_suffix(&chain, &path_nfc)
+            })
             .collect();
+        let exact_mode = !exact.is_empty();
+        let matches: Vec<usize> = if exact_mode {
+            exact
+        } else {
+            (0..self.headings.len())
+                .filter(|&i| is_suffix(&self.chain(i), &path_nfc))
+                .collect()
+        };
+
+        if matches.is_empty() {
+            return Err(Error::new(
+                Code::NotFound,
+                format!("heading path not found: {path:?}"),
+            ));
+        }
 
         match occurrence {
             Some(occ) => {
                 if occ == 0 {
                     return Err(Error::new(Code::NotFound, "occurrence is 1-based"));
+                }
+                if !exact_mode {
+                    return Err(Error::new(
+                        Code::Ambiguous,
+                        format!(
+                            "occurrence requires the full heading_path; {path:?} matches only \
+                             by suffix — use the exact chain from read_outlines"
+                        ),
+                    ));
                 }
                 matches.get(occ - 1).copied().ok_or_else(|| {
                     Error::new(
@@ -209,15 +241,19 @@ impl Document {
                 })
             }
             None => match matches.as_slice() {
-                [] => Err(Error::new(
-                    Code::NotFound,
-                    format!("heading path not found: {path:?}"),
-                )),
                 [only] => Ok(*only),
-                many => Err(Error::new(
+                many if exact_mode => Err(Error::new(
                     Code::Ambiguous,
                     format!(
                         "heading path matches {} headings; specify occurrence: {path:?}",
+                        many.len()
+                    ),
+                )),
+                many => Err(Error::new(
+                    Code::Ambiguous,
+                    format!(
+                        "{path:?} suffix-matches {} headings; give the full heading_path \
+                         from read_outlines (plus occurrence if it is marked ambiguous)",
                         many.len()
                     ),
                 )),
@@ -501,9 +537,37 @@ mod tests {
         let doc = Document::parse(src);
         let err = doc.resolve_heading(&["Status".into()], None).unwrap_err();
         assert_eq!(err.code, Code::Ambiguous);
-        // occurrence picks one in document order.
-        assert_eq!(doc.resolve_heading(&["Status".into()], Some(1)).unwrap(), 1);
-        assert_eq!(doc.resolve_heading(&["Status".into()], Some(2)).unwrap(), 3);
+        // occurrence indexes exact-match groups (the outline's numbering), so
+        // it cannot be combined with a suffix-only match.
+        let err = doc
+            .resolve_heading(&["Status".into()], Some(1))
+            .unwrap_err();
+        assert_eq!(err.code, Code::Ambiguous);
+        assert!(err.message.contains("full heading_path"), "{}", err.message);
+    }
+
+    #[test]
+    fn exact_match_beats_suffix_match() {
+        // A nested `## X` comes first in document order; the top-level `# X`
+        // is the exact match for ["X"] and must win — resolving by suffix here
+        // silently edited the wrong section.
+        let src = "# Y\ny\n## X\nnested\n# X\ntop\n";
+        let doc = Document::parse(src);
+        let i = doc.resolve_heading(&["X".into()], None).unwrap();
+        assert_eq!(doc.headings[i].line, 5, "must be the top-level X");
+        // occurrence numbering agrees with the outline (exact-match group).
+        let i = doc.resolve_heading(&["X".into()], Some(1)).unwrap();
+        assert_eq!(doc.headings[i].line, 5);
+    }
+
+    #[test]
+    fn unique_suffix_still_resolves_without_occurrence() {
+        let src = "# A\n## B\n### C\nc\n";
+        let doc = Document::parse(src);
+        let i = doc
+            .resolve_heading(&["B".into(), "C".into()], None)
+            .unwrap();
+        assert_eq!(doc.headings[i].line, 3);
     }
 
     #[test]

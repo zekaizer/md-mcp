@@ -48,9 +48,13 @@ impl Span {
     }
 }
 
-/// Normalize CRLF and lone CR line endings to LF, borrowing when already LF-only.
+/// Canonicalize text for parsing and writes: strip a leading UTF-8 BOM and
+/// normalize CRLF / lone-CR line endings to LF, borrowing when already
+/// canonical. A BOM would otherwise sit in front of `---` and silently defeat
+/// frontmatter recognition; like CRLF, it is dropped when a note is rewritten.
 #[must_use]
 pub fn normalize_newlines(s: &str) -> Cow<'_, str> {
+    let s = s.strip_prefix('\u{feff}').unwrap_or(s);
     if s.contains('\r') {
         Cow::Owned(s.replace("\r\n", "\n").replace('\r', "\n"))
     } else {
@@ -100,6 +104,14 @@ mod tests {
         // "## " is 3 bytes; "한글" is 6 bytes (3 each); slice the heading text run.
         let sp = Span::new(0, "## 한글 제목".len());
         assert_eq!(sp.of(s), "## 한글 제목");
+    }
+
+    #[test]
+    fn normalize_strips_leading_bom() {
+        assert_eq!(normalize_newlines("\u{feff}---\nk: 1"), "---\nk: 1");
+        // BOM + CRLF together; a mid-text U+FEFF is content, not a BOM.
+        assert_eq!(normalize_newlines("\u{feff}a\r\nb"), "a\nb");
+        assert_eq!(normalize_newlines("a\u{feff}b"), "a\u{feff}b");
     }
 
     #[test]

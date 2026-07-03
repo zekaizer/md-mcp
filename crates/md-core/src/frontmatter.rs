@@ -146,6 +146,14 @@ mod parse_error_tests {
     use super::*;
 
     #[test]
+    fn bom_prefixed_frontmatter_is_recognized() {
+        // A BOM from a Windows/macOS editor must not turn the frontmatter
+        // block into body text.
+        let fm = parse("\u{feff}---\ntitle: bom\n---\nbody\n").unwrap().unwrap();
+        assert_eq!(fm["title"], serde_json::json!("bom"));
+    }
+
+    #[test]
     fn duplicate_key_message_drops_library_hint() {
         let e = parse("---\nk: 1\nk: 2\n---\nbody\n").unwrap_err();
         assert_eq!(e.code, Code::FrontmatterParse);
