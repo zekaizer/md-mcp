@@ -219,14 +219,22 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Vec<Splice>
             let new_heading = edit.new_heading.as_deref().ok_or_else(|| {
                 Error::new(Code::MissingContent, "new_heading is required for rename")
             })?;
+            if new_heading.trim().is_empty() {
+                return Err(Error::new(
+                    Code::InvalidHeading,
+                    "new_heading must not be empty",
+                ));
+            }
+            if new_heading.contains(['\n', '\r']) {
+                return Err(Error::new(
+                    Code::InvalidHeading,
+                    "new_heading must not contain a line break",
+                ));
+            }
             let h = &doc.headings[i];
             let hashes = "#".repeat(h.level as usize);
             let had_nl = source.as_bytes().get(h.span.end - 1) == Some(&b'\n');
-            let line = if new_heading.is_empty() {
-                hashes
-            } else {
-                format!("{hashes} {new_heading}")
-            };
+            let line = format!("{hashes} {new_heading}");
             let rep = if had_nl { format!("{line}\n") } else { line };
             Ok(vec![Splice {
                 start: h.span.start,
@@ -649,6 +657,24 @@ mod tests {
             patch_sections(src, &[e]).unwrap_err()[0].error.code,
             Code::Overlap
         );
+    }
+
+    #[test]
+    fn rename_rejects_newline_in_new_heading() {
+        // A newline would split the heading line: `## Multi` + a stray body
+        // line `Line`, and the echoed heading_path could never be resolved.
+        let src = "# A\nbody\n";
+        for bad in ["Multi\nLine", "CR\rLine", "", "   "] {
+            let e = Edit {
+                new_heading: Some(bad.into()),
+                ..edit(&["A"], Operation::Rename)
+            };
+            assert_eq!(
+                patch_sections(src, &[e]).unwrap_err()[0].error.code,
+                Code::InvalidHeading,
+                "new_heading {bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
