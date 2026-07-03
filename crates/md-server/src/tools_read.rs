@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::MdServer;
-use crate::envelope::{ApiError, batch_limit};
+use crate::envelope::{ApiError, batch_limit, enforce_content_budget};
 
 fn default_true() -> bool {
     true
@@ -67,6 +67,10 @@ pub struct ReadNotesRequest {
 #[schemars(crate = "rmcp::schemars")]
 pub struct ReadNotesResponse {
     pub notes: Vec<NoteRead>,
+    /// Request indexes dropped to keep the response under the content budget;
+    /// read those notes via read_outlines → read_sections instead.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub omitted: Vec<usize>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -229,6 +233,10 @@ pub struct SectionTarget {
 #[schemars(crate = "rmcp::schemars")]
 pub struct ReadSectionsResponse {
     pub sections: Vec<SectionRead>,
+    /// Request indexes dropped to keep the response under the content budget;
+    /// re-read those targets with narrower sections.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub omitted: Vec<usize>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -311,12 +319,14 @@ impl MdServer {
     ) -> Result<Json<ReadNotesResponse>, ErrorData> {
         batch_limit(req.paths.len())?;
         let _guard = self.lock().read().await;
-        let notes = req
+        let mut notes: Vec<NoteRead> = req
             .paths
             .iter()
             .map(|p| read_one_note(self.vault(), p, req.include_body, req.include_frontmatter))
             .collect();
-        Ok(Json(ReadNotesResponse { notes }))
+        let omitted =
+            enforce_content_budget(&mut notes, |n| n.content.as_deref().map_or(0, str::len));
+        Ok(Json(ReadNotesResponse { notes, omitted }))
     }
 
     /// Read the heading outline (table of contents) of one or more notes.
@@ -347,12 +357,14 @@ impl MdServer {
     ) -> Result<Json<ReadSectionsResponse>, ErrorData> {
         batch_limit(req.targets.len())?;
         let _guard = self.lock().read().await;
-        let sections = req
+        let mut sections: Vec<SectionRead> = req
             .targets
             .iter()
             .map(|t| read_one_section(self.vault(), t))
             .collect();
-        Ok(Json(ReadSectionsResponse { sections }))
+        let omitted =
+            enforce_content_budget(&mut sections, |s| s.content.as_deref().map_or(0, str::len));
+        Ok(Json(ReadSectionsResponse { sections, omitted }))
     }
 }
 
@@ -452,6 +464,51 @@ mod tests {
         let s = read_one_section(&v, &t);
         assert!(s.note_exists && !s.found);
         assert_eq!(s.error.unwrap().code, "AMBIGUOUS");
+    }
+
+    #[tokio::test]
+    async fn oversized_read_drops_whole_items_and_reports_omitted() {
+        let big = format!("# Big\n{}", "x".repeat(crate::envelope::MAX_CONTENT_BYTES));
+        let (_d, v) = vault_with(&[("big.md", &big), ("small.md", "# S\nok\n")]);
+        let server = MdServer::new(v);
+
+        let resp = server
+            .read_notes(Parameters(ReadNotesRequest {
+                paths: vec!["big.md".into(), "small.md".into()],
+                include_body: true,
+                include_frontmatter: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.omitted, vec![0], "the oversized note is dropped whole");
+        assert_eq!(resp.notes.len(), 1);
+        assert_eq!(resp.notes[0].path, "small.md");
+        assert_eq!(resp.notes[0].content.as_deref(), Some("# S\nok\n"));
+
+        let resp = server
+            .read_sections(Parameters(ReadSectionsRequest {
+                targets: vec![
+                    SectionTarget {
+                        path: "small.md".into(),
+                        heading_path: vec![],
+                        occurrence: None,
+                        scope: ScopeArg::Section,
+                    },
+                    SectionTarget {
+                        path: "big.md".into(),
+                        heading_path: vec![],
+                        occurrence: None,
+                        scope: ScopeArg::Section,
+                    },
+                ],
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.omitted, vec![1]);
+        assert_eq!(resp.sections.len(), 1);
+        assert_eq!(resp.sections[0].path, "small.md");
     }
 
     #[tokio::test]

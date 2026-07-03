@@ -20,6 +20,35 @@ pub fn batch_limit(n: usize) -> Result<(), ErrorData> {
     }
 }
 
+/// Total content-byte budget for one content-bearing read response
+/// ([tool_spec §4 토큰 비용 통제]). Items past the budget are dropped whole and
+/// reported by index in `omitted` — content is never truncated mid-item; a big
+/// note is read via read_outlines → read_sections instead.
+pub const MAX_CONTENT_BYTES: usize = 256 * 1024;
+
+/// Enforce [`MAX_CONTENT_BYTES`] over a response's items, in request order.
+///
+/// An item whose content would push the running total past the budget is
+/// dropped from `items` and its request index recorded; later, smaller items
+/// may still fit. Zero-content items (missing notes, flags off) are always
+/// kept. Returns the omitted request indexes.
+pub fn enforce_content_budget<T>(items: &mut Vec<T>, content_len: impl Fn(&T) -> usize) -> Vec<usize> {
+    let mut total = 0usize;
+    let mut omitted = Vec::new();
+    let mut kept = Vec::with_capacity(items.len());
+    for (i, item) in items.drain(..).enumerate() {
+        let len = content_len(&item);
+        if len > 0 && total + len > MAX_CONTENT_BYTES {
+            omitted.push(i);
+        } else {
+            total += len;
+            kept.push(item);
+        }
+    }
+    *items = kept;
+    omitted
+}
+
 /// A machine-readable error embedded in a tool response (per-item or per-batch).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]

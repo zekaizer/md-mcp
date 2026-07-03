@@ -13,7 +13,8 @@ use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use cap_tempfile::TempFile;
 
-use crate::error::{Error, Result};
+use crate::error::{Code, Error, Result};
+use crate::text::nfc;
 
 /// The server's internal state directory, off-limits to agent note operations.
 pub(crate) const INTERNAL_DIR: &str = ".md-mcp";
@@ -118,15 +119,60 @@ impl Vault {
         Ok(clean)
     }
 
+    /// Resolve a validated relative path against the on-disk tree, comparing
+    /// path components after Unicode NFC normalization — so an NFC-spelled path
+    /// finds a note a macOS client synced in NFD ([tool_spec §4]). An exact
+    /// byte match always wins; a component with no match (e.g. a file being
+    /// created) is kept as given. Returns the on-disk spelling.
+    pub fn resolve_rel(&self, rel: &str) -> Result<String> {
+        let clean = Self::validate_rel(rel)?;
+        if self.root.exists(&clean) {
+            return Ok(clean);
+        }
+        let mut resolved = String::new();
+        for seg in clean.split('/') {
+            let exact = if resolved.is_empty() {
+                seg.to_string()
+            } else {
+                format!("{resolved}/{seg}")
+            };
+            if self.root.exists(&exact) {
+                resolved = exact;
+                continue;
+            }
+            let entries = if resolved.is_empty() {
+                self.root.entries()
+            } else {
+                self.root.read_dir(&resolved)
+            };
+            let target = nfc(seg);
+            let matched = entries.ok().and_then(|es| {
+                let mut names: Vec<String> = es
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str().map(String::from))
+                    .filter(|n| nfc(n) == target)
+                    .collect();
+                names.sort();
+                names.into_iter().next()
+            });
+            resolved = match matched {
+                Some(name) if resolved.is_empty() => name,
+                Some(name) => format!("{resolved}/{name}"),
+                None => exact,
+            };
+        }
+        Ok(resolved)
+    }
+
     /// Whether a note or directory exists at `rel`.
     pub fn exists(&self, rel: &str) -> Result<bool> {
-        let clean = Self::validate_rel(rel)?;
+        let clean = self.resolve_rel(rel)?;
         Ok(self.root.exists(clean))
     }
 
     /// Whether `rel` exists and is a directory.
     pub fn is_dir(&self, rel: &str) -> Result<bool> {
-        let clean = Self::validate_rel(rel)?;
+        let clean = self.resolve_rel(rel)?;
         Ok(self
             .root
             .metadata(clean)
@@ -137,7 +183,7 @@ impl Vault {
     /// Read a note's raw text (as stored on disk, UTF-8). The internal state
     /// directory is hidden — reading inside it reports the note as absent.
     pub fn read_note(&self, rel: &str) -> Result<String> {
-        let clean = Self::validate_rel(rel)?;
+        let clean = self.resolve_rel(rel)?;
         if Self::is_internal_path(rel) {
             return Err(Error::not_found(format!("note not found: {rel}")));
         }
@@ -155,7 +201,15 @@ impl Vault {
     /// renames it over the target — so a reader sees the old or the complete new
     /// file, never a torn one.
     pub fn write_atomic(&self, rel: &str, bytes: &[u8]) -> Result<()> {
-        let clean = Self::validate_rel(rel)?;
+        // A trailing '/' denotes a directory (suffix convention); silently
+        // stripping it would write a file where the caller expected a directory.
+        if rel.ends_with('/') {
+            return Err(Error::new(
+                Code::Suffix,
+                format!("a note path must not end with '/': {rel}"),
+            ));
+        }
+        let clean = self.resolve_rel(rel)?;
         let clean_path = Path::new(&clean);
         let name = clean_path
             .file_name()
@@ -194,7 +248,8 @@ impl Vault {
     /// `overwrite` is set. A pre-existing symlink (even dangling) counts as
     /// occupied and is refused.
     pub fn create_note(&self, rel: &str, bytes: &[u8], overwrite: bool) -> Result<()> {
-        let clean = Self::validate_note_rel(rel)?;
+        Self::validate_note_rel(rel)?;
+        let clean = self.resolve_rel(rel)?;
         if !overwrite && self.root.symlink_metadata(&clean).is_ok() {
             return Err(Error::conflict(format!("note already exists: {rel}")));
         }
@@ -342,6 +397,53 @@ mod tests {
     }
 
     // --- create guard -------------------------------------------------------
+
+    #[test]
+    fn nfc_path_resolves_nfd_stored_note() {
+        // A note synced from macOS is stored with NFD bytes; an agent-supplied
+        // NFC path must still find it (tool_spec §4: NFC-normalized comparison).
+        let (_v, vault) = temp_vault();
+        let nfd = "\u{110b}\u{1161}/\u{1102}\u{1169}\u{1110}\u{1173}.md"; // 아/노트.md in NFD
+        let nfc_path = "아/노트.md";
+        assert_ne!(nfd, nfc_path);
+        vault.write_atomic(nfd, b"content").unwrap();
+
+        assert!(vault.exists(nfc_path).unwrap());
+        assert_eq!(vault.read_note(nfc_path).unwrap(), "content");
+        // The resolved spelling is the on-disk (NFD) one.
+        assert_eq!(vault.resolve_rel(nfc_path).unwrap(), nfd);
+        // Creating the NFC twin is a conflict, not a visually-identical duplicate.
+        let e = vault.create_note(nfc_path, b"twin", false).unwrap_err();
+        assert_eq!(e.code, Code::Conflict);
+        // Writing through the NFC path edits the NFD file in place.
+        vault.write_atomic(nfc_path, b"updated").unwrap();
+        assert_eq!(vault.read_note(nfd).unwrap(), "updated");
+    }
+
+    #[test]
+    fn commit_batch_resolves_nfc_paths() {
+        let (_v, vault) = temp_vault();
+        let nfd = "\u{1102}\u{1169}\u{1110}\u{1173}.md"; // 노트.md in NFD
+        vault.write_atomic(nfd, b"x").unwrap();
+        let outcomes = vault
+            .commit_batch(&[crate::Op::Delete {
+                path: "노트.md".to_string(),
+            }])
+            .unwrap();
+        assert!(matches!(&outcomes[0], crate::OpOutcome::Deleted { path, .. } if path == nfd));
+        assert!(!vault.exists(nfd).unwrap());
+    }
+
+    #[test]
+    fn create_rejects_directory_suffix_path() {
+        // `new/dir/` must not silently become a regular file named `dir`.
+        let (_v, vault) = temp_vault();
+        for p in ["new/dir/", "top/"] {
+            let e = vault.create_note(p, b"x", false).unwrap_err();
+            assert_eq!(e.code, Code::Suffix, "expected SUFFIX for {p:?}");
+            assert!(!vault.exists(p).unwrap(), "nothing must be created for {p:?}");
+        }
+    }
 
     #[test]
     fn create_refuses_existing_without_overwrite() {

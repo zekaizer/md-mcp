@@ -219,14 +219,22 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Vec<Splice>
             let new_heading = edit.new_heading.as_deref().ok_or_else(|| {
                 Error::new(Code::MissingContent, "new_heading is required for rename")
             })?;
+            if new_heading.trim().is_empty() {
+                return Err(Error::new(
+                    Code::InvalidHeading,
+                    "new_heading must not be empty",
+                ));
+            }
+            if new_heading.contains(['\n', '\r']) {
+                return Err(Error::new(
+                    Code::InvalidHeading,
+                    "new_heading must not contain a line break",
+                ));
+            }
             let h = &doc.headings[i];
             let hashes = "#".repeat(h.level as usize);
             let had_nl = source.as_bytes().get(h.span.end - 1) == Some(&b'\n');
-            let line = if new_heading.is_empty() {
-                hashes
-            } else {
-                format!("{hashes} {new_heading}")
-            };
+            let line = format!("{hashes} {new_heading}");
             let rep = if had_nl { format!("{line}\n") } else { line };
             Ok(vec![Splice {
                 start: h.span.start,
@@ -269,6 +277,18 @@ fn resolve_move(
         return Err(Error::new(
             Code::Overlap,
             "cannot move a section into its own subtree",
+        ));
+    }
+
+    // The moved section keeps its heading level, so it must land as a sibling
+    // of the destination anchor (top-level at the root) — any other level would
+    // silently re-parent surrounding sections (spec: content heading 계층 검증).
+    let moved_level = doc.headings[src_i].level;
+    let expected = sibling_level(doc, dest_idx);
+    if moved_level != expected {
+        return Err(Error::new(
+            Code::HeadingLevel,
+            format!("moved section's heading is level {moved_level}, expected {expected} at the destination"),
         ));
     }
 
@@ -637,6 +657,100 @@ mod tests {
             patch_sections(src, &[e]).unwrap_err()[0].error.code,
             Code::Overlap
         );
+    }
+
+    #[test]
+    fn rename_rejects_newline_in_new_heading() {
+        // A newline would split the heading line: `## Multi` + a stray body
+        // line `Line`, and the echoed heading_path could never be resolved.
+        let src = "# A\nbody\n";
+        for bad in ["Multi\nLine", "CR\rLine", "", "   "] {
+            let e = Edit {
+                new_heading: Some(bad.into()),
+                ..edit(&["A"], Operation::Rename)
+            };
+            assert_eq!(
+                patch_sections(src, &[e]).unwrap_err()[0].error.code,
+                Code::InvalidHeading,
+                "new_heading {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn move_with_shallower_level_than_destination_is_rejected() {
+        // Moving `# B` (h1) beside `## A1` (h2) would cut section A in half.
+        let src = "# A\nlead\n## A1\na1\n## A2\na2\n# B\nb\n## B1\nb1\n";
+        let e = Edit {
+            operation: Some(Operation::Move),
+            heading_path: vec!["B".into()],
+            destination: Some(Destination {
+                heading_path: vec!["A".into(), "A1".into()],
+                occurrence: None,
+                position: Position::Before,
+            }),
+            ..Edit::default()
+        };
+        assert_eq!(
+            patch_sections(src, &[e]).unwrap_err()[0].error.code,
+            Code::HeadingLevel
+        );
+    }
+
+    #[test]
+    fn move_with_deeper_level_than_destination_is_rejected() {
+        // Moving `## A1` (h2) beside `# B` (h1) would nest it under B, not
+        // beside it — the echoed sibling heading_path would be a lie.
+        let src = "# A\nlead\n## A1\na1\n# B\nb\n";
+        let e = Edit {
+            operation: Some(Operation::Move),
+            heading_path: vec!["A".into(), "A1".into()],
+            destination: Some(Destination {
+                heading_path: vec!["B".into()],
+                occurrence: None,
+                position: Position::After,
+            }),
+            ..Edit::default()
+        };
+        assert_eq!(
+            patch_sections(src, &[e]).unwrap_err()[0].error.code,
+            Code::HeadingLevel
+        );
+    }
+
+    #[test]
+    fn move_to_root_requires_top_level_heading() {
+        let src = "# A\nlead\n## A1\na1\n";
+        let e = Edit {
+            operation: Some(Operation::Move),
+            heading_path: vec!["A".into(), "A1".into()],
+            destination: Some(Destination {
+                heading_path: vec![],
+                occurrence: None,
+                position: Position::After,
+            }),
+            ..Edit::default()
+        };
+        assert_eq!(
+            patch_sections(src, &[e]).unwrap_err()[0].error.code,
+            Code::HeadingLevel
+        );
+    }
+
+    #[test]
+    fn move_same_level_subsection_between_parents() {
+        let src = "# A\nax\n## A1\na1\n# B\nbx\n## B1\nb1\n";
+        let e = Edit {
+            operation: Some(Operation::Move),
+            heading_path: vec!["A".into(), "A1".into()],
+            destination: Some(Destination {
+                heading_path: vec!["B".into(), "B1".into()],
+                occurrence: None,
+                position: Position::After,
+            }),
+            ..Edit::default()
+        };
+        assert_eq!(apply(src, vec![e]), "# A\nax\n# B\nbx\n## B1\nb1\n## A1\na1\n");
     }
 
     #[test]

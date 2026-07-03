@@ -29,6 +29,9 @@ pub enum Code {
     BatchCollision,
     /// A required `content`/`new_heading`/`destination` field was missing.
     MissingContent,
+    /// A `new_heading` cannot form a single valid heading line (empty or
+    /// contains a line break).
+    InvalidHeading,
     /// A path escaped the vault root (`..`, absolute, symlink, or the root itself).
     Traversal,
     /// A note's frontmatter is not parseable YAML.
@@ -52,6 +55,7 @@ impl Code {
             Code::DestNotDir => "DEST_NOT_DIR",
             Code::BatchCollision => "BATCH_COLLISION",
             Code::MissingContent => "MISSING_CONTENT",
+            Code::InvalidHeading => "INVALID_HEADING",
             Code::Traversal => "TRAVERSAL",
             Code::FrontmatterParse => "FRONTMATTER_PARSE",
             Code::Io => "IO",
