@@ -8,8 +8,16 @@ use std::time::UNIX_EPOCH;
 
 use globset::GlobBuilder;
 
-use crate::error::{Error, Result};
+use crate::error::{Code, Error, Result};
 use crate::vault::Vault;
+
+/// Maximum bytes in a `list_notes` glob pattern. A real glob is a handful of
+/// path components (`daily/**/*.md`); this cap is orders of magnitude above any
+/// legitimate pattern yet well below the point where globset's lazy regex
+/// compilation (`Glob::compile_matcher`, which `.expect()`s on a failed NFA
+/// build) panics on a pathological literal — so an oversized glob fails as a
+/// clean `TOO_LARGE` rejection instead of taking the request down.
+const MAX_GLOB_BYTES: usize = 1024;
 
 /// One listed entry: a note or a directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,13 +53,26 @@ impl Vault {
         }
 
         let matcher = match glob {
-            Some(pat) => Some(
-                GlobBuilder::new(pat)
-                    .literal_separator(true)
-                    .build()
-                    .map_err(|e| Error::io(format!("invalid glob {pat}: {e}")))?
-                    .compile_matcher(),
-            ),
+            Some(pat) => {
+                // Bound the pattern before handing it to globset: its matcher
+                // compilation panics (not errors) on an over-long literal.
+                if pat.len() > MAX_GLOB_BYTES {
+                    return Err(Error::new(
+                        Code::TooLarge,
+                        format!(
+                            "glob pattern exceeds {MAX_GLOB_BYTES} bytes: {} bytes",
+                            pat.len()
+                        ),
+                    ));
+                }
+                Some(
+                    GlobBuilder::new(pat)
+                        .literal_separator(true)
+                        .build()
+                        .map_err(|e| Error::io(format!("invalid glob {pat}: {e}")))?
+                        .compile_matcher(),
+                )
+            }
             None => None,
         };
         let recursive = recursive || glob.is_some_and(|g| g.contains("**"));
@@ -233,6 +254,19 @@ mod tests {
         // `**/*.md` matches at any depth.
         let all = v.list_entries("", true, Some("**/*.md"), false).unwrap();
         assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn over_long_glob_rejected_cleanly_not_panic() {
+        let (_d, v) = vault_with(&[("a.md", "")]);
+        // A pattern past the cap must return TOO_LARGE, never reach globset's
+        // matcher compilation (which panics on a pathological literal).
+        let huge = "z".repeat(MAX_GLOB_BYTES + 1);
+        let err = v.list_entries("", true, Some(&huge), false).unwrap_err();
+        assert_eq!(err.code, Code::TooLarge);
+        // A pattern at exactly the cap is still accepted.
+        let at_cap = "z".repeat(MAX_GLOB_BYTES);
+        assert!(v.list_entries("", true, Some(&at_cap), false).is_ok());
     }
 
     #[test]
