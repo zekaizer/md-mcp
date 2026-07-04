@@ -41,6 +41,10 @@ pub struct MdServer {
     /// Outcome of the most recent push/sync attempt; `Some` while failing
     /// (ADR-0019). Std mutex: only ever held for a field read/write.
     sync_health: Arc<std::sync::Mutex<Option<sync::SyncHealth>>>,
+    /// Vault-relative path of an introduction note advertised in the server
+    /// instructions (`MD_INTRO_NOTE`), so agents read the vault's own guide
+    /// before working in it.
+    intro_note: Option<String>,
     /// The advertised tool set: the base families, plus `sync_vault` when git
     /// sync is enabled.
     tool_router: ToolRouter<Self>,
@@ -58,6 +62,7 @@ impl MdServer {
             auto_commit: false,
             push_tx: None,
             sync_health: Arc::new(std::sync::Mutex::new(None)),
+            intro_note: None,
             tool_router: Self::base_router(),
         }
     }
@@ -113,6 +118,14 @@ impl MdServer {
     #[must_use]
     pub fn with_sync_interval(self, every: std::time::Duration) -> Self {
         tokio::spawn(sync::interval_sync_task(self.clone(), every));
+        self
+    }
+
+    /// Advertise `path` (vault-relative) as the vault's introduction note in
+    /// the server instructions.
+    #[must_use]
+    pub fn with_intro_note(mut self, path: String) -> Self {
+        self.intro_note = Some(path);
         self
     }
 
@@ -282,12 +295,17 @@ impl ServerHandler for MdServer {
         info.server_info.name = "md-mcp".into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info.instructions = Some(
-            "md-mcp manages a single vault of pure-Markdown notes (.md + YAML frontmatter). \
-             Address notes by vault-relative path; read large notes via read_outlines then \
-             read_sections. Destructive batches are all-or-nothing."
-                .into(),
-        );
+        let mut instructions = "md-mcp manages a single vault of pure-Markdown notes (.md + \
+             YAML frontmatter). Address notes by vault-relative path; read large notes via \
+             read_outlines then read_sections. Destructive batches are all-or-nothing."
+            .to_string();
+        if let Some(intro) = &self.intro_note {
+            instructions.push_str(&format!(
+                " Before working in this vault, read \"{intro}\" (via read_notes): it \
+                 introduces the vault's purpose, structure, and conventions."
+            ));
+        }
+        info.instructions = Some(instructions);
         info
     }
 }
@@ -316,6 +334,20 @@ mod tests {
             instructions.contains("md-mcp"),
             "instructions: {instructions}"
         );
+    }
+
+    #[test]
+    fn intro_note_is_advertised_in_instructions() {
+        let with = server()
+            .with_intro_note("meta/start-here.md".into())
+            .get_info()
+            .instructions
+            .unwrap_or_default();
+        assert!(with.contains("meta/start-here.md"), "got: {with}");
+        assert!(with.contains("read_notes"), "got: {with}");
+
+        let without = server().get_info().instructions.unwrap_or_default();
+        assert!(!without.contains("start-here"), "got: {without}");
     }
 
     #[test]

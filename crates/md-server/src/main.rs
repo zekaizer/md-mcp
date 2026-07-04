@@ -26,6 +26,14 @@ async fn main() -> Result<()> {
     // Keep .md-mcp/ out of any git repo the vault lives in (ADR-0016).
     md_server::sync::ensure_git_exclude(&config.vault_dir);
     let mut server = MdServer::new(vault);
+    if let Some(intro) = config.intro_note.clone() {
+        // Advertise even when absent right now (it may arrive via sync), but
+        // flag the likely typo.
+        if !config.vault_dir.join(&intro).is_file() {
+            tracing::warn!("MD_INTRO_NOTE {intro:?} does not exist in the vault (yet)");
+        }
+        server = server.with_intro_note(intro);
+    }
     if config.events.enabled {
         let hook_tx = config
             .events

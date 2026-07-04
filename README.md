@@ -31,6 +31,10 @@ MD_VAULT=/path/to/vault target/release/md-server --stdio
 else HTTP. The server logs to stderr (under stdio, stdout is the JSON-RPC
 channel). See [ADR-0013](docs/adr/0013-http-transport.md).
 
+`MD_INTRO_NOTE` (optional) names a vault-relative note (e.g. `meta/start-here.md`)
+advertised in the MCP server instructions, so connecting agents read the vault's
+own introduction before working in it.
+
 ### HTTP options
 
 | Variable | Default | Meaning |
