@@ -449,6 +449,102 @@ mod tests {
         );
     }
 
+    /// Poll the bare remote's log until `needle` shows up (or panic at the
+    /// deadline).
+    async fn wait_for_remote_commit(bare: &Path, needle: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let out = Command::new("git")
+                .args(["log", "--format=%s", "main"])
+                .current_dir(bare)
+                .output()
+                .unwrap();
+            let log = String::from_utf8_lossy(&out.stdout).to_string();
+            if log.contains(needle) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "commit never landed on the remote; log:\n{log}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_push_retries_after_transient_failure() {
+        let (root, vault_dir, _clone) = repo_fixture();
+        let bare = root.path().join("remote.git");
+        let off = root.path().join("remote.git.off");
+
+        let mut s = server_with_sync(&vault_dir).await.with_auto_commit();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        s.push_tx = Some(tx);
+        tokio::spawn(crate::sync::auto_push_task(
+            s.clone(),
+            rx,
+            std::time::Duration::from_millis(40),  // debounce
+            std::time::Duration::from_millis(150), // retry initial
+            std::time::Duration::from_millis(400), // retry cap
+        ));
+
+        // The remote is down when the write lands: the push and its fallback
+        // sync both fail.
+        std::fs::rename(&bare, &off).unwrap();
+        s.create_notes(Parameters(CreateNotesRequest {
+            notes: vec![NoteInput {
+                path: "retry.md".into(),
+                content: "# Retry\n".into(),
+                frontmatter: None,
+            }],
+            overwrite: false,
+        }))
+        .await
+        .unwrap();
+
+        // Wait until the failure is recorded (first attempt happened) …
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while s.sync_warning().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first auto-push attempt never failed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // … then bring the remote back: the retry timer (no new writes!) must
+        // land the commit and clear the health.
+        std::fs::rename(&off, &bare).unwrap();
+        wait_for_remote_commit(&bare, "mcp(create_notes)").await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while s.sync_warning().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sync health never cleared after the retried push"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_push_drains_a_stranded_backlog_on_startup() {
+        let (root, vault_dir, _clone) = repo_fixture();
+        let bare = root.path().join("remote.git");
+
+        // A commit stranded by a previous run: ahead of the remote, no writes
+        // coming.
+        std::fs::write(vault_dir.join("stranded.md"), "# Stranded\n").unwrap();
+        git(&vault_dir, &["add", "-A"]);
+        git(&vault_dir, &["commit", "-m", "stranded backlog"]);
+
+        let _s = server_with_sync(&vault_dir)
+            .await
+            .with_auto_commit()
+            .with_auto_push(std::time::Duration::from_millis(50));
+
+        wait_for_remote_commit(&bare, "stranded backlog").await;
+    }
+
     #[tokio::test]
     async fn interval_sync_pulls_remote_changes_unattended() {
         let (_root, vault_dir, clone) = repo_fixture();

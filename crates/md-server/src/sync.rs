@@ -249,19 +249,50 @@ impl GitSync {
 /// signal, then pushes. A rejected push falls back to one full sync (whose
 /// conflicts are logged and left local — an explicit `sync_vault` reports
 /// them to an agent).
+///
+/// A failed attempt (push and fallback sync both failing) arms a retry timer —
+/// `retry_initial` doubling up to `retry_cap` — so a transient outage heals
+/// without waiting for the next write (ADR-0019). A rebase conflict is *not*
+/// retried: it is deterministic until the local or remote history changes, and
+/// the next commit signal or interval sync re-attempts anyway. A fresh commit
+/// signal resets the backoff.
 pub(crate) async fn auto_push_task(
     server: crate::MdServer,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     debounce: std::time::Duration,
+    retry_initial: std::time::Duration,
+    retry_cap: std::time::Duration,
 ) {
-    while rx.recv().await.is_some() {
-        loop {
-            match tokio::time::timeout(debounce, rx.recv()).await {
-                Ok(Some(())) => {} // another commit: restart the quiet window
-                Ok(None) => return,
-                Err(_) => break, // window elapsed quietly
+    let mut backoff = retry_initial;
+    let mut retry_at: Option<tokio::time::Instant> = None;
+    loop {
+        // Wait for a commit signal, or for the pending retry to come due.
+        let signaled = match retry_at {
+            Some(at) => tokio::select! {
+                received = rx.recv() => match received {
+                    Some(()) => true,
+                    None => return,
+                },
+                () = tokio::time::sleep_until(at) => false,
+            },
+            None => match rx.recv().await {
+                Some(()) => true,
+                None => return,
+            },
+        };
+        if signaled {
+            // Debounce: restart the quiet window on every further signal.
+            loop {
+                match tokio::time::timeout(debounce, rx.recv()).await {
+                    Ok(Some(())) => {}
+                    Ok(None) => return,
+                    Err(_) => break, // window elapsed quietly
+                }
             }
+            backoff = retry_initial; // fresh activity resets the backoff
         }
+        retry_at = None;
+
         let Some(git) = server.git_sync() else { return };
         if git.ahead_count().await == 0 {
             server.report_sync_ok();
@@ -271,7 +302,20 @@ pub(crate) async fn auto_push_task(
             server.report_sync_ok();
             continue;
         }
-        log_background_sync("auto-push", server.run_sync().await);
+        match server.run_sync().await {
+            Ok(r) if r.status == "conflict" => {
+                tracing::warn!(
+                    "auto-push: conflicts left local, resolve via sync_vault: {:?}",
+                    r.conflicts
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("auto-push failed: {e}; retrying in {backoff:?}");
+                retry_at = Some(tokio::time::Instant::now() + backoff);
+                backoff = (backoff * 2).min(retry_cap);
+            }
+        }
     }
 }
 

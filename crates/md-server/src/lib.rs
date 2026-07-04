@@ -85,12 +85,26 @@ impl MdServer {
     }
 
     /// Push `debounce` after the most recent auto-commit (ADR-0018); spawns
-    /// the background task, so a tokio runtime must be running.
+    /// the background task, so a tokio runtime must be running. Failed pushes
+    /// retry on a capped exponential backoff, and one synthetic signal is sent
+    /// at startup so a backlog stranded by a previous run drains without
+    /// waiting for new writes (ADR-0019).
     #[must_use]
     pub fn with_auto_push(mut self, debounce: std::time::Duration) -> Self {
+        /// First retry delay after a failed push (doubles per failure).
+        const RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(15);
+        /// Backoff ceiling: a dead remote is probed this often at most.
+        const RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(15 * 60);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(()); // startup nudge: drain any stranded backlog
         self.push_tx = Some(tx);
-        tokio::spawn(sync::auto_push_task(self.clone(), rx, debounce));
+        tokio::spawn(sync::auto_push_task(
+            self.clone(),
+            rx,
+            debounce,
+            RETRY_INITIAL,
+            RETRY_CAP,
+        ));
         self
     }
 
