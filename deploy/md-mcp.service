@@ -1,0 +1,31 @@
+# md-mcp systemd unit (ADR-0020). Install:
+#   sudo cp deploy/md-mcp.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now md-mcp
+# Adjust User/Group and the two ReadWritePaths to match MD_VAULT/MD_STATE_DIR.
+
+[Unit]
+Description=md-mcp Markdown vault MCP server
+Documentation=https://github.com/zekaizer/md-mcp
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=zekaizer
+Group=zekaizer
+EnvironmentFile=/etc/md-mcp/env
+ExecStart=/usr/local/bin/md-server --http
+Restart=on-failure
+RestartSec=2
+
+# Hardening: the server needs exactly the vault (incl. its .git) and the
+# state dir writable; everything else read-only.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/zekaizer/vault
+ReadWritePaths=/home/zekaizer/.local/state/md-mcp
+
+[Install]
+WantedBy=multi-user.target
