@@ -37,10 +37,17 @@ fn parent_dir(p: &str) -> String {
     }
 }
 
+/// A path's comparison key: slash-stripped and NFC-normalized (spec §4 — a
+/// batch mixing NFD and NFC spellings of one path must not slip past
+/// duplicate/overlap detection to fail confusingly at commit time).
+fn nfc_key(p: &str) -> String {
+    md_core::text::nfc(strip_slash(p)).into_owned()
+}
+
 /// Whether `a` is an ancestor of (or equal to) `b`.
 fn contains(a: &str, b: &str) -> bool {
-    let a = strip_slash(a);
-    let b = strip_slash(b);
+    let a = nfc_key(a);
+    let b = nfc_key(b);
     a == b || b.starts_with(&format!("{a}/"))
 }
 
@@ -76,10 +83,10 @@ fn check_move_collisions(pairs: &[(usize, String, String)], errors: &mut Vec<Api
         for j in (i + 1)..n {
             let (_, fi, ti) = &pairs[i];
             let (_, fj, tj) = &pairs[j];
-            if strip_slash(fi) == strip_slash(fj)
-                || strip_slash(ti) == strip_slash(tj)
-                || strip_slash(ti) == strip_slash(fj)
-                || strip_slash(tj) == strip_slash(fi)
+            if nfc_key(fi) == nfc_key(fj)
+                || nfc_key(ti) == nfc_key(tj)
+                || nfc_key(ti) == nfc_key(fj)
+                || nfc_key(tj) == nfc_key(fi)
                 || overlap(fi, fj)
             {
                 bad[i] = true;
@@ -402,6 +409,8 @@ impl MdServer {
         Vault::validate_rel(&to)?;
         // A no-op rename would otherwise reach the commit stage, where backing
         // up the destination removes the source and a raw IO error leaks out.
+        // Bytewise on purpose: an NFC respelling of the same name is a
+        // legitimate rename, not a no-op.
         if strip_slash(&to) == strip_slash(&r.path) {
             return Err(Error::new(
                 Code::Conflict,
@@ -585,6 +594,50 @@ mod tests {
             .0;
         assert!(!ok.ok, "top-level dir into root is a no-op");
         assert!(ok.errors[0].message.contains("already in dest_dir"));
+    }
+
+    #[tokio::test]
+    async fn mixed_spelling_batches_are_caught_at_validation() {
+        // NFD and NFC spellings of one path must not slip past overlap and
+        // duplicate detection to fail confusingly at commit time.
+        let nfd_dir = "\u{1112}\u{1161}\u{11ab}"; // 한 in NFD
+        let file = format!("{nfd_dir}/c.md");
+        let (_d, s) = server(&[(file.as_str(), "x")]);
+
+        let bad = s
+            .delete_notes(Parameters(DeleteNotesRequest {
+                paths: vec![format!("{nfd_dir}/"), "\u{d55c}/c.md".into()],
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!bad.ok);
+        assert_eq!(bad.errors[0].code, "OVERLAP", "{:?}", bad.errors);
+        assert!(s.vault().exists(&file).unwrap(), "nothing deleted");
+
+        let bad = s
+            .rename_notes(Parameters(RenameNotesRequest {
+                renames: vec![
+                    RenameItem {
+                        path: file.clone(),
+                        new_name: "d.md".into(),
+                    },
+                    RenameItem {
+                        path: "\u{d55c}/c.md".into(),
+                        new_name: "e.md".into(),
+                    },
+                ],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!bad.ok);
+        assert!(
+            bad.errors.iter().any(|e| e.code == "BATCH_COLLISION"),
+            "{:?}",
+            bad.errors
+        );
     }
 
     #[tokio::test]
