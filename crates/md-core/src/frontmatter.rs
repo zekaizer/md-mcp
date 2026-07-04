@@ -149,7 +149,9 @@ mod parse_error_tests {
     fn bom_prefixed_frontmatter_is_recognized() {
         // A BOM from a Windows/macOS editor must not turn the frontmatter
         // block into body text.
-        let fm = parse("\u{feff}---\ntitle: bom\n---\nbody\n").unwrap().unwrap();
+        let fm = parse("\u{feff}---\ntitle: bom\n---\nbody\n")
+            .unwrap()
+            .unwrap();
         assert_eq!(fm["title"], serde_json::json!("bom"));
     }
 
