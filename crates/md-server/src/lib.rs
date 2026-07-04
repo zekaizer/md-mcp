@@ -184,7 +184,17 @@ impl MdServer {
     /// commit snapshot is exactly the batch's result; path-scoped staging
     /// keeps concurrent external edits out. A git failure is logged, never
     /// surfaced — the vault, not git, is the durability layer.
-    pub(crate) async fn auto_commit(&self, tool: &str, ops: &[events::EventOp]) {
+    ///
+    /// `args` is the invoking tool call (request struct or its items); a
+    /// condensed rendering — long strings truncated, total size capped — goes
+    /// into the commit body so `git log` shows what command produced each
+    /// commit without replicating whole note contents.
+    pub(crate) async fn auto_commit(
+        &self,
+        tool: &str,
+        ops: &[events::EventOp],
+        args: &(impl serde::Serialize + Sync),
+    ) {
         if !self.auto_commit || ops.is_empty() {
             return;
         }
@@ -194,7 +204,11 @@ impl MdServer {
             .flat_map(events::EventOp::touched_paths)
             .map(str::to_string)
             .collect();
-        let message = format!("mcp({tool}): {} notes", ops.len());
+        let subject = format!("mcp({tool}): {} notes", ops.len());
+        let message = match serde_json::to_value(args) {
+            Ok(v) => format!("{subject}\n\n{tool} {}", summarize_tool_args(&v)),
+            Err(_) => subject,
+        };
         let flock = match self.vault().exclusive_lock() {
             Ok(l) => l,
             Err(e) => {
@@ -213,6 +227,43 @@ impl MdServer {
             Err(e) => tracing::warn!("auto-commit failed: {e}"),
         }
         drop(flock);
+    }
+}
+
+/// Longest string kept verbatim inside a condensed tool call (chars).
+const ARG_STR_MAX: usize = 80;
+/// Total size cap of one condensed tool call (chars).
+const ARG_TOTAL_MAX: usize = 800;
+
+/// Truncate every long string in `v` to [`ARG_STR_MAX`] chars, in place,
+/// marking how much was dropped — note contents must not bloat commit bodies.
+fn condense_json(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => {
+            let chars = s.chars().count();
+            if chars > ARG_STR_MAX {
+                let head: String = s.chars().take(ARG_STR_MAX).collect();
+                *s = format!("{head}…(+{} chars)", chars - ARG_STR_MAX);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(condense_json),
+        serde_json::Value::Object(map) => map.values_mut().for_each(condense_json),
+        _ => {}
+    }
+}
+
+/// One-line condensed rendering of a tool call's arguments for the
+/// auto-commit body: compact JSON with long strings truncated and an overall
+/// size cap.
+fn summarize_tool_args(args: &serde_json::Value) -> String {
+    let mut v = args.clone();
+    condense_json(&mut v);
+    let s = serde_json::to_string(&v).unwrap_or_default();
+    if s.chars().count() > ARG_TOTAL_MAX {
+        let head: String = s.chars().take(ARG_TOTAL_MAX).collect();
+        format!("{head}…")
+    } else {
+        s
     }
 }
 

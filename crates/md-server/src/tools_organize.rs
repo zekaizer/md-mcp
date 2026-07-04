@@ -144,7 +144,7 @@ pub struct RenameNotesRequest {
     pub overwrite: bool,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct RenameItem {
     pub path: String,
@@ -161,7 +161,7 @@ pub struct RelocateNotesRequest {
     pub overwrite: bool,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct RelocateItem {
     pub source: String,
@@ -301,7 +301,7 @@ impl MdServer {
             Ok(receipt) => {
                 let ops = EventOp::from_outcomes(&receipt.outcomes);
                 self.emit_event("delete_notes", Some(&receipt.batch_id), &ops);
-                self.auto_commit("delete_notes", &ops).await;
+                self.auto_commit("delete_notes", &ops, &paths).await;
                 let deleted = receipt
                     .outcomes
                     .into_iter()
@@ -364,7 +364,13 @@ impl MdServer {
                 Err(e) => errors.push(ApiError::at(i, &e)),
             }
         }
-        self.finish_move("rename_notes", pairs, errors).await
+        self.finish_move(
+            "rename_notes",
+            pairs,
+            errors,
+            serde_json::json!({"renames": renames, "overwrite": overwrite}),
+        )
+        .await
     }
 
     async fn run_relocate(&self, moves: &[RelocateItem], overwrite: bool) -> MoveResponse {
@@ -394,7 +400,13 @@ impl MdServer {
                 Err(e) => errors.push(ApiError::at(i, &e)),
             }
         }
-        self.finish_move("relocate_notes", pairs, errors).await
+        self.finish_move(
+            "relocate_notes",
+            pairs,
+            errors,
+            serde_json::json!({"moves": moves, "overwrite": overwrite}),
+        )
+        .await
     }
 
     fn compute_rename(&self, r: &RenameItem) -> Result<String, Error> {
@@ -500,6 +512,7 @@ impl MdServer {
         tool: &str,
         pairs: Vec<(usize, String, String)>,
         mut errors: Vec<ApiError>,
+        args: serde_json::Value,
     ) -> MoveResponse {
         check_move_collisions(&pairs, &mut errors);
         if !errors.is_empty() {
@@ -522,7 +535,7 @@ impl MdServer {
             Ok(receipt) => {
                 let ops = EventOp::from_outcomes(&receipt.outcomes);
                 self.emit_event(tool, Some(&receipt.batch_id), &ops);
-                self.auto_commit(tool, &ops).await;
+                self.auto_commit(tool, &ops, &args).await;
                 let moved = receipt
                     .outcomes
                     .into_iter()

@@ -472,6 +472,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_commit_message_records_the_condensed_tool_call() {
+        let (_root, vault_dir, _clone) = repo_fixture();
+        let s = server_with_sync(&vault_dir).await.with_auto_commit();
+        let long = "x".repeat(500);
+        s.create_notes(Parameters(CreateNotesRequest {
+            notes: vec![NoteInput {
+                path: "cmd.md".into(),
+                content: long.clone(),
+                frontmatter: None,
+            }],
+            overwrite: false,
+        }))
+        .await
+        .unwrap();
+
+        let out = Command::new("git")
+            .args(["log", "-1", "--format=%B"])
+            .current_dir(&vault_dir)
+            .output()
+            .unwrap();
+        let msg = String::from_utf8_lossy(&out.stdout).to_string();
+        // Subject unchanged; the body carries the condensed invocation.
+        assert!(
+            msg.starts_with("mcp(create_notes): 1 notes\n"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("create_notes {"), "no call in body: {msg}");
+        assert!(msg.contains("cmd.md"), "got: {msg}");
+        assert!(
+            !msg.contains(&long),
+            "long content must be truncated: {msg}"
+        );
+        assert!(msg.contains("chars)"), "truncation marker expected: {msg}");
+    }
+
+    #[tokio::test]
     async fn auto_push_retries_after_transient_failure() {
         let (root, vault_dir, _clone) = repo_fixture();
         let bare = root.path().join("remote.git");

@@ -35,7 +35,7 @@ fn body_has_frontmatter(content: &str) -> bool {
 
 // --- create_notes -----------------------------------------------------------
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct CreateNotesRequest {
     #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
@@ -44,7 +44,7 @@ pub struct CreateNotesRequest {
     pub overwrite: bool,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct NoteInput {
     pub path: String,
@@ -75,14 +75,14 @@ pub struct CreateResult {
 
 // --- append_notes -----------------------------------------------------------
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct AppendNotesRequest {
     #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
     pub appends: Vec<AppendInput>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct AppendInput {
     pub path: String,
@@ -111,7 +111,7 @@ pub struct AppendResult {
 
 // --- edit_sections ----------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[schemars(crate = "rmcp::schemars")]
 pub enum OperationArg {
@@ -131,7 +131,7 @@ pub struct EditSectionsRequest {
     pub edits: Vec<EditItem>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct EditItem {
     pub path: String,
@@ -152,7 +152,7 @@ pub struct EditItem {
     pub expected_hash: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "lowercase")]
 #[schemars(crate = "rmcp::schemars")]
 pub enum PositionArg {
@@ -160,7 +160,7 @@ pub enum PositionArg {
     After,
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct DestinationArg {
     pub heading_path: Vec<String>,
@@ -278,7 +278,7 @@ pub struct EditPropertiesRequest {
     pub edits: Vec<PropertyEdit>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct PropertyEdit {
     pub path: String,
@@ -360,7 +360,7 @@ impl MdServer {
         for op in &ops {
             self.emit_event("create_notes", None, std::slice::from_ref(op));
         }
-        self.auto_commit("create_notes", &ops).await;
+        self.auto_commit("create_notes", &ops, &req).await;
         Ok(Json(CreateNotesResponse {
             created,
             sync_warning: self.sync_warning(),
@@ -390,7 +390,7 @@ impl MdServer {
             }
             appended.push(result);
         }
-        self.auto_commit("append_notes", &ops).await;
+        self.auto_commit("append_notes", &ops, &req).await;
         Ok(Json(AppendNotesResponse {
             appended,
             sync_warning: self.sync_warning(),
@@ -562,7 +562,7 @@ impl MdServer {
             Ok(receipt) => {
                 let ops = EventOp::from_outcomes(&receipt.outcomes);
                 self.emit_event("edit_sections", Some(&receipt.batch_id), &ops);
-                self.auto_commit("edit_sections", &ops).await;
+                self.auto_commit("edit_sections", &ops, &edits).await;
             }
             Err(e) => {
                 return EditSectionsResponse {
@@ -661,7 +661,7 @@ impl MdServer {
             Ok(receipt) => {
                 let ops = EventOp::from_outcomes(&receipt.outcomes);
                 self.emit_event("edit_properties", Some(&receipt.batch_id), &ops);
-                self.auto_commit("edit_properties", &ops).await;
+                self.auto_commit("edit_properties", &ops, &edits).await;
             }
             Err(e) => {
                 return EditPropertiesResponse {
