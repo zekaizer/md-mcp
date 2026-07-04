@@ -1,6 +1,21 @@
 # Deploying md-mcp (ADR-0020)
 
-One Linux host, one vault, exposed through a Cloudflare Tunnel. Components:
+One Linux host, one vault, exposed through a Cloudflare Tunnel. Day-to-day
+management goes through **[`mdctl`](mdctl)** (steps 1–3 below are
+`sudo deploy/mdctl install` + `mdctl edit`):
+
+```
+mdctl install     first-time setup: binary + unit + env skeleton
+mdctl update      rebuild, install (keeping a .prev), restart, health-check
+mdctl rollback    swap the .prev binary back, restart, health-check
+mdctl start|stop|restart
+mdctl status      unit state + health probe + sync backlog + recent warns
+mdctl logs [...]  follow the journal
+mdctl edit        edit the env file, then offer a restart
+mdctl token       print a fresh bearer token
+```
+
+Components:
 
 - `md-server` — systemd system service, loopback HTTP (`127.0.0.1:7654`)
 - `cloudflared` — its own systemd service, terminates TLS and forwards

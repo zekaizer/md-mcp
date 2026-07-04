@@ -1,0 +1,133 @@
+#!/bin/bash
+# mdctl — manage the md-mcp production service (ADR-0020).
+#
+#   mdctl install     first-time setup: binary + unit + env skeleton
+#   mdctl update      rebuild, install (keeping a .prev), restart, health-check
+#   mdctl rollback    swap the .prev binary back, restart, health-check
+#   mdctl start|stop|restart
+#   mdctl status      unit state + health probe + sync backlog + recent warns
+#   mdctl logs [...]  follow the journal (extra args pass to journalctl)
+#   mdctl edit        edit the env file, then offer a restart
+#   mdctl token       print a fresh bearer token (paste into the env file)
+#
+# Run from anywhere; the repo root is derived from this script's location.
+set -euo pipefail
+
+UNIT=md-mcp
+BIN=/usr/local/bin/md-server
+ENV_FILE=/etc/md-mcp/env
+REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+
+# Everything here touches root-owned paths; re-exec under sudo once.
+if [ "${EUID}" -ne 0 ] && [ "${1:-}" != token ]; then
+    exec sudo --preserve-env=EDITOR "$0" "$@"
+fi
+
+die() { echo "mdctl: $*" >&2; exit 1; }
+
+envval() { sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | head -1; }
+
+# The vault path with surrounding quotes stripped (env values are unquoted
+# paths in the sample, but be lenient).
+vault_dir() { envval MD_VAULT | sed "s/^['\"]//;s/['\"]$//"; }
+
+health() {
+    local addr host code
+    addr=$(envval MD_HTTP_ADDR); addr=${addr:-127.0.0.1:7654}
+    host=$(envval MD_HTTP_ALLOWED_HOSTS | cut -d, -f1)
+    # Guarded /mcp must answer 401 without a bearer: proves the server is up,
+    # listening, and auth is on. The Host header satisfies the host guard.
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://$addr/mcp" \
+        ${host:+-H "Host: $host"} || true)
+    if [ "$code" = 401 ]; then
+        echo "health: OK (guarded /mcp answers 401 without a bearer)"
+    else
+        echo "health: FAIL — expected 401 from http://$addr/mcp, got '${code}'"
+        return 1
+    fi
+}
+
+backlog() {
+    local vault
+    vault=$(vault_dir)
+    [ -n "$vault" ] && [ -d "$vault" ] || { echo "backlog: vault not found"; return 0; }
+    # Give git the env file's GIT_CONFIG_* binding, exactly as the server does.
+    ( set -a; . "$ENV_FILE"; set +a
+      ahead=$(git -C "$vault" rev-list --count '@{u}..HEAD' 2>/dev/null || echo '?')
+      echo "sync backlog: $ahead commit(s) not on the remote" )
+}
+
+build_and_install() {
+    echo "building release binary in $REPO ..."
+    # Build as the invoking (non-root) user so target/ ownership stays sane.
+    sudo -u "${SUDO_USER:-$USER}" cargo build --release --manifest-path "$REPO/Cargo.toml"
+    if [ -x "$BIN" ]; then
+        cp -f "$BIN" "$BIN.prev"
+        echo "kept previous binary at $BIN.prev"
+    fi
+    install -m 0755 "$REPO/target/release/md-server" "$BIN"
+}
+
+restart_and_check() {
+    systemctl restart "$UNIT"
+    sleep 1
+    systemctl is-active --quiet "$UNIT" || die "unit is not active; see: journalctl -u $UNIT -n 50"
+    health
+}
+
+case "${1:-}" in
+install)
+    build_and_install
+    mkdir -p /etc/md-mcp
+    if [ ! -f "$ENV_FILE" ]; then
+        install -m 0600 "$REPO/deploy/md-mcp.env.example" "$ENV_FILE"
+        chown "${SUDO_USER:-$USER}:" "$ENV_FILE"
+        echo "created $ENV_FILE from the sample — EDIT IT before starting (mdctl edit)"
+    fi
+    if [ ! -f /etc/systemd/system/$UNIT.service ]; then
+        cp "$REPO/deploy/md-mcp.service" /etc/systemd/system/
+        echo "installed unit — adjust User=/ReadWritePaths= if paths differ"
+    fi
+    systemctl daemon-reload
+    echo "next: mdctl edit && systemctl enable --now $UNIT && mdctl status"
+    ;;
+update)
+    build_and_install
+    restart_and_check
+    ;;
+rollback)
+    [ -x "$BIN.prev" ] || die "no $BIN.prev to roll back to"
+    cp -f "$BIN" "$BIN.rolledback"
+    cp -f "$BIN.prev" "$BIN"
+    echo "rolled back binary (the replaced one is at $BIN.rolledback)"
+    restart_and_check
+    ;;
+start)   systemctl start "$UNIT" && sleep 1 && health ;;
+stop)    systemctl stop "$UNIT" && echo stopped ;;
+restart) restart_and_check ;;
+status)
+    systemctl --no-pager --lines 0 status "$UNIT" || true
+    echo
+    health || true
+    backlog
+    echo "recent warnings:"
+    journalctl -u "$UNIT" --since -1h -p warning --no-pager -o cat | tail -5 \
+        || echo "  (none)"
+    ;;
+logs)
+    shift
+    exec journalctl -u "$UNIT" -f "$@"
+    ;;
+edit)
+    "${EDITOR:-vi}" "$ENV_FILE"
+    read -r -p "restart $UNIT to apply? [y/N] " a
+    [ "${a,,}" = y ] && restart_and_check || echo "not restarted"
+    ;;
+token)
+    head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '='
+    ;;
+*)
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac
