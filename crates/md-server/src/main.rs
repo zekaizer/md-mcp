@@ -35,6 +35,14 @@ async fn main() -> Result<()> {
         let sink = md_server::events::EventSink::open(&config.vault_dir, hook_tx)?;
         server = server.with_event_sink(sink);
     }
+    if config.git.sync {
+        // Precondition failure disables sync with a warning (ADR-0016), it
+        // never fails startup: the vault itself is fully usable without git.
+        match md_server::sync::GitSync::preflight(&config.vault_dir).await {
+            Ok(git) => server = server.with_git_sync(git),
+            Err(warning) => tracing::warn!("{warning}"),
+        }
+    }
 
     match config.transport {
         Transport::Stdio => {

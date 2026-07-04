@@ -168,6 +168,22 @@ fn parse_flag(raw: Option<String>, var: &str) -> Result<bool> {
     }
 }
 
+/// Git sync configuration (ADR-0016).
+#[derive(Debug, Clone, Default)]
+pub struct GitConfig {
+    /// Whether git sync is requested (`MD_GIT_SYNC=1`); gates the
+    /// `sync_vault` tool.
+    pub sync: bool,
+}
+
+impl GitConfig {
+    fn resolve(sync: Option<String>) -> Result<Self> {
+        Ok(Self {
+            sync: parse_flag(sync, "MD_GIT_SYNC")?,
+        })
+    }
+}
+
 /// Runtime configuration for the md-mcp server.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -177,6 +193,8 @@ pub struct Config {
     pub transport: Transport,
     /// Event journal + hook (ADR-0017).
     pub events: EventsConfig,
+    /// Git sync (ADR-0016).
+    pub git: GitConfig,
 }
 
 impl Config {
@@ -214,11 +232,13 @@ impl Config {
             std::env::var("MD_EVENTS").ok(),
             std::env::var("MD_ON_COMMIT_HOOK").ok(),
         )?;
+        let git = GitConfig::resolve(std::env::var("MD_GIT_SYNC").ok())?;
 
         Ok(Self {
             vault_dir,
             transport,
             events,
+            git,
         })
     }
 }

@@ -13,6 +13,7 @@ pub mod sync;
 pub mod tools_organize;
 pub mod tools_read;
 pub mod tools_search;
+pub mod tools_sync;
 pub mod tools_write;
 
 use std::sync::Arc;
@@ -31,6 +32,11 @@ pub struct MdServer {
     lock: Arc<RwLock<()>>,
     /// Event journal, when enabled (ADR-0017).
     events: Option<Arc<events::EventSink>>,
+    /// Git driver, when sync is enabled (ADR-0016).
+    git: Option<Arc<sync::GitSync>>,
+    /// The advertised tool set: the base families, plus `sync_vault` when git
+    /// sync is enabled.
+    tool_router: ToolRouter<Self>,
 }
 
 impl MdServer {
@@ -41,6 +47,8 @@ impl MdServer {
             vault: Arc::new(vault),
             lock: Arc::new(RwLock::new(())),
             events: None,
+            git: None,
+            tool_router: Self::base_router(),
         }
     }
 
@@ -49,6 +57,19 @@ impl MdServer {
     pub fn with_event_sink(mut self, sink: events::EventSink) -> Self {
         self.events = Some(Arc::new(sink));
         self
+    }
+
+    /// Attach the git driver and expose the `sync_vault` tool (ADR-0016).
+    #[must_use]
+    pub fn with_git_sync(mut self, git: sync::GitSync) -> Self {
+        self.git = Some(Arc::new(git));
+        self.tool_router = Self::base_router() + Self::sync_router();
+        self
+    }
+
+    /// The git driver, when sync is enabled.
+    pub(crate) fn git_sync(&self) -> Option<&sync::GitSync> {
+        self.git.as_deref()
     }
 
     /// The vault handle (used by tool implementations).
@@ -78,13 +99,13 @@ impl MdServer {
 }
 
 impl MdServer {
-    /// The composed tool router across all tool families.
-    pub(crate) fn tool_router() -> ToolRouter<Self> {
+    /// The composed tool router across the always-on tool families.
+    pub(crate) fn base_router() -> ToolRouter<Self> {
         Self::read_router() + Self::write_router() + Self::organize_router() + Self::search_router()
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for MdServer {
     fn get_info(&self) -> ServerInfo {
         // ServerInfo/Implementation are #[non_exhaustive]: mutate defaults.
