@@ -24,3 +24,4 @@ immutable; a changed decision supersedes the old one with a new ADR.
 - [0013](0013-http-transport.md) — HTTP transport (Streamable HTTP), stdio optional
 - [0014](0014-oauth-authentication.md) — Authentication: co-hosted OAuth 2.1 for the claude.ai connector
 - [0015](0015-stdio-end-to-end-suite.md) — stdio end-to-end test suite
+- [0016](0016-git-sync-integration.md) — Git sync integration: coexistence hardening and the `sync_vault` tool
