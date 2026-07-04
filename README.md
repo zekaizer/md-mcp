@@ -48,6 +48,19 @@ for browser clients, the origin in `MD_HTTP_ALLOWED_ORIGINS`) — or `*` to disa
 guard. There is no in-process TLS — terminate TLS upstream (reverse proxy /
 tunnel) for remote use.
 
+## Testing
+
+```sh
+make check    # fmt + clippy + cargo test + stdio e2e — the pre-push gate
+make test     # unit + in-process protocol tests only
+make e2e      # stdio black-box end-to-end suite (functional + hardening)
+```
+
+Unit tests and one in-process rmcp protocol test live with the crates
+([ADR-0012](docs/adr/0012-testing-and-benchmarking.md)); a stdio black-box suite
+drives the real binary over its wire protocol
+([tests/e2e](tests/e2e/README.md), [ADR-0015](docs/adr/0015-stdio-end-to-end-suite.md)).
+
 ## Documentation
 
 - **[CONTEXT.md](CONTEXT.md)** — glossary / ubiquitous language. Start here.
