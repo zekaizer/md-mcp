@@ -249,6 +249,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_commit_is_per_batch_and_path_scoped() {
+        let (_root, vault_dir, _clone) = repo_fixture();
+        // A concurrent external edit that must never be swept into an
+        // mcp-attributed commit (ADR-0018).
+        std::fs::write(vault_dir.join("external.md"), "# External\n").unwrap();
+
+        let s = server_with_sync(&vault_dir).await.with_auto_commit();
+        s.create_notes(Parameters(CreateNotesRequest {
+            notes: vec![
+                NoteInput {
+                    path: "one.md".into(),
+                    content: "# One\n".into(),
+                    frontmatter: None,
+                },
+                NoteInput {
+                    path: "two.md".into(),
+                    content: "# Two\n".into(),
+                    frontmatter: None,
+                },
+            ],
+            overwrite: false,
+        }))
+        .await
+        .unwrap();
+
+        let out = Command::new("git")
+            .args(["log", "--format=%s", "--name-only", "-1"])
+            .current_dir(&vault_dir)
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(log.contains("mcp(create_notes): 2 notes"), "got: {log}");
+        assert!(log.contains("one.md") && log.contains("two.md"));
+        assert!(
+            !log.contains("external.md"),
+            "external edit swept into mcp commit: {log}"
+        );
+
+        // The external edit is still dirty — left for sync's sweep commit.
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&vault_dir)
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&status.stdout).to_string();
+        assert!(status.contains("external.md"), "got: {status}");
+    }
+
+    #[tokio::test]
     async fn sync_vault_tool_is_hidden_without_git_sync() {
         let dir = tempfile::tempdir().unwrap();
         let s = MdServer::new(Vault::open(dir.path()).unwrap());

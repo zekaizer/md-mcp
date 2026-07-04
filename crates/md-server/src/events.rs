@@ -37,6 +37,18 @@ pub enum EventOp {
 }
 
 impl EventOp {
+    /// The vault paths this op touches (both ends of a move) — what a
+    /// path-scoped auto-commit stages (ADR-0018).
+    pub fn touched_paths(&self) -> impl Iterator<Item = &str> {
+        let (a, b) = match self {
+            EventOp::Create { path } | EventOp::Write { path } | EventOp::Delete { path } => {
+                (path.as_str(), None)
+            }
+            EventOp::Move { path, to } => (path.as_str(), Some(to.as_str())),
+        };
+        std::iter::once(a).chain(b)
+    }
+
     /// Map a committed batch's outcomes to event ops.
     pub fn from_outcomes(outcomes: &[md_core::OpOutcome]) -> Vec<EventOp> {
         outcomes

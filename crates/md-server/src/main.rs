@@ -39,7 +39,13 @@ async fn main() -> Result<()> {
         // Precondition failure disables sync with a warning (ADR-0016), it
         // never fails startup: the vault itself is fully usable without git.
         match md_server::sync::GitSync::preflight(&config.vault_dir).await {
-            Ok(git) => server = server.with_git_sync(git),
+            Ok(git) => {
+                server = server.with_git_sync(git);
+                if config.git.auto_commit {
+                    server = server.with_auto_commit();
+                }
+            }
+            // Automation layers ride on the driver, so this disables them too.
             Err(warning) => tracing::warn!("{warning}"),
         }
     }

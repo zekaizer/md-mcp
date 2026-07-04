@@ -34,6 +34,8 @@ pub struct MdServer {
     events: Option<Arc<events::EventSink>>,
     /// Git driver, when sync is enabled (ADR-0016).
     git: Option<Arc<sync::GitSync>>,
+    /// Per-batch auto-commit (ADR-0018); meaningful only with `git` set.
+    auto_commit: bool,
     /// The advertised tool set: the base families, plus `sync_vault` when git
     /// sync is enabled.
     tool_router: ToolRouter<Self>,
@@ -48,6 +50,7 @@ impl MdServer {
             lock: Arc::new(RwLock::new(())),
             events: None,
             git: None,
+            auto_commit: false,
             tool_router: Self::base_router(),
         }
     }
@@ -64,6 +67,13 @@ impl MdServer {
     pub fn with_git_sync(mut self, git: sync::GitSync) -> Self {
         self.git = Some(Arc::new(git));
         self.tool_router = Self::base_router() + Self::sync_router();
+        self
+    }
+
+    /// Commit every write batch as it lands (ADR-0018); requires a git driver.
+    #[must_use]
+    pub fn with_auto_commit(mut self) -> Self {
+        self.auto_commit = true;
         self
     }
 
@@ -95,6 +105,35 @@ impl MdServer {
         if let Err(e) = sink.emit(tool, batch_id, ops) {
             tracing::warn!("event journal append failed: {e}");
         }
+    }
+
+    /// Commit a batch's touched paths as one git commit (ADR-0018), when
+    /// auto-commit is on. Called while the write guard is still held, so the
+    /// commit snapshot is exactly the batch's result; path-scoped staging
+    /// keeps concurrent external edits out. A git failure is logged, never
+    /// surfaced — the vault, not git, is the durability layer.
+    pub(crate) async fn auto_commit(&self, tool: &str, ops: &[events::EventOp]) {
+        if !self.auto_commit || ops.is_empty() {
+            return;
+        }
+        let Some(git) = self.git_sync() else { return };
+        let paths: Vec<String> = ops
+            .iter()
+            .flat_map(events::EventOp::touched_paths)
+            .map(str::to_string)
+            .collect();
+        let message = format!("mcp({tool}): {} notes", ops.len());
+        let flock = match self.vault().exclusive_lock() {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!("auto-commit skipped, cannot take vault lock: {e}");
+                return;
+            }
+        };
+        if let Err(e) = git.commit_paths(&message, &paths).await {
+            tracing::warn!("auto-commit failed: {e}");
+        }
+        drop(flock);
     }
 }
 

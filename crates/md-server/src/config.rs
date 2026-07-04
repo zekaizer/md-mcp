@@ -168,19 +168,26 @@ fn parse_flag(raw: Option<String>, var: &str) -> Result<bool> {
     }
 }
 
-/// Git sync configuration (ADR-0016).
+/// Git sync configuration (ADR-0016) and automation layers (ADR-0018).
 #[derive(Debug, Clone, Default)]
 pub struct GitConfig {
     /// Whether git sync is requested (`MD_GIT_SYNC=1`); gates the
-    /// `sync_vault` tool.
+    /// `sync_vault` tool and is the base every automation layer requires.
     pub sync: bool,
+    /// Per-batch auto-commit (`MD_GIT_AUTO_COMMIT=1`).
+    pub auto_commit: bool,
 }
 
 impl GitConfig {
-    fn resolve(sync: Option<String>) -> Result<Self> {
-        Ok(Self {
-            sync: parse_flag(sync, "MD_GIT_SYNC")?,
-        })
+    fn resolve(sync: Option<String>, auto_commit: Option<String>) -> Result<Self> {
+        let sync = parse_flag(sync, "MD_GIT_SYNC")?;
+        let auto_commit = parse_flag(auto_commit, "MD_GIT_AUTO_COMMIT")?;
+        // An automation layer without the base is a misconfiguration, not a
+        // silent no-op (ADR-0018).
+        if auto_commit && !sync {
+            bail!("MD_GIT_AUTO_COMMIT requires MD_GIT_SYNC=1");
+        }
+        Ok(Self { sync, auto_commit })
     }
 }
 
@@ -232,7 +239,10 @@ impl Config {
             std::env::var("MD_EVENTS").ok(),
             std::env::var("MD_ON_COMMIT_HOOK").ok(),
         )?;
-        let git = GitConfig::resolve(std::env::var("MD_GIT_SYNC").ok())?;
+        let git = GitConfig::resolve(
+            std::env::var("MD_GIT_SYNC").ok(),
+            std::env::var("MD_GIT_AUTO_COMMIT").ok(),
+        )?;
 
         Ok(Self {
             vault_dir,
