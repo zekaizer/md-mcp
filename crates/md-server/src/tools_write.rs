@@ -391,7 +391,7 @@ impl MdServer {
                 appended: false,
                 error: Some(ApiError {
                     code: Code::Traversal.as_str().to_string(),
-                    message: "cannot target the internal state directory".to_string(),
+                    message: "cannot target a protected directory".to_string(),
                     index: None,
                 }),
             };

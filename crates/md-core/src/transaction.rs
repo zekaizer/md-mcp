@@ -79,7 +79,7 @@ impl Vault {
             for p in paths {
                 if Self::is_internal_path(p) {
                     return Err(Error::traversal(format!(
-                        "cannot target the internal state directory: {p}"
+                        "cannot target a protected directory: {p}"
                     )));
                 }
             }

@@ -19,6 +19,14 @@ use crate::text::nfc;
 /// The server's internal state directory, off-limits to agent note operations.
 pub(crate) const INTERNAL_DIR: &str = ".md-mcp";
 
+/// The git repository metadata directory. Off-limits like `.md-mcp/`: a note
+/// operation writing into `.git/` could corrupt the repository
+/// ([ADR-0016](../../../docs/adr/0016-git-sync-integration.md)).
+const GIT_DIR: &str = ".git";
+
+/// Directories no agent note operation may target.
+const PROTECTED_DIRS: [&str; 2] = [INTERNAL_DIR, GIT_DIR];
+
 /// Maximum bytes in one path component (file or directory name). Matches the
 /// common filesystem `NAME_MAX`, so an over-long name is a validation error
 /// rather than a raw `ENAMETOOLONG` at commit time.
@@ -115,23 +123,26 @@ impl Vault {
         Ok(clean.to_string())
     }
 
-    /// Whether `rel` targets the server's internal state directory (`.md-mcp/`),
-    /// which agent-facing note operations must not touch.
+    /// Whether `rel` targets a protected directory — the server's internal
+    /// state (`.md-mcp/`) or the git metadata (`.git/`) — which agent-facing
+    /// note operations must not touch.
     #[must_use]
     pub fn is_internal_path(rel: &str) -> bool {
         match Self::validate_rel(rel) {
-            Ok(clean) => clean == INTERNAL_DIR || clean.starts_with(&format!("{INTERNAL_DIR}/")),
+            Ok(clean) => PROTECTED_DIRS
+                .iter()
+                .any(|d| clean == *d || clean.starts_with(&format!("{d}/"))),
             Err(_) => false,
         }
     }
 
-    /// Validate an agent-supplied note path: traversal-safe and not inside the
-    /// internal `.md-mcp/` state directory.
+    /// Validate an agent-supplied note path: traversal-safe and not inside a
+    /// protected directory (`.md-mcp/`, `.git/`).
     pub fn validate_note_rel(rel: &str) -> Result<String> {
         let clean = Self::validate_rel(rel)?;
-        if clean == INTERNAL_DIR || clean.starts_with(&format!("{INTERNAL_DIR}/")) {
+        if Self::is_internal_path(&clean) {
             return Err(Error::traversal(format!(
-                "cannot target the internal state directory: {rel}"
+                "cannot target a protected directory: {rel}"
             )));
         }
         Ok(clean)
@@ -530,6 +541,12 @@ mod tests {
         assert!(Vault::is_internal_path("./.md-mcp/trash/a.md"));
         assert!(!Vault::is_internal_path("notes/.md-mcp.md"));
         assert!(!Vault::is_internal_path("a.md"));
+        // .git/ is protected like .md-mcp/ (ADR-0016); look-alikes are not.
+        assert!(Vault::is_internal_path(".git"));
+        assert!(Vault::is_internal_path(".git/config"));
+        assert!(Vault::is_internal_path("./.git/hooks/pre-commit.md"));
+        assert!(!Vault::is_internal_path(".gitignore"));
+        assert!(!Vault::is_internal_path("notes/.git.md"));
     }
 
     #[test]
@@ -553,6 +570,24 @@ mod tests {
             .create_note(".md-mcp/journal/evil.md", b"x", false)
             .unwrap_err();
         assert_eq!(e.code, Code::Traversal);
+    }
+
+    #[test]
+    fn git_dir_is_write_protected_and_hidden() {
+        let (vdir, vault) = temp_vault();
+        std::fs::create_dir_all(vdir.path().join(".git")).unwrap();
+        std::fs::write(vdir.path().join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        // No creation, no transaction op, no read inside .git/.
+        let e = vault.create_note(".git/evil.md", b"x", false).unwrap_err();
+        assert_eq!(e.code, Code::Traversal);
+        let e = vault
+            .commit_batch(&[crate::Op::Delete {
+                path: ".git/HEAD".into(),
+            }])
+            .unwrap_err();
+        assert_eq!(e.code, Code::Traversal);
+        let e = vault.read_note(".git/HEAD").unwrap_err();
+        assert_eq!(e.code, Code::NotFound);
     }
 
     #[test]
