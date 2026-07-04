@@ -49,6 +49,18 @@ pub fn ensure_git_exclude(vault_root: &Path) {
     }
 }
 
+/// The most recent push/sync failure, kept for surfacing on write responses
+/// (ADR-0019). Cleared by any successful sync or push.
+#[derive(Debug)]
+pub(crate) struct SyncHealth {
+    /// When the current failure streak started (kept across repeats).
+    pub since: std::time::Instant,
+    /// Local commits not on the upstream at the last failed attempt.
+    pub ahead: u64,
+    /// One-line reason (first line of the git error, or the conflict list).
+    pub reason: String,
+}
+
 /// How a rebase onto the fetched upstream ended.
 #[derive(Debug)]
 pub enum Rebase {
@@ -252,9 +264,11 @@ pub(crate) async fn auto_push_task(
         }
         let Some(git) = server.git_sync() else { return };
         if git.ahead_count().await == 0 {
+            server.report_sync_ok();
             continue;
         }
         if git.push().await.is_ok() {
+            server.report_sync_ok();
             continue;
         }
         log_background_sync("auto-push", server.run_sync().await);

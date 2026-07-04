@@ -38,6 +38,9 @@ pub struct MdServer {
     auto_commit: bool,
     /// Signals the debounced auto-push task after each auto-commit (ADR-0018).
     push_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    /// Outcome of the most recent push/sync attempt; `Some` while failing
+    /// (ADR-0019). Std mutex: only ever held for a field read/write.
+    sync_health: Arc<std::sync::Mutex<Option<sync::SyncHealth>>>,
     /// The advertised tool set: the base families, plus `sync_vault` when git
     /// sync is enabled.
     tool_router: ToolRouter<Self>,
@@ -54,6 +57,7 @@ impl MdServer {
             git: None,
             auto_commit: false,
             push_tx: None,
+            sync_health: Arc::new(std::sync::Mutex::new(None)),
             tool_router: Self::base_router(),
         }
     }
@@ -113,6 +117,39 @@ impl MdServer {
     #[must_use]
     pub fn lock(&self) -> &RwLock<()> {
         &self.lock
+    }
+
+    /// Record a failed push/sync attempt (ADR-0019). The start of the failure
+    /// streak is kept across repeats so the warning shows total duration.
+    pub(crate) fn report_sync_failure(&self, ahead: u64, reason: String) {
+        let mut health = self.sync_health.lock().unwrap();
+        let since = health
+            .as_ref()
+            .map_or_else(std::time::Instant::now, |h| h.since);
+        *health = Some(sync::SyncHealth {
+            since,
+            ahead,
+            reason,
+        });
+    }
+
+    /// Record a successful push/sync attempt: the vault is on the remote.
+    pub(crate) fn report_sync_ok(&self) {
+        self.sync_health.lock().unwrap().take();
+    }
+
+    /// The warning carried on write responses while sync is failing (ADR-0019);
+    /// `None` when healthy (the field is then omitted from the JSON).
+    pub(crate) fn sync_warning(&self) -> Option<String> {
+        let health = self.sync_health.lock().unwrap();
+        health.as_ref().map(|h| {
+            format!(
+                "{} local commit(s) not on the remote ({}; failing for {}s)",
+                h.ahead,
+                h.reason,
+                h.since.elapsed().as_secs()
+            )
+        })
     }
 
     /// Record a successful mutation in the event journal, if one is attached.

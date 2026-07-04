@@ -58,6 +58,10 @@ pub struct NoteInput {
 #[schemars(crate = "rmcp::schemars")]
 pub struct CreateNotesResponse {
     pub created: Vec<CreateResult>,
+    /// Present while git sync is failing: local commits are not on the remote
+    /// (ADR-0019). Inspect and recover via sync_vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -91,6 +95,9 @@ pub struct AppendInput {
 #[schemars(crate = "rmcp::schemars")]
 pub struct AppendNotesResponse {
     pub appended: Vec<AppendResult>,
+    /// Present while git sync is failing (ADR-0019); see sync_vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -170,6 +177,9 @@ pub struct EditSectionsResponse {
     pub applied: Vec<AppliedEdit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
+    /// Present while git sync is failing (ADR-0019); see sync_vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -286,6 +296,9 @@ pub struct EditPropertiesResponse {
     pub applied: Vec<PropertyApplied>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
+    /// Present while git sync is failing (ADR-0019); see sync_vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -348,7 +361,10 @@ impl MdServer {
             self.emit_event("create_notes", None, std::slice::from_ref(op));
         }
         self.auto_commit("create_notes", &ops).await;
-        Ok(Json(CreateNotesResponse { created }))
+        Ok(Json(CreateNotesResponse {
+            created,
+            sync_warning: self.sync_warning(),
+        }))
     }
 
     /// Append raw content to the end of notes (no separator inserted).
@@ -375,7 +391,10 @@ impl MdServer {
             appended.push(result);
         }
         self.auto_commit("append_notes", &ops).await;
-        Ok(Json(AppendNotesResponse { appended }))
+        Ok(Json(AppendNotesResponse {
+            appended,
+            sync_warning: self.sync_warning(),
+        }))
     }
 
     /// Edit note sections by heading path (all-or-nothing).
@@ -388,7 +407,9 @@ impl MdServer {
     ) -> Result<Json<EditSectionsResponse>, ErrorData> {
         batch_limit(req.edits.len())?;
         let _guard = self.lock().write().await;
-        Ok(Json(self.run_edit_sections(&req.edits).await))
+        let mut r = self.run_edit_sections(&req.edits).await;
+        r.sync_warning = self.sync_warning();
+        Ok(Json(r))
     }
 
     /// Set or remove frontmatter properties (all-or-nothing).
@@ -401,7 +422,9 @@ impl MdServer {
     ) -> Result<Json<EditPropertiesResponse>, ErrorData> {
         batch_limit(req.edits.len())?;
         let _guard = self.lock().write().await;
-        Ok(Json(self.run_edit_properties(&req.edits).await))
+        let mut r = self.run_edit_properties(&req.edits).await;
+        r.sync_warning = self.sync_warning();
+        Ok(Json(r))
     }
 }
 
@@ -532,6 +555,7 @@ impl MdServer {
                 ok: false,
                 applied: vec![],
                 errors,
+                sync_warning: None,
             };
         }
         match self.vault().commit_batch(&writes) {
@@ -545,6 +569,7 @@ impl MdServer {
                     ok: false,
                     applied: vec![],
                     errors: vec![ApiError::from_core(&e)],
+                    sync_warning: None,
                 };
             }
         }
@@ -553,6 +578,7 @@ impl MdServer {
             ok: true,
             applied,
             errors: vec![],
+            sync_warning: None,
         }
     }
 
@@ -628,6 +654,7 @@ impl MdServer {
                 ok: false,
                 applied: vec![],
                 errors,
+                sync_warning: None,
             };
         }
         match self.vault().commit_batch(&writes) {
@@ -641,6 +668,7 @@ impl MdServer {
                     ok: false,
                     applied: vec![],
                     errors: vec![ApiError::from_core(&e)],
+                    sync_warning: None,
                 };
             }
         }
@@ -649,6 +677,7 @@ impl MdServer {
             ok: true,
             applied,
             errors: vec![],
+            sync_warning: None,
         }
     }
 }

@@ -123,6 +123,9 @@ pub struct DeleteNotesResponse {
     pub deleted: Vec<DeletedItem>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
+    /// Present while git sync is failing (ADR-0019); see sync_vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -175,6 +178,9 @@ pub struct MoveResponse {
     pub moved: Vec<MovedItem>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
+    /// Present while git sync is failing (ADR-0019); see sync_vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -185,6 +191,9 @@ pub struct RenameResponse {
     pub renamed: Vec<MovedItem>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
+    /// Present while git sync is failing (ADR-0019); see sync_vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -206,7 +215,9 @@ impl MdServer {
     ) -> Result<Json<DeleteNotesResponse>, ErrorData> {
         batch_limit(req.paths.len())?;
         let _guard = self.lock().write().await;
-        Ok(Json(self.run_delete(&req.paths).await))
+        let mut r = self.run_delete(&req.paths).await;
+        r.sync_warning = self.sync_warning();
+        Ok(Json(r))
     }
 
     /// Rename a note or directory in place (same parent). All-or-nothing.
@@ -224,6 +235,7 @@ impl MdServer {
             ok: r.ok,
             renamed: r.moved,
             errors: r.errors,
+            sync_warning: self.sync_warning(),
         }))
     }
 
@@ -237,7 +249,9 @@ impl MdServer {
     ) -> Result<Json<MoveResponse>, ErrorData> {
         batch_limit(req.moves.len())?;
         let _guard = self.lock().write().await;
-        Ok(Json(self.run_relocate(&req.moves, req.overwrite).await))
+        let mut r = self.run_relocate(&req.moves, req.overwrite).await;
+        r.sync_warning = self.sync_warning();
+        Ok(Json(r))
     }
 }
 
@@ -275,6 +289,7 @@ impl MdServer {
                 ok: false,
                 deleted: vec![],
                 errors,
+                sync_warning: None,
             };
         }
 
@@ -303,12 +318,14 @@ impl MdServer {
                     ok: true,
                     deleted,
                     errors: vec![],
+                    sync_warning: None,
                 }
             }
             Err(e) => DeleteNotesResponse {
                 ok: false,
                 deleted: vec![],
                 errors: vec![ApiError::from_core(&e)],
+                sync_warning: None,
             },
         }
     }
@@ -491,6 +508,7 @@ impl MdServer {
                 ok: false,
                 moved: vec![],
                 errors,
+                sync_warning: None,
             };
         }
         let ops: Vec<Op> = pairs
@@ -521,12 +539,14 @@ impl MdServer {
                     ok: true,
                     moved,
                     errors: vec![],
+                    sync_warning: None,
                 }
             }
             Err(e) => MoveResponse {
                 ok: false,
                 moved: vec![],
                 errors: vec![ApiError::from_core(&e)],
+                sync_warning: None,
             },
         }
     }
