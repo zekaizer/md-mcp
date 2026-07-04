@@ -282,8 +282,9 @@ impl MdServer {
             .map(|p| Op::Delete { path: p.clone() })
             .collect();
         match self.vault().commit_batch(&ops) {
-            Ok(outcomes) => {
-                let deleted = outcomes
+            Ok(receipt) => {
+                let deleted = receipt
+                    .outcomes
                     .into_iter()
                     .zip(paths)
                     .filter_map(|(o, requested)| match o {
@@ -495,8 +496,9 @@ impl MdServer {
             })
             .collect();
         match self.vault().commit_batch(&ops) {
-            Ok(outcomes) => {
-                let moved = outcomes
+            Ok(receipt) => {
+                let moved = receipt
+                    .outcomes
                     .into_iter()
                     .zip(&pairs)
                     .filter_map(|(o, (_, pfrom, pto))| match o {

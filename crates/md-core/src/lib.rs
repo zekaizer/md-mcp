@@ -20,5 +20,5 @@ pub use document::{Document, Heading, OutlineEntry};
 pub use error::{Code, Error, Result};
 pub use patch::{Destination, Edit, Operation, Position, patch_sections};
 pub use section::Scope;
-pub use transaction::{Op, OpOutcome};
+pub use transaction::{CommitReceipt, Op, OpOutcome};
 pub use vault::{Vault, VaultLock};
