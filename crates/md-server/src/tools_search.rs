@@ -28,6 +28,13 @@ fn default_context_lines() -> usize {
     2
 }
 
+/// Maximum bytes in a `search_notes` query. A real query is a few keywords; this
+/// cap is far above any legitimate one yet bounds the aho-corasick automaton
+/// build, whose `ascii_case_insensitive` construction is superlinear in a single
+/// long token (a multi-megabyte query otherwise wedges the request for tens of
+/// seconds). Over-cap queries are rejected up front instead.
+const MAX_QUERY_BYTES: usize = 1024;
+
 // --- list_notes -------------------------------------------------------------
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -172,6 +179,14 @@ impl MdServer {
         if !has_query && req.frontmatter.is_none() && req.frontmatter_exists.is_none() {
             return Err(ErrorData::invalid_params(
                 "provide at least one of query, frontmatter, or frontmatter_exists",
+                None,
+            ));
+        }
+        if let Some(q) = req.query.as_deref()
+            && q.len() > MAX_QUERY_BYTES
+        {
+            return Err(ErrorData::invalid_params(
+                format!("query exceeds {MAX_QUERY_BYTES} bytes: {} bytes", q.len()),
                 None,
             ));
         }
@@ -461,6 +476,26 @@ mod tests {
             }))
             .await;
         assert!(r.is_err(), "search limit 500 must be rejected");
+    }
+
+    #[tokio::test]
+    async fn over_long_query_is_rejected() {
+        // An over-cap query must fail fast, not wedge the aho-corasick build
+        // (whose case-insensitive construction is superlinear in one long token).
+        let (_d, s) = server(&[("a.md", "body")]);
+        let huge = "z".repeat(MAX_QUERY_BYTES + 1);
+        let r = s
+            .search_notes(Parameters(SearchNotesRequest {
+                query: Some(huge),
+                mode: SearchMode::default(),
+                frontmatter: None,
+                frontmatter_exists: None,
+                limit: 20,
+                context_lines: 2,
+                cursor: None,
+            }))
+            .await;
+        assert!(r.is_err(), "over-cap query must be rejected");
     }
 
     #[tokio::test]
