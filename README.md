@@ -69,10 +69,13 @@ The automation variables require `MD_GIT_SYNC=1`. Whenever the vault is a git
 repository (opted in or not), the server excludes its internal `.md-mcp/` state
 via `.git/info/exclude` and takes an OS lock (`.md-mcp/lock`) around every
 transaction commit and git operation — external tooling can coordinate with
-`flock <vault>/.md-mcp/lock git …`. See
+`flock <vault>/.md-mcp/lock git …`. When a push or sync fails, write responses
+carry a `sync_warning` field until a sync succeeds, and the auto-push task
+retries on a capped backoff (a stranded backlog also drains at startup). See
 [ADR-0016](docs/adr/0016-git-sync-integration.md),
 [ADR-0017](docs/adr/0017-event-journal-and-hook.md),
-[ADR-0018](docs/adr/0018-git-automation.md).
+[ADR-0018](docs/adr/0018-git-automation.md),
+[ADR-0019](docs/adr/0019-sync-health-and-push-retry.md).
 
 ## Testing
 
