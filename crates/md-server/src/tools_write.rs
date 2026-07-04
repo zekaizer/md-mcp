@@ -35,7 +35,7 @@ fn body_has_frontmatter(content: &str) -> bool {
 
 // --- create_notes -----------------------------------------------------------
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct CreateNotesRequest {
     #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
@@ -44,7 +44,7 @@ pub struct CreateNotesRequest {
     pub overwrite: bool,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct NoteInput {
     pub path: String,
@@ -58,6 +58,10 @@ pub struct NoteInput {
 #[schemars(crate = "rmcp::schemars")]
 pub struct CreateNotesResponse {
     pub created: Vec<CreateResult>,
+    /// Present while git sync is failing: local commits are not on the remote
+    /// (ADR-0019). Inspect and recover via sync_vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -71,14 +75,14 @@ pub struct CreateResult {
 
 // --- append_notes -----------------------------------------------------------
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct AppendNotesRequest {
     #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
     pub appends: Vec<AppendInput>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct AppendInput {
     pub path: String,
@@ -91,6 +95,9 @@ pub struct AppendInput {
 #[schemars(crate = "rmcp::schemars")]
 pub struct AppendNotesResponse {
     pub appended: Vec<AppendResult>,
+    /// Present while git sync is failing (ADR-0019); see sync_vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -104,7 +111,7 @@ pub struct AppendResult {
 
 // --- edit_sections ----------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[schemars(crate = "rmcp::schemars")]
 pub enum OperationArg {
@@ -124,7 +131,7 @@ pub struct EditSectionsRequest {
     pub edits: Vec<EditItem>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct EditItem {
     pub path: String,
@@ -145,7 +152,7 @@ pub struct EditItem {
     pub expected_hash: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema, Serialize)]
 #[serde(rename_all = "lowercase")]
 #[schemars(crate = "rmcp::schemars")]
 pub enum PositionArg {
@@ -153,7 +160,7 @@ pub enum PositionArg {
     After,
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct DestinationArg {
     pub heading_path: Vec<String>,
@@ -170,6 +177,9 @@ pub struct EditSectionsResponse {
     pub applied: Vec<AppliedEdit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
+    /// Present while git sync is failing (ADR-0019); see sync_vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -268,7 +278,7 @@ pub struct EditPropertiesRequest {
     pub edits: Vec<PropertyEdit>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct PropertyEdit {
     pub path: String,
@@ -286,6 +296,9 @@ pub struct EditPropertiesResponse {
     pub applied: Vec<PropertyApplied>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
+    /// Present while git sync is failing (ADR-0019); see sync_vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -347,8 +360,11 @@ impl MdServer {
         for op in &ops {
             self.emit_event("create_notes", None, std::slice::from_ref(op));
         }
-        self.auto_commit("create_notes", &ops).await;
-        Ok(Json(CreateNotesResponse { created }))
+        self.auto_commit("create_notes", &ops, &req).await;
+        Ok(Json(CreateNotesResponse {
+            created,
+            sync_warning: self.sync_warning(),
+        }))
     }
 
     /// Append raw content to the end of notes (no separator inserted).
@@ -374,8 +390,11 @@ impl MdServer {
             }
             appended.push(result);
         }
-        self.auto_commit("append_notes", &ops).await;
-        Ok(Json(AppendNotesResponse { appended }))
+        self.auto_commit("append_notes", &ops, &req).await;
+        Ok(Json(AppendNotesResponse {
+            appended,
+            sync_warning: self.sync_warning(),
+        }))
     }
 
     /// Edit note sections by heading path (all-or-nothing).
@@ -388,7 +407,9 @@ impl MdServer {
     ) -> Result<Json<EditSectionsResponse>, ErrorData> {
         batch_limit(req.edits.len())?;
         let _guard = self.lock().write().await;
-        Ok(Json(self.run_edit_sections(&req.edits).await))
+        let mut r = self.run_edit_sections(&req.edits).await;
+        r.sync_warning = self.sync_warning();
+        Ok(Json(r))
     }
 
     /// Set or remove frontmatter properties (all-or-nothing).
@@ -401,7 +422,9 @@ impl MdServer {
     ) -> Result<Json<EditPropertiesResponse>, ErrorData> {
         batch_limit(req.edits.len())?;
         let _guard = self.lock().write().await;
-        Ok(Json(self.run_edit_properties(&req.edits).await))
+        let mut r = self.run_edit_properties(&req.edits).await;
+        r.sync_warning = self.sync_warning();
+        Ok(Json(r))
     }
 }
 
@@ -532,19 +555,21 @@ impl MdServer {
                 ok: false,
                 applied: vec![],
                 errors,
+                sync_warning: None,
             };
         }
         match self.vault().commit_batch(&writes) {
             Ok(receipt) => {
                 let ops = EventOp::from_outcomes(&receipt.outcomes);
                 self.emit_event("edit_sections", Some(&receipt.batch_id), &ops);
-                self.auto_commit("edit_sections", &ops).await;
+                self.auto_commit("edit_sections", &ops, &edits).await;
             }
             Err(e) => {
                 return EditSectionsResponse {
                     ok: false,
                     applied: vec![],
                     errors: vec![ApiError::from_core(&e)],
+                    sync_warning: None,
                 };
             }
         }
@@ -553,6 +578,7 @@ impl MdServer {
             ok: true,
             applied,
             errors: vec![],
+            sync_warning: None,
         }
     }
 
@@ -628,19 +654,21 @@ impl MdServer {
                 ok: false,
                 applied: vec![],
                 errors,
+                sync_warning: None,
             };
         }
         match self.vault().commit_batch(&writes) {
             Ok(receipt) => {
                 let ops = EventOp::from_outcomes(&receipt.outcomes);
                 self.emit_event("edit_properties", Some(&receipt.batch_id), &ops);
-                self.auto_commit("edit_properties", &ops).await;
+                self.auto_commit("edit_properties", &ops, &edits).await;
             }
             Err(e) => {
                 return EditPropertiesResponse {
                     ok: false,
                     applied: vec![],
                     errors: vec![ApiError::from_core(&e)],
+                    sync_warning: None,
                 };
             }
         }
@@ -649,6 +677,7 @@ impl MdServer {
             ok: true,
             applied,
             errors: vec![],
+            sync_warning: None,
         }
     }
 }

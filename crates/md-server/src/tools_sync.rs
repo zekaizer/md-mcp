@@ -48,8 +48,35 @@ impl MdServer {
 impl MdServer {
     /// The full sync sequence — shared by the `sync_vault` tool and the
     /// automation tasks (ADR-0018). `Err` is a git execution failure;
-    /// conflicts are a normal result.
+    /// conflicts are a normal result. Every outcome updates the sync health
+    /// surfaced on write responses (ADR-0019), so the manual tool, the
+    /// interval task, and the auto-push fallback all feed one state.
     pub(crate) async fn run_sync(&self) -> Result<SyncVaultResponse, String> {
+        let result = self.run_sync_inner().await;
+        if let Some(git) = self.git_sync() {
+            match &result {
+                Ok(r) if r.status == "conflict" => {
+                    let ahead = git.ahead_count().await;
+                    self.report_sync_failure(
+                        ahead,
+                        format!(
+                            "rebase conflict in {}; resolve via sync_vault",
+                            r.conflicts.join(", ")
+                        ),
+                    );
+                }
+                Ok(_) => self.report_sync_ok(),
+                Err(e) => {
+                    let ahead = git.ahead_count().await;
+                    let first_line = e.lines().next().unwrap_or(e).to_string();
+                    self.report_sync_failure(ahead, first_line);
+                }
+            }
+        }
+        result
+    }
+
+    async fn run_sync_inner(&self) -> Result<SyncVaultResponse, String> {
         let Some(git) = self.git_sync() else {
             return Err("git sync is not enabled".into());
         };
@@ -339,6 +366,219 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn write_responses_surface_sync_warning_while_push_fails() {
+        let (root, vault_dir, _clone) = repo_fixture();
+        let bare = root.path().join("remote.git");
+        let off = root.path().join("remote.git.off");
+        let s = server_with_sync(&vault_dir).await.with_auto_commit();
+
+        // The remote vanishes: the explicit sync fails and records ill health.
+        std::fs::rename(&bare, &off).unwrap();
+        assert!(s.sync_vault().await.is_err());
+
+        let r = s
+            .create_notes(Parameters(CreateNotesRequest {
+                notes: vec![NoteInput {
+                    path: "while-down.md".into(),
+                    content: "# Down\n".into(),
+                    frontmatter: None,
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        let warning = r
+            .sync_warning
+            .expect("write must carry sync_warning while sync is failing");
+        assert!(warning.contains("not on the remote"), "got: {warning}");
+
+        // The remote returns: a clean sync clears the warning on later writes.
+        std::fs::rename(&off, &bare).unwrap();
+        assert_eq!(s.sync_vault().await.unwrap().0.status, "clean");
+        let r = s
+            .create_notes(Parameters(CreateNotesRequest {
+                notes: vec![NoteInput {
+                    path: "after-recovery.md".into(),
+                    content: "# Up\n".into(),
+                    frontmatter: None,
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            r.sync_warning.is_none(),
+            "warning must clear after a clean sync: {:?}",
+            r.sync_warning
+        );
+    }
+
+    #[tokio::test]
+    async fn rebase_conflict_surfaces_in_sync_warning() {
+        let (_root, vault_dir, clone) = repo_fixture();
+        std::fs::write(clone.join("seed.md"), "# Seed\nremote line\n").unwrap();
+        git(&clone, &["add", "-A"]);
+        git(&clone, &["commit", "-m", "remote edit"]);
+        git(&clone, &["push"]);
+        std::fs::write(vault_dir.join("seed.md"), "# Seed\nlocal line\n").unwrap();
+
+        let s = server_with_sync(&vault_dir).await.with_auto_commit();
+        assert_eq!(s.sync_vault().await.unwrap().0.status, "conflict");
+
+        let r = s
+            .create_notes(Parameters(CreateNotesRequest {
+                notes: vec![NoteInput {
+                    path: "unrelated.md".into(),
+                    content: "# Unrelated\n".into(),
+                    frontmatter: None,
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        let warning = r.sync_warning.expect("conflict must surface on writes");
+        assert!(
+            warning.contains("conflict") && warning.contains("seed.md"),
+            "got: {warning}"
+        );
+    }
+
+    /// Poll the bare remote's log until `needle` shows up (or panic at the
+    /// deadline).
+    async fn wait_for_remote_commit(bare: &Path, needle: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let out = Command::new("git")
+                .args(["log", "--format=%s", "main"])
+                .current_dir(bare)
+                .output()
+                .unwrap();
+            let log = String::from_utf8_lossy(&out.stdout).to_string();
+            if log.contains(needle) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "commit never landed on the remote; log:\n{log}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_commit_message_records_the_condensed_tool_call() {
+        let (_root, vault_dir, _clone) = repo_fixture();
+        let s = server_with_sync(&vault_dir).await.with_auto_commit();
+        let long = "x".repeat(500);
+        s.create_notes(Parameters(CreateNotesRequest {
+            notes: vec![NoteInput {
+                path: "cmd.md".into(),
+                content: long.clone(),
+                frontmatter: None,
+            }],
+            overwrite: false,
+        }))
+        .await
+        .unwrap();
+
+        let out = Command::new("git")
+            .args(["log", "-1", "--format=%B"])
+            .current_dir(&vault_dir)
+            .output()
+            .unwrap();
+        let msg = String::from_utf8_lossy(&out.stdout).to_string();
+        // Subject unchanged; the body carries the condensed invocation.
+        assert!(
+            msg.starts_with("mcp(create_notes): 1 notes\n"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("create_notes {"), "no call in body: {msg}");
+        assert!(msg.contains("cmd.md"), "got: {msg}");
+        assert!(
+            !msg.contains(&long),
+            "long content must be truncated: {msg}"
+        );
+        assert!(msg.contains("chars)"), "truncation marker expected: {msg}");
+    }
+
+    #[tokio::test]
+    async fn auto_push_retries_after_transient_failure() {
+        let (root, vault_dir, _clone) = repo_fixture();
+        let bare = root.path().join("remote.git");
+        let off = root.path().join("remote.git.off");
+
+        let mut s = server_with_sync(&vault_dir).await.with_auto_commit();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        s.push_tx = Some(tx);
+        tokio::spawn(crate::sync::auto_push_task(
+            s.clone(),
+            rx,
+            std::time::Duration::from_millis(40),  // debounce
+            std::time::Duration::from_millis(150), // retry initial
+            std::time::Duration::from_millis(400), // retry cap
+        ));
+
+        // The remote is down when the write lands: the push and its fallback
+        // sync both fail.
+        std::fs::rename(&bare, &off).unwrap();
+        s.create_notes(Parameters(CreateNotesRequest {
+            notes: vec![NoteInput {
+                path: "retry.md".into(),
+                content: "# Retry\n".into(),
+                frontmatter: None,
+            }],
+            overwrite: false,
+        }))
+        .await
+        .unwrap();
+
+        // Wait until the failure is recorded (first attempt happened) …
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while s.sync_warning().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first auto-push attempt never failed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // … then bring the remote back: the retry timer (no new writes!) must
+        // land the commit and clear the health.
+        std::fs::rename(&off, &bare).unwrap();
+        wait_for_remote_commit(&bare, "mcp(create_notes)").await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while s.sync_warning().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sync health never cleared after the retried push"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_push_drains_a_stranded_backlog_on_startup() {
+        let (root, vault_dir, _clone) = repo_fixture();
+        let bare = root.path().join("remote.git");
+
+        // A commit stranded by a previous run: ahead of the remote, no writes
+        // coming.
+        std::fs::write(vault_dir.join("stranded.md"), "# Stranded\n").unwrap();
+        git(&vault_dir, &["add", "-A"]);
+        git(&vault_dir, &["commit", "-m", "stranded backlog"]);
+
+        let _s = server_with_sync(&vault_dir)
+            .await
+            .with_auto_commit()
+            .with_auto_push(std::time::Duration::from_millis(50));
+
+        wait_for_remote_commit(&bare, "stranded backlog").await;
     }
 
     #[tokio::test]

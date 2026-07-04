@@ -38,6 +38,13 @@ pub struct MdServer {
     auto_commit: bool,
     /// Signals the debounced auto-push task after each auto-commit (ADR-0018).
     push_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    /// Outcome of the most recent push/sync attempt; `Some` while failing
+    /// (ADR-0019). Std mutex: only ever held for a field read/write.
+    sync_health: Arc<std::sync::Mutex<Option<sync::SyncHealth>>>,
+    /// Vault-relative path of an introduction note advertised in the server
+    /// instructions (`MD_INTRO_NOTE`), so agents read the vault's own guide
+    /// before working in it.
+    intro_note: Option<String>,
     /// The advertised tool set: the base families, plus `sync_vault` when git
     /// sync is enabled.
     tool_router: ToolRouter<Self>,
@@ -54,6 +61,8 @@ impl MdServer {
             git: None,
             auto_commit: false,
             push_tx: None,
+            sync_health: Arc::new(std::sync::Mutex::new(None)),
+            intro_note: None,
             tool_router: Self::base_router(),
         }
     }
@@ -81,12 +90,26 @@ impl MdServer {
     }
 
     /// Push `debounce` after the most recent auto-commit (ADR-0018); spawns
-    /// the background task, so a tokio runtime must be running.
+    /// the background task, so a tokio runtime must be running. Failed pushes
+    /// retry on a capped exponential backoff, and one synthetic signal is sent
+    /// at startup so a backlog stranded by a previous run drains without
+    /// waiting for new writes (ADR-0019).
     #[must_use]
     pub fn with_auto_push(mut self, debounce: std::time::Duration) -> Self {
+        /// First retry delay after a failed push (doubles per failure).
+        const RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(15);
+        /// Backoff ceiling: a dead remote is probed this often at most.
+        const RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(15 * 60);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(()); // startup nudge: drain any stranded backlog
         self.push_tx = Some(tx);
-        tokio::spawn(sync::auto_push_task(self.clone(), rx, debounce));
+        tokio::spawn(sync::auto_push_task(
+            self.clone(),
+            rx,
+            debounce,
+            RETRY_INITIAL,
+            RETRY_CAP,
+        ));
         self
     }
 
@@ -95,6 +118,14 @@ impl MdServer {
     #[must_use]
     pub fn with_sync_interval(self, every: std::time::Duration) -> Self {
         tokio::spawn(sync::interval_sync_task(self.clone(), every));
+        self
+    }
+
+    /// Advertise `path` (vault-relative) as the vault's introduction note in
+    /// the server instructions.
+    #[must_use]
+    pub fn with_intro_note(mut self, path: String) -> Self {
+        self.intro_note = Some(path);
         self
     }
 
@@ -115,6 +146,39 @@ impl MdServer {
         &self.lock
     }
 
+    /// Record a failed push/sync attempt (ADR-0019). The start of the failure
+    /// streak is kept across repeats so the warning shows total duration.
+    pub(crate) fn report_sync_failure(&self, ahead: u64, reason: String) {
+        let mut health = self.sync_health.lock().unwrap();
+        let since = health
+            .as_ref()
+            .map_or_else(std::time::Instant::now, |h| h.since);
+        *health = Some(sync::SyncHealth {
+            since,
+            ahead,
+            reason,
+        });
+    }
+
+    /// Record a successful push/sync attempt: the vault is on the remote.
+    pub(crate) fn report_sync_ok(&self) {
+        self.sync_health.lock().unwrap().take();
+    }
+
+    /// The warning carried on write responses while sync is failing (ADR-0019);
+    /// `None` when healthy (the field is then omitted from the JSON).
+    pub(crate) fn sync_warning(&self) -> Option<String> {
+        let health = self.sync_health.lock().unwrap();
+        health.as_ref().map(|h| {
+            format!(
+                "{} local commit(s) not on the remote ({}; failing for {}s)",
+                h.ahead,
+                h.reason,
+                h.since.elapsed().as_secs()
+            )
+        })
+    }
+
     /// Record a successful mutation in the event journal, if one is attached.
     /// Emission is best-effort: a journal failure is logged, never surfaced —
     /// the vault write has already durably committed.
@@ -133,7 +197,17 @@ impl MdServer {
     /// commit snapshot is exactly the batch's result; path-scoped staging
     /// keeps concurrent external edits out. A git failure is logged, never
     /// surfaced — the vault, not git, is the durability layer.
-    pub(crate) async fn auto_commit(&self, tool: &str, ops: &[events::EventOp]) {
+    ///
+    /// `args` is the invoking tool call (request struct or its items); a
+    /// condensed rendering — long strings truncated, total size capped — goes
+    /// into the commit body so `git log` shows what command produced each
+    /// commit without replicating whole note contents.
+    pub(crate) async fn auto_commit(
+        &self,
+        tool: &str,
+        ops: &[events::EventOp],
+        args: &(impl serde::Serialize + Sync),
+    ) {
         if !self.auto_commit || ops.is_empty() {
             return;
         }
@@ -143,7 +217,11 @@ impl MdServer {
             .flat_map(events::EventOp::touched_paths)
             .map(str::to_string)
             .collect();
-        let message = format!("mcp({tool}): {} notes", ops.len());
+        let subject = format!("mcp({tool}): {} notes", ops.len());
+        let message = match serde_json::to_value(args) {
+            Ok(v) => format!("{subject}\n\n{tool} {}", summarize_tool_args(&v)),
+            Err(_) => subject,
+        };
         let flock = match self.vault().exclusive_lock() {
             Ok(l) => l,
             Err(e) => {
@@ -165,6 +243,43 @@ impl MdServer {
     }
 }
 
+/// Longest string kept verbatim inside a condensed tool call (chars).
+const ARG_STR_MAX: usize = 80;
+/// Total size cap of one condensed tool call (chars).
+const ARG_TOTAL_MAX: usize = 800;
+
+/// Truncate every long string in `v` to [`ARG_STR_MAX`] chars, in place,
+/// marking how much was dropped — note contents must not bloat commit bodies.
+fn condense_json(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => {
+            let chars = s.chars().count();
+            if chars > ARG_STR_MAX {
+                let head: String = s.chars().take(ARG_STR_MAX).collect();
+                *s = format!("{head}…(+{} chars)", chars - ARG_STR_MAX);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(condense_json),
+        serde_json::Value::Object(map) => map.values_mut().for_each(condense_json),
+        _ => {}
+    }
+}
+
+/// One-line condensed rendering of a tool call's arguments for the
+/// auto-commit body: compact JSON with long strings truncated and an overall
+/// size cap.
+fn summarize_tool_args(args: &serde_json::Value) -> String {
+    let mut v = args.clone();
+    condense_json(&mut v);
+    let s = serde_json::to_string(&v).unwrap_or_default();
+    if s.chars().count() > ARG_TOTAL_MAX {
+        let head: String = s.chars().take(ARG_TOTAL_MAX).collect();
+        format!("{head}…")
+    } else {
+        s
+    }
+}
+
 impl MdServer {
     /// The composed tool router across the always-on tool families.
     pub(crate) fn base_router() -> ToolRouter<Self> {
@@ -180,12 +295,17 @@ impl ServerHandler for MdServer {
         info.server_info.name = "md-mcp".into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info.instructions = Some(
-            "md-mcp manages a single vault of pure-Markdown notes (.md + YAML frontmatter). \
-             Address notes by vault-relative path; read large notes via read_outlines then \
-             read_sections. Destructive batches are all-or-nothing."
-                .into(),
-        );
+        let mut instructions = "md-mcp manages a single vault of pure-Markdown notes (.md + \
+             YAML frontmatter). Address notes by vault-relative path; read large notes via \
+             read_outlines then read_sections. Destructive batches are all-or-nothing."
+            .to_string();
+        if let Some(intro) = &self.intro_note {
+            instructions.push_str(&format!(
+                " Before working in this vault, read \"{intro}\" (via read_notes): it \
+                 introduces the vault's purpose, structure, and conventions."
+            ));
+        }
+        info.instructions = Some(instructions);
         info
     }
 }
@@ -214,6 +334,20 @@ mod tests {
             instructions.contains("md-mcp"),
             "instructions: {instructions}"
         );
+    }
+
+    #[test]
+    fn intro_note_is_advertised_in_instructions() {
+        let with = server()
+            .with_intro_note("meta/start-here.md".into())
+            .get_info()
+            .instructions
+            .unwrap_or_default();
+        assert!(with.contains("meta/start-here.md"), "got: {with}");
+        assert!(with.contains("read_notes"), "got: {with}");
+
+        let without = server().get_info().instructions.unwrap_or_default();
+        assert!(!without.contains("start-here"), "got: {without}");
     }
 
     #[test]

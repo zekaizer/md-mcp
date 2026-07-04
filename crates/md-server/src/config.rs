@@ -244,6 +244,9 @@ pub struct Config {
     pub events: EventsConfig,
     /// Git sync (ADR-0016).
     pub git: GitConfig,
+    /// Vault-relative path of the introduction note advertised in the server
+    /// instructions (`MD_INTRO_NOTE`). Unset/blank → no advertisement.
+    pub intro_note: Option<String>,
 }
 
 impl Config {
@@ -288,11 +291,17 @@ impl Config {
             std::env::var("MD_GIT_SYNC_INTERVAL_SECS").ok(),
         )?;
 
+        let intro_note = std::env::var("MD_INTRO_NOTE")
+            .ok()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty());
+
         Ok(Self {
             vault_dir,
             transport,
             events,
             git,
+            intro_note,
         })
     }
 }
