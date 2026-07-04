@@ -108,6 +108,38 @@ journalctl -u md-mcp --since -5min | grep -i warn   # expect nothing
 git -C <vault> log --oneline -3                     # mcp(...) commits, pushed
 ```
 
+## 7. Logs → VictoriaLogs (optional, ADR-0021)
+
+With `MD_LOG_FORMAT=json` the server emits one JSON object per line to stderr;
+systemd captures them in the journal. Ship the journal with systemd's own
+uploader — VictoriaLogs accepts it natively (no collector needed):
+
+```sh
+sudo apt install systemd-journal-remote
+# /etc/systemd/journal-upload.conf
+#   [Upload]
+#   URL=http://<vl-host>:9428/insert/journald
+sudo systemctl enable --now systemd-journal-upload
+```
+
+Query in VictoriaLogs (the JSON lives in `_msg`; unit/host are stream fields
+by default):
+
+```
+_time:1h _SYSTEMD_UNIT:"md-mcp.service" | unpack_json | duration_ms:>100
+_time:1h _SYSTEMD_UNIT:"md-mcp.service" | unpack_json | level:"WARN"
+```
+
+Note: `systemd-journal-upload` ships the whole host journal; swap in vector
+with a unit filter if that is unwanted. To also ship the mutation audit
+stream (ADR-0017 events), point the commit hook at the jsonline endpoint —
+the `Content-Type` header is required (VictoriaLogs silently ignores bodies
+sent as form data):
+
+```
+MD_ON_COMMIT_HOOK='curl -s -X POST -H "Content-Type: application/stream+json" --data-binary @- "http://<vl-host>:9428/insert/jsonline?_stream_fields=app&app=md-mcp-events"'
+```
+
 Operational notes: push failures surface as `sync_warning` on write responses
 and retry on a capped backoff; a backlog also drains at service start
 (ADR-0019). Keep `MD_GIT_SYNC_INTERVAL_SECS` on — it is the recovery upper
