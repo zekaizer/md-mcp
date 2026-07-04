@@ -13,12 +13,24 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     // Logs always go to stderr: under stdio, stdout is the JSON-RPC channel and
     // any stray write corrupts it; under HTTP, stderr is simply the safe default.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    // MD_LOG_FORMAT=json emits one flattened JSON object per line for log
+    // shipping (ADR-0021); the default stays human-readable text.
+    let log_format = md_server::config::log_format_from_env()?;
+    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    match log_format {
+        md_server::config::LogFormat::Text => tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter())
+            .init(),
+        md_server::config::LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter())
+            .init(),
+    }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config = Config::from_env_and_args(&args)?;

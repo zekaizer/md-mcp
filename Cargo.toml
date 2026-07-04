@@ -21,6 +21,8 @@ rmcp = { version = "1.8", default-features = false, features = ["server", "macro
 # co-hosted OAuth 2.1 server (ADR-0014). `form`/`query`/`json` are the OAuth
 # endpoints' extractors; the rest is Router/middleware/serve over HTTP/1.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "form", "query", "json"] }
+# EOS-timed access log body wrapper (ADR-0021) — already in the axum tree.
+http-body = "1"
 
 # Co-hosted OAuth 2.1 authorization server (ADR-0014): opaque token entropy,
 # PKCE S256, base64url. No JWT/OAuth crate — hand-rolled and auditable.
@@ -63,7 +65,7 @@ anyhow = "1"
 # Async runtime + logging (server only). `net` for the HTTP TCP listener (ADR-0013).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Dev / test / bench
 criterion = "0.8"
