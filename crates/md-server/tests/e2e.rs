@@ -121,11 +121,20 @@ async fn tool_schemas_expose_spec_constraints() {
     }
 
     // Paged limits carry their maximum.
-    assert_eq!(schema("list_notes")["properties"]["limit"]["maximum"], json!(1000));
-    assert_eq!(schema("search_notes")["properties"]["limit"]["maximum"], json!(100));
+    assert_eq!(
+        schema("list_notes")["properties"]["limit"]["maximum"],
+        json!(1000)
+    );
+    assert_eq!(
+        schema("search_notes")["properties"]["limit"]["maximum"],
+        json!(100)
+    );
 
     // search `mode` defaults to "both".
-    assert_eq!(schema("search_notes")["properties"]["mode"]["default"], json!("both"));
+    assert_eq!(
+        schema("search_notes")["properties"]["mode"]["default"],
+        json!("both")
+    );
 
     // edit_sections description names the `move` operation.
     let desc = tools

@@ -314,11 +314,14 @@ impl MdServer {
     ) -> (bool, Option<String>, Option<usize>) {
         let want_content = matches!(req.mode, SearchMode::Content | SearchMode::Both);
         let want_filename = matches!(req.mode, SearchMode::Filename | SearchMode::Both);
-        let query_lower = md_core::text::nfc(req.query.as_deref().unwrap_or_default()).to_lowercase();
+        let query_lower =
+            md_core::text::nfc(req.query.as_deref().unwrap_or_default()).to_lowercase();
 
         let filename_hit = want_filename
             && !query_lower.is_empty()
-            && md_core::text::nfc(path).to_lowercase().contains(&query_lower);
+            && md_core::text::nfc(path)
+                .to_lowercase()
+                .contains(&query_lower);
 
         let mut content_hit = false;
         let mut snippet = None;
@@ -407,7 +410,10 @@ mod tests {
 
     #[tokio::test]
     async fn match_count_reveals_hits_beyond_the_snippet() {
-        let (_d, s) = server(&[("m.md", "# One\nfindme a.\nfiller\nfindme b.\n\n# Two\nfindme c.\n")]);
+        let (_d, s) = server(&[(
+            "m.md",
+            "# One\nfindme a.\nfiller\nfindme b.\n\n# Two\nfindme c.\n",
+        )]);
         let r = s
             .search_notes(Parameters(SearchNotesRequest {
                 query: Some("findme".into()),

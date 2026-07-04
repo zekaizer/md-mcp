@@ -414,7 +414,10 @@ impl MdServer {
             return AppendResult {
                 path: item.path.clone(),
                 appended: false,
-                error: Some(ApiError::from_core(&write_size_error("note", combined.len()))),
+                error: Some(ApiError::from_core(&write_size_error(
+                    "note",
+                    combined.len(),
+                ))),
             };
         }
         match self.vault().write_atomic(&item.path, combined.as_bytes()) {
@@ -659,8 +662,16 @@ mod tests {
         let r = s
             .create_notes(Parameters(CreateNotesRequest {
                 notes: vec![
-                    NoteInput { path: "big.md".into(), content: big.clone(), frontmatter: None },
-                    NoteInput { path: "small.md".into(), content: "ok\n".into(), frontmatter: None },
+                    NoteInput {
+                        path: "big.md".into(),
+                        content: big.clone(),
+                        frontmatter: None,
+                    },
+                    NoteInput {
+                        path: "small.md".into(),
+                        content: "ok\n".into(),
+                        frontmatter: None,
+                    },
                 ],
                 overwrite: false,
             }))

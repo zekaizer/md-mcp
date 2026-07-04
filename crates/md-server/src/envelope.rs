@@ -46,7 +46,10 @@ pub const MAX_CONTENT_BYTES: usize = 256 * 1024;
 /// dropped from `items` and its request index recorded; later, smaller items
 /// may still fit. Zero-content items (missing notes, flags off) are always
 /// kept. Returns the omitted request indexes.
-pub fn enforce_content_budget<T>(items: &mut Vec<T>, content_len: impl Fn(&T) -> usize) -> Vec<usize> {
+pub fn enforce_content_budget<T>(
+    items: &mut Vec<T>,
+    content_len: impl Fn(&T) -> usize,
+) -> Vec<usize> {
     let mut total = 0usize;
     let mut omitted = Vec::new();
     let mut kept = Vec::with_capacity(items.len());
@@ -75,9 +78,7 @@ pub const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
 pub fn write_size_error(what: &str, len: usize) -> md_core::Error {
     md_core::Error::new(
         md_core::Code::TooLarge,
-        format!(
-            "{what} is {len} bytes, over the {MAX_WRITE_BYTES}-byte limit for a single write"
-        ),
+        format!("{what} is {len} bytes, over the {MAX_WRITE_BYTES}-byte limit for a single write"),
     )
 }
 

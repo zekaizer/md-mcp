@@ -8,3 +8,7 @@
 # Editor / OS noise
 **/*.rs.bk
 .DS_Store
+
+# Python bytecode from the e2e test harness
+__pycache__/
+*.pyc

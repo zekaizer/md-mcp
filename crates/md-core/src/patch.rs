@@ -288,7 +288,9 @@ fn resolve_move(
     if moved_level != expected {
         return Err(Error::new(
             Code::HeadingLevel,
-            format!("moved section's heading is level {moved_level}, expected {expected} at the destination"),
+            format!(
+                "moved section's heading is level {moved_level}, expected {expected} at the destination"
+            ),
         ));
     }
 
@@ -765,7 +767,10 @@ mod tests {
             }),
             ..Edit::default()
         };
-        assert_eq!(apply(src, vec![e]), "# A\nax\n# B\nbx\n## B1\nb1\n\n## A1\na1\n");
+        assert_eq!(
+            apply(src, vec![e]),
+            "# A\nax\n# B\nbx\n## B1\nb1\n\n## A1\na1\n"
+        );
     }
 
     #[test]

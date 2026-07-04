@@ -661,7 +661,11 @@ mod tests {
             .0;
         assert!(ok.ok, "{:?}", ok.errors);
         assert_eq!(ok.renamed[0].to, nfc);
-        assert_eq!(s.vault().resolve_rel(nfc).unwrap(), nfc, "on-disk bytes are NFC now");
+        assert_eq!(
+            s.vault().resolve_rel(nfc).unwrap(),
+            nfc,
+            "on-disk bytes are NFC now"
+        );
 
         // And back to NFD.
         let ok = s
@@ -844,7 +848,10 @@ mod tests {
         assert!(!bad.ok);
         assert_eq!(bad.errors[0].code, "NOT_FOUND");
         assert_eq!(bad.errors[0].index, Some(1));
-        assert!(s.vault().exists("a.md").unwrap(), "all-or-nothing: a.md stays");
+        assert!(
+            s.vault().exists("a.md").unwrap(),
+            "all-or-nothing: a.md stays"
+        );
 
         let bad = s
             .rename_notes(Parameters(RenameNotesRequest {

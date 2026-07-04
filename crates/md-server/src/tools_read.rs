@@ -535,7 +535,9 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_frontmatter_counts_against_the_budget() {
-        let items: String = (0..3500).map(|i| format!("- item-{i}-{}\n", "x".repeat(70))).collect();
+        let items: String = (0..3500)
+            .map(|i| format!("- item-{i}-{}\n", "x".repeat(70)))
+            .collect();
         let big = format!("---\ndata:\n{items}---\nsmall body\n");
         let (_d, v) = vault_with(&[("bigfm.md", &big), ("small.md", "# S\nok\n")]);
         let server = MdServer::new(v);

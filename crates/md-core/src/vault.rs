@@ -341,7 +341,11 @@ mod tests {
         let ok = format!("{}.md", "a".repeat(MAX_PATH_COMPONENT_BYTES - 3));
         assert!(Vault::validate_rel(&ok).is_ok());
         // The limit is per-component, not per-path: many short segments pass.
-        let deep = (0..300).map(|i| format!("d{i}")).collect::<Vec<_>>().join("/") + "/n.md";
+        let deep = (0..300)
+            .map(|i| format!("d{i}"))
+            .collect::<Vec<_>>()
+            .join("/")
+            + "/n.md";
         assert!(Vault::validate_rel(&deep).is_ok());
     }
 
@@ -493,7 +497,10 @@ mod tests {
         for p in ["new/dir/", "top/"] {
             let e = vault.create_note(p, b"x", false).unwrap_err();
             assert_eq!(e.code, Code::Suffix, "expected SUFFIX for {p:?}");
-            assert!(!vault.exists(p).unwrap(), "nothing must be created for {p:?}");
+            assert!(
+                !vault.exists(p).unwrap(),
+                "nothing must be created for {p:?}"
+            );
         }
     }
 
