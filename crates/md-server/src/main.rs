@@ -23,6 +23,8 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config = Config::from_env_and_args(&args)?;
     let vault = Vault::open(&config.vault_dir)?;
+    // Keep .md-mcp/ out of any git repo the vault lives in (ADR-0016).
+    md_server::sync::ensure_git_exclude(&config.vault_dir);
     let server = MdServer::new(vault);
 
     match config.transport {

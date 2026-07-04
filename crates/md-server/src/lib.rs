@@ -8,6 +8,7 @@ pub mod config;
 pub mod envelope;
 pub mod http;
 pub mod oauth;
+pub mod sync;
 pub mod tools_organize;
 pub mod tools_read;
 pub mod tools_search;
