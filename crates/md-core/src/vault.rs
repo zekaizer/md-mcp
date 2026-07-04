@@ -19,6 +19,11 @@ use crate::text::nfc;
 /// The server's internal state directory, off-limits to agent note operations.
 pub(crate) const INTERNAL_DIR: &str = ".md-mcp";
 
+/// Maximum bytes in one path component (file or directory name). Matches the
+/// common filesystem `NAME_MAX`, so an over-long name is a validation error
+/// rather than a raw `ENAMETOOLONG` at commit time.
+const MAX_PATH_COMPONENT_BYTES: usize = 255;
+
 /// A capability-jailed handle to a vault root directory.
 pub struct Vault {
     root: Dir,
@@ -71,7 +76,20 @@ impl Vault {
         let mut clean = PathBuf::new();
         for comp in Path::new(rel).components() {
             match comp {
-                Component::Normal(seg) => clean.push(seg),
+                Component::Normal(seg) => {
+                    // Reject an over-long component up front, so it fails as a
+                    // clean validation error instead of a raw ENAMETOOLONG at
+                    // commit time. 255 bytes is the common filesystem limit.
+                    if seg.len() > MAX_PATH_COMPONENT_BYTES {
+                        return Err(Error::new(
+                            Code::Suffix,
+                            format!(
+                                "path component exceeds {MAX_PATH_COMPONENT_BYTES} bytes: {rel}"
+                            ),
+                        ));
+                    }
+                    clean.push(seg);
+                }
                 Component::CurDir => {}
                 Component::ParentDir => {
                     return Err(Error::traversal(format!("path contains '..': {rel}")));
@@ -312,6 +330,19 @@ mod tests {
                 "expected traversal for {p:?}"
             );
         }
+    }
+
+    #[test]
+    fn validate_rejects_over_long_component() {
+        let long = format!("{}.md", "a".repeat(300));
+        let e = Vault::validate_rel(&long).unwrap_err();
+        assert_eq!(e.code, Code::Suffix);
+        // A component at exactly the limit is accepted.
+        let ok = format!("{}.md", "a".repeat(MAX_PATH_COMPONENT_BYTES - 3));
+        assert!(Vault::validate_rel(&ok).is_ok());
+        // The limit is per-component, not per-path: many short segments pass.
+        let deep = (0..300).map(|i| format!("d{i}")).collect::<Vec<_>>().join("/") + "/n.md";
+        assert!(Vault::validate_rel(&deep).is_ok());
     }
 
     #[test]
