@@ -9,8 +9,10 @@ treating the vault as a flat pile of files.
 
 **Status:** the full 12-tool surface is implemented and tested (read, search,
 section/property edits, safe batch moves and deletes) over a crash-safe
-transaction engine. Built foundations-first (path safety → parser → frontmatter →
-transaction → tools), test-driven.
+transaction engine, plus opt-in git sync (a 13th tool, `sync_vault`, with
+auto-commit/push/pull automation) and an event journal for external consumers.
+Built foundations-first (path safety → parser → frontmatter → transaction →
+tools), test-driven.
 
 ## Build & run
 
@@ -47,6 +49,26 @@ unaffected). Exposing the server (a non-loopback `MD_HTTP_ADDR`) means setting
 for browser clients, the origin in `MD_HTTP_ALLOWED_ORIGINS`) — or `*` to disable a
 guard. There is no in-process TLS — terminate TLS upstream (reverse proxy /
 tunnel) for remote use.
+
+### Git sync & events (opt-in)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MD_GIT_SYNC` | unset | `1` exposes the `sync_vault` tool (vault root must be the repo toplevel) |
+| `MD_GIT_AUTO_COMMIT` | unset | `1` commits every write batch as one path-scoped git commit |
+| `MD_GIT_AUTO_PUSH_SECS` | unset | push N seconds after the most recent auto-commit (debounced) |
+| `MD_GIT_SYNC_INTERVAL_SECS` | unset | run a full sync every N seconds |
+| `MD_EVENTS` | unset | `1` appends every mutation to `.md-mcp/events.jsonl` |
+| `MD_ON_COMMIT_HOOK` | unset | command run per event record with the JSON on stdin (implies `MD_EVENTS`) |
+
+The automation variables require `MD_GIT_SYNC=1`. Whenever the vault is a git
+repository (opted in or not), the server excludes its internal `.md-mcp/` state
+via `.git/info/exclude` and takes an OS lock (`.md-mcp/lock`) around every
+transaction commit and git operation — external tooling can coordinate with
+`flock <vault>/.md-mcp/lock git …`. See
+[ADR-0016](docs/adr/0016-git-sync-integration.md),
+[ADR-0017](docs/adr/0017-event-journal-and-hook.md),
+[ADR-0018](docs/adr/0018-git-automation.md).
 
 ## Testing
 

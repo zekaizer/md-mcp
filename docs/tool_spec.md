@@ -42,6 +42,7 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
 | `rename_notes` | 제자리 이름 변경 (1:1) | ✓ | **all-or-nothing** |
 | `relocate_notes` | 디렉토리로 이동 (N:1-dir) | ✓ | **all-or-nothing** |
 | `delete_notes` | 노트 삭제 | ✓ | **all-or-nothing** |
+| `sync_vault` | git 원격과 동기화 (opt-in, `MD_GIT_SYNC=1`일 때만 노출) | — | 단일 (conflict는 정상 결과) |
 
 **실패 의미론 원칙**: 비파괴 도구(create/append)는 부분 성공 — 한 item의 실패가 형제 item을 가라앉히지 않는다. 파괴적 도구(edit/properties/rename/relocate/delete)는 all-or-nothing — batch 내 한 item이라도 거부되면 전체를 쓰지 않는다. 데이터 손실 위험이 있는 작업에서 "절반만 적용된 모호한 상태"를 만들지 않기 위함이다. **다중 파일에 걸친 batch도 서버가 원자성을 보장한다** — 원본 백업/저널 후 일괄 적용, 어느 파일이라도 write 실패하면 전부 롤백해 무적용으로 되돌린다(§4).
 
@@ -348,6 +349,12 @@ frontmatter 편집기 — **item 하나 = (노트, key) 하나**의 atomic 단�
 }
 ```
 파일·디렉토리 모두 대상(디렉토리는 `/`로 끝나는 path, subtree 재귀 삭제). 배치 내 path가 서로 동일·포함관계(디렉토리와 그 하위)면 거부(§4 대상 겹침 금지). 존재하지 않는 path 포함 시 batch 전체 거부(부분 삭제로 인한 모호한 상태 방지). 복구 가능하도록 영구 삭제 대신 trash 이동을 권장(trash 목록·restore 도구, overwrite/edit의 이전 버전 복구 대칭은 **별도 ADR**). 출력(성공): `{ deleted: [path…], trashed_to }` — trash 위치를 함께 줘 복구 경로를 안다.
+
+### sync_vault (조건부 등록 · 단일)
+```json
+{ "properties": {} }
+```
+`MD_GIT_SYNC=1`로 기동했고 preflight(git binary 존재, vault root == repo toplevel)를 통과한 경우에만 노출되는 git 동기화 도구([ADR-0016](adr/0016-git-sync-integration.md)). 시퀀스: fetch(락 밖) → write guard + flock 아래 { 로컬 dirty 일괄 commit, upstream 위로 rebase } → push(락 밖), non-fast-forward push는 fetch부터 1회 재시도. 출력: `{ status: "clean"|"conflict", pulled, pushed, conflicts:[path…] }`. **conflict는 오류가 아니라 정상 결말** — rebase를 abort해 vault를 원상 복구하고 conflict marker는 절대 노트에 남기지 않으며, 해소는 에이전트/사용자 몫. MCP error는 git 실행 실패(binary 부재, 인증 실패 등)에만 쓴다. pull로 들어온 변경은 event journal에 `tool:"sync_vault"` 레코드로 발행된다(ADR-0017). 자동화 계층(per-batch auto-commit·debounced push·interval sync)은 [ADR-0018](adr/0018-git-automation.md).
 
 ---
 
