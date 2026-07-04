@@ -63,6 +63,24 @@ pub fn enforce_content_budget<T>(items: &mut Vec<T>, content_len: impl Fn(&T) ->
     omitted
 }
 
+/// Maximum byte size of a single note write ([tool_spec §4]: "item당 content
+/// 크기에 서버 상한을 둬 단일 거대 입력을 막는다"). Bounds one create/append/edit
+/// payload so a runaway or hostile client cannot fill the vault; comfortably
+/// above any real note, well below a denial-of-service payload.
+pub const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Reject a write payload that exceeds [`MAX_WRITE_BYTES`]. `what` names the
+/// field for the message (e.g. "content", "note"). Returned as a core-style
+/// error so it flows into the tool envelope like any other rejection.
+pub fn write_size_error(what: &str, len: usize) -> md_core::Error {
+    md_core::Error::new(
+        md_core::Code::TooLarge,
+        format!(
+            "{what} is {len} bytes, over the {MAX_WRITE_BYTES}-byte limit for a single write"
+        ),
+    )
+}
+
 /// A machine-readable error embedded in a tool response (per-item or per-batch).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
