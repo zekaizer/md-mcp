@@ -27,6 +27,9 @@ const GIT_DIR: &str = ".git";
 /// Directories no agent note operation may target.
 const PROTECTED_DIRS: [&str; 2] = [INTERNAL_DIR, GIT_DIR];
 
+/// The cross-process lock file, inside the internal state directory.
+const LOCK_FILE: &str = ".md-mcp/lock";
+
 /// Maximum bytes in one path component (file or directory name). Matches the
 /// common filesystem `NAME_MAX`, so an over-long name is a validation error
 /// rather than a raw `ENAMETOOLONG` at commit time.
@@ -36,6 +39,12 @@ const MAX_PATH_COMPONENT_BYTES: usize = 255;
 pub struct Vault {
     root: Dir,
     root_path: PathBuf,
+}
+
+/// RAII guard for the cross-process vault lock; the OS lock is released when
+/// the guard (and its file handle) drops.
+pub struct VaultLock {
+    _file: std::fs::File,
 }
 
 impl Vault {
@@ -282,6 +291,30 @@ impl Vault {
             .map_err(|e| Error::io(format!("commit {rel}: {e}")))?;
         self.fsync_parent(&clean);
         Ok(())
+    }
+
+    /// Acquire the exclusive cross-process vault lock (an OS lock on
+    /// `.md-mcp/lock`), blocking until available; released on drop.
+    ///
+    /// Held around every transaction commit and every git operation
+    /// ([ADR-0016](../../../docs/adr/0016-git-sync-integration.md)). External
+    /// tools that mutate the vault (e.g. `flock <vault>/.md-mcp/lock git pull`)
+    /// take the same lock, so a checkout can never interleave with a
+    /// transaction.
+    pub fn exclusive_lock(&self) -> Result<VaultLock> {
+        self.root
+            .create_dir_all(INTERNAL_DIR)
+            .map_err(|e| Error::io(format!("create {INTERNAL_DIR}: {e}")))?;
+        let mut opts = cap_std::fs::OpenOptions::new();
+        opts.create(true).write(true).read(true);
+        let file = self
+            .root
+            .open_with(LOCK_FILE, &opts)
+            .map_err(|e| Error::io(format!("open {LOCK_FILE}: {e}")))?
+            .into_std();
+        file.lock()
+            .map_err(|e| Error::io(format!("lock {LOCK_FILE}: {e}")))?;
+        Ok(VaultLock { _file: file })
     }
 
     /// Create a new note, refusing to overwrite an existing target unless
@@ -588,6 +621,20 @@ mod tests {
         assert_eq!(e.code, Code::Traversal);
         let e = vault.read_note(".git/HEAD").unwrap_err();
         assert_eq!(e.code, Code::NotFound);
+    }
+
+    // --- cross-process lock --------------------------------------------------
+
+    #[test]
+    fn exclusive_lock_excludes_other_holders_until_dropped() {
+        let (vdir, vault) = temp_vault();
+        let guard = vault.exclusive_lock().unwrap();
+        // A second handle on the lock file (as an external tool would open it)
+        // cannot take the lock while the guard lives.
+        let other = std::fs::File::open(vdir.path().join(".md-mcp/lock")).unwrap();
+        assert!(other.try_lock().is_err(), "lock must be held");
+        drop(guard);
+        assert!(other.try_lock().is_ok(), "lock must be released on drop");
     }
 
     #[test]

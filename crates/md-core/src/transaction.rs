@@ -142,6 +142,10 @@ impl Vault {
             .collect::<Result<_>>()?;
         let ops = &ops[..];
 
+        // Cross-process exclusion (ADR-0016): a cooperating external tool
+        // holding the same flock never observes a mid-batch tree.
+        let _flock = self.exclusive_lock()?;
+
         let batch_id = new_batch_id();
         let journal_path = format!("{JOURNAL_DIR}/{batch_id}.json");
         let mut journal = Journal {
@@ -188,6 +192,10 @@ impl Vault {
         let Ok(entries) = self.dir().read_dir(JOURNAL_DIR) else {
             return Ok(());
         };
+        // Journals exist, so .md-mcp/ does too: recovery mutates the tree and
+        // takes the same cross-process lock as a commit. (Skipped above for a
+        // fresh vault, so a plain open never creates .md-mcp/.)
+        let _flock = self.exclusive_lock()?;
         let mut journal_paths = Vec::new();
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str()
