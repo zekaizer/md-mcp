@@ -17,6 +17,7 @@ use serde_json::Value;
 
 use crate::MdServer;
 use crate::envelope::{ApiError, MAX_WRITE_BYTES, batch_limit, write_size_error};
+use crate::events::EventOp;
 use crate::tools_read::ScopeArg;
 
 /// Distinguish an omitted `value` (remove) from an explicit `null` (set null).
@@ -307,7 +308,7 @@ impl MdServer {
     ) -> Result<Json<CreateNotesResponse>, ErrorData> {
         batch_limit(req.notes.len())?;
         let _guard = self.lock().write().await;
-        let created = req
+        let created: Vec<CreateResult> = req
             .notes
             .iter()
             .map(|note| {
@@ -336,6 +337,15 @@ impl MdServer {
                 }
             })
             .collect();
+        for c in created.iter().filter(|c| c.created) {
+            self.emit_event(
+                "create_notes",
+                None,
+                &[EventOp::Create {
+                    path: c.path.clone(),
+                }],
+            );
+        }
         Ok(Json(CreateNotesResponse { created }))
     }
 
@@ -351,7 +361,17 @@ impl MdServer {
         let _guard = self.lock().write().await;
         let mut appended = Vec::with_capacity(req.appends.len());
         for item in &req.appends {
-            appended.push(self.append_one(item));
+            let result = self.append_one(item);
+            if result.appended {
+                self.emit_event(
+                    "append_notes",
+                    None,
+                    &[EventOp::Write {
+                        path: result.path.clone(),
+                    }],
+                );
+            }
+            appended.push(result);
         }
         Ok(Json(AppendNotesResponse { appended }))
     }
@@ -512,12 +532,19 @@ impl MdServer {
                 errors,
             };
         }
-        if let Err(e) = self.vault().commit_batch(&writes) {
-            return EditSectionsResponse {
-                ok: false,
-                applied: vec![],
-                errors: vec![ApiError::from_core(&e)],
-            };
+        match self.vault().commit_batch(&writes) {
+            Ok(receipt) => self.emit_event(
+                "edit_sections",
+                Some(&receipt.batch_id),
+                &EventOp::from_outcomes(&receipt.outcomes),
+            ),
+            Err(e) => {
+                return EditSectionsResponse {
+                    ok: false,
+                    applied: vec![],
+                    errors: vec![ApiError::from_core(&e)],
+                };
+            }
         }
         applied.sort_by_key(|a| a.index);
         EditSectionsResponse {
@@ -601,12 +628,19 @@ impl MdServer {
                 errors,
             };
         }
-        if let Err(e) = self.vault().commit_batch(&writes) {
-            return EditPropertiesResponse {
-                ok: false,
-                applied: vec![],
-                errors: vec![ApiError::from_core(&e)],
-            };
+        match self.vault().commit_batch(&writes) {
+            Ok(receipt) => self.emit_event(
+                "edit_properties",
+                Some(&receipt.batch_id),
+                &EventOp::from_outcomes(&receipt.outcomes),
+            ),
+            Err(e) => {
+                return EditPropertiesResponse {
+                    ok: false,
+                    applied: vec![],
+                    errors: vec![ApiError::from_core(&e)],
+                };
+            }
         }
         applied.sort_by_key(|a| a.index);
         EditPropertiesResponse {

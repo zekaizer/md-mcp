@@ -520,7 +520,9 @@ mod tests {
                 path: "노트.md".to_string(),
             }])
             .unwrap();
-        assert!(matches!(&outcomes.outcomes[0], crate::OpOutcome::Deleted { path, .. } if path == nfd));
+        assert!(
+            matches!(&outcomes.outcomes[0], crate::OpOutcome::Deleted { path, .. } if path == nfd)
+        );
         assert!(!vault.exists(nfd).unwrap());
     }
 

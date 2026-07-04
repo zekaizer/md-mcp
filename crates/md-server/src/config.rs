@@ -139,6 +139,35 @@ fn parse_allowlist(raw: Option<String>, var: &str) -> Result<Option<Vec<String>>
     }
 }
 
+/// Event journal + commit hook configuration (ADR-0017).
+#[derive(Debug, Clone, Default)]
+pub struct EventsConfig {
+    /// Whether the journal is written (`MD_EVENTS=1`, or implied by a hook).
+    pub enabled: bool,
+    /// Hook command (`MD_ON_COMMIT_HOOK`), run per record with JSON on stdin.
+    pub hook: Option<String>,
+}
+
+impl EventsConfig {
+    /// Resolve from raw env values (pure; env-free). A hook implies the
+    /// journal: its catch-up story depends on the journal existing.
+    fn resolve(events: Option<String>, hook: Option<String>) -> Result<Self> {
+        let hook = hook.map(|h| h.trim().to_string()).filter(|h| !h.is_empty());
+        let enabled = parse_flag(events, "MD_EVENTS")? || hook.is_some();
+        Ok(Self { enabled, hook })
+    }
+}
+
+/// Parse an on/off env flag. Unset/blank → off; `1`/`true` → on; anything else
+/// is a hard error, never a silent off (fail-closed, as everywhere here).
+fn parse_flag(raw: Option<String>, var: &str) -> Result<bool> {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => Ok(false),
+        Some("1" | "true") => Ok(true),
+        Some(other) => bail!("{var} must be \"1\" or \"true\" (or unset), got {other:?}"),
+    }
+}
+
 /// Runtime configuration for the md-mcp server.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -146,6 +175,8 @@ pub struct Config {
     pub vault_dir: PathBuf,
     /// The selected transport.
     pub transport: Transport,
+    /// Event journal + hook (ADR-0017).
+    pub events: EventsConfig,
 }
 
 impl Config {
@@ -179,9 +210,15 @@ impl Config {
             )?),
         };
 
+        let events = EventsConfig::resolve(
+            std::env::var("MD_EVENTS").ok(),
+            std::env::var("MD_ON_COMMIT_HOOK").ok(),
+        )?;
+
         Ok(Self {
             vault_dir,
             transport,
+            events,
         })
     }
 }

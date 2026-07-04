@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::MdServer;
 use crate::envelope::{ApiError, batch_limit};
+use crate::events::EventOp;
 
 // --- path helpers -----------------------------------------------------------
 
@@ -283,6 +284,11 @@ impl MdServer {
             .collect();
         match self.vault().commit_batch(&ops) {
             Ok(receipt) => {
+                self.emit_event(
+                    "delete_notes",
+                    Some(&receipt.batch_id),
+                    &EventOp::from_outcomes(&receipt.outcomes),
+                );
                 let deleted = receipt
                     .outcomes
                     .into_iter()
@@ -343,7 +349,7 @@ impl MdServer {
                 Err(e) => errors.push(ApiError::at(i, &e)),
             }
         }
-        self.finish_move(pairs, errors)
+        self.finish_move("rename_notes", pairs, errors)
     }
 
     fn run_relocate(&self, moves: &[RelocateItem], overwrite: bool) -> MoveResponse {
@@ -373,7 +379,7 @@ impl MdServer {
                 Err(e) => errors.push(ApiError::at(i, &e)),
             }
         }
-        self.finish_move(pairs, errors)
+        self.finish_move("relocate_notes", pairs, errors)
     }
 
     fn compute_rename(&self, r: &RenameItem) -> Result<String, Error> {
@@ -476,6 +482,7 @@ impl MdServer {
 
     fn finish_move(
         &self,
+        tool: &str,
         pairs: Vec<(usize, String, String)>,
         mut errors: Vec<ApiError>,
     ) -> MoveResponse {
@@ -497,6 +504,11 @@ impl MdServer {
             .collect();
         match self.vault().commit_batch(&ops) {
             Ok(receipt) => {
+                self.emit_event(
+                    tool,
+                    Some(&receipt.batch_id),
+                    &EventOp::from_outcomes(&receipt.outcomes),
+                );
                 let moved = receipt
                     .outcomes
                     .into_iter()

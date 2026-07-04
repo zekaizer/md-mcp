@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod envelope;
+pub mod events;
 pub mod http;
 pub mod oauth;
 pub mod sync;
@@ -28,6 +29,8 @@ pub struct MdServer {
     vault: Arc<Vault>,
     /// Read guard for reads; write guard for the commit step (ADR-0008).
     lock: Arc<RwLock<()>>,
+    /// Event journal, when enabled (ADR-0017).
+    events: Option<Arc<events::EventSink>>,
 }
 
 impl MdServer {
@@ -37,7 +40,15 @@ impl MdServer {
         Self {
             vault: Arc::new(vault),
             lock: Arc::new(RwLock::new(())),
+            events: None,
         }
+    }
+
+    /// Attach an event journal (ADR-0017).
+    #[must_use]
+    pub fn with_event_sink(mut self, sink: events::EventSink) -> Self {
+        self.events = Some(Arc::new(sink));
+        self
     }
 
     /// The vault handle (used by tool implementations).
@@ -50,6 +61,19 @@ impl MdServer {
     #[must_use]
     pub fn lock(&self) -> &RwLock<()> {
         &self.lock
+    }
+
+    /// Record a successful mutation in the event journal, if one is attached.
+    /// Emission is best-effort: a journal failure is logged, never surfaced —
+    /// the vault write has already durably committed.
+    pub(crate) fn emit_event(&self, tool: &str, batch_id: Option<&str>, ops: &[events::EventOp]) {
+        let Some(sink) = &self.events else { return };
+        if ops.is_empty() {
+            return;
+        }
+        if let Err(e) = sink.emit(tool, batch_id, ops) {
+            tracing::warn!("event journal append failed: {e}");
+        }
     }
 }
 

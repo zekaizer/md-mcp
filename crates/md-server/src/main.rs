@@ -25,7 +25,16 @@ async fn main() -> Result<()> {
     let vault = Vault::open(&config.vault_dir)?;
     // Keep .md-mcp/ out of any git repo the vault lives in (ADR-0016).
     md_server::sync::ensure_git_exclude(&config.vault_dir);
-    let server = MdServer::new(vault);
+    let mut server = MdServer::new(vault);
+    if config.events.enabled {
+        let hook_tx = config
+            .events
+            .hook
+            .clone()
+            .map(md_server::events::spawn_hook);
+        let sink = md_server::events::EventSink::open(&config.vault_dir, hook_tx)?;
+        server = server.with_event_sink(sink);
+    }
 
     match config.transport {
         Transport::Stdio => {
