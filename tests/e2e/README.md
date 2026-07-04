@@ -14,6 +14,8 @@ end-user tool behavior that only the external transport reveals. See
 python3 tests/e2e/run.py            # build release, run everything
 python3 tests/e2e/run.py --no-build # reuse target/release/md-server
 python3 tests/e2e/run.py --only hardening
+python3 tests/e2e/run.py --only fuzz # opt-in fuzz campaign (not in the gate)
+python3 tests/e2e/run.py --only fuzz --fuzz-seed 99 --fuzz-iters 500
 make e2e                            # from the repo root
 make check                          # fmt + clippy + cargo test + e2e (pre-push gate)
 ```
@@ -29,6 +31,7 @@ hook or CI step. No third-party packages — Python 3.9+ and a built server only
 | `run.py` | Entry point: build, isolate temp vaults, run suites, report, exit code |
 | `suites/functional.py` | Per-tool behavior: read/search shapes, section addressing, the content_hash edit flow, failure semantics, NFC paths, size budget |
 | `suites/hardening.py` | Traversal corpus, symlink escape, internal-state isolation, write/path-size limits, protocol misuse, crash recovery, startup fail-closed |
+| `suites/fuzz.py` | Schema-aware adversarial input across all 12 tools: asserts liveness (no hang), framing (pure stdout), no crash/panic, well-formed responses, and jail integrity. Opt-in (`--only fuzz`), seeded for reproducible campaigns |
 
 ## Adding a check
 

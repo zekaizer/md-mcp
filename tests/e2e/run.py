@@ -26,7 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 from harness import MCPClient, Runner  # noqa: E402
-from suites import functional, hardening  # noqa: E402
+from suites import fuzz, functional, hardening  # noqa: E402
 
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 DEFAULT_BINARY = os.path.join(REPO_ROOT, "target", "release", "md-server")
@@ -62,11 +62,21 @@ def run_hardening(binary: str, t: Runner) -> None:
         hardening.run(binary, t, scratch)
 
 
+def run_fuzz(binary: str, t: Runner, iters: int, seed: int) -> None:
+    print("\n### fuzz")
+    with tempfile.TemporaryDirectory(prefix="mdmcp-e2e-fuzz-") as scratch:
+        fuzz.run(binary, t, scratch, iters=iters, seed=seed)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="md-mcp stdio end-to-end tests")
     ap.add_argument("--no-build", action="store_true", help="use the existing binary")
-    ap.add_argument("--only", choices=["functional", "hardening"], help="run one suite")
+    ap.add_argument("--only", choices=["functional", "hardening", "fuzz"], help="run one suite")
     ap.add_argument("--binary", default=DEFAULT_BINARY, help="path to md-server")
+    ap.add_argument("--fuzz-iters", type=int, default=250,
+                    help="fuzz rounds per tool (default 250)")
+    ap.add_argument("--fuzz-seed", type=int, default=1337,
+                    help="fuzz RNG seed for reproducible campaigns (default 1337)")
     ap.add_argument("-q", "--quiet", action="store_true", help="quieter build + only failures")
     args = ap.parse_args()
 
@@ -76,6 +86,11 @@ def main() -> int:
         sys.exit(f"binary not found: {args.binary} (drop --no-build to build it)")
 
     t = Runner(verbose=not args.quiet)
+    # Default gate = functional + hardening (deterministic). Fuzz is opt-in
+    # (`--only fuzz`): a randomized campaign does not belong in the pre-push gate.
+    if args.only == "fuzz":
+        run_fuzz(args.binary, t, args.fuzz_iters, args.fuzz_seed)
+        return t.summary()
     if args.only != "hardening":
         run_functional(args.binary, t)
     if args.only != "functional":
