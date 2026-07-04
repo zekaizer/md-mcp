@@ -176,18 +176,60 @@ pub struct GitConfig {
     pub sync: bool,
     /// Per-batch auto-commit (`MD_GIT_AUTO_COMMIT=1`).
     pub auto_commit: bool,
+    /// Debounced push, N seconds after the most recent commit
+    /// (`MD_GIT_AUTO_PUSH_SECS`).
+    pub auto_push_secs: Option<u64>,
+    /// Periodic full sync (`MD_GIT_SYNC_INTERVAL_SECS`).
+    pub sync_interval_secs: Option<u64>,
 }
 
 impl GitConfig {
-    fn resolve(sync: Option<String>, auto_commit: Option<String>) -> Result<Self> {
+    fn resolve(
+        sync: Option<String>,
+        auto_commit: Option<String>,
+        auto_push_secs: Option<String>,
+        sync_interval_secs: Option<String>,
+    ) -> Result<Self> {
         let sync = parse_flag(sync, "MD_GIT_SYNC")?;
         let auto_commit = parse_flag(auto_commit, "MD_GIT_AUTO_COMMIT")?;
+        let auto_push_secs = parse_secs(auto_push_secs, "MD_GIT_AUTO_PUSH_SECS")?;
+        let sync_interval_secs = parse_secs(sync_interval_secs, "MD_GIT_SYNC_INTERVAL_SECS")?;
         // An automation layer without the base is a misconfiguration, not a
         // silent no-op (ADR-0018).
-        if auto_commit && !sync {
-            bail!("MD_GIT_AUTO_COMMIT requires MD_GIT_SYNC=1");
+        if !sync {
+            if auto_commit {
+                bail!("MD_GIT_AUTO_COMMIT requires MD_GIT_SYNC=1");
+            }
+            if auto_push_secs.is_some() {
+                bail!("MD_GIT_AUTO_PUSH_SECS requires MD_GIT_SYNC=1");
+            }
+            if sync_interval_secs.is_some() {
+                bail!("MD_GIT_SYNC_INTERVAL_SECS requires MD_GIT_SYNC=1");
+            }
         }
-        Ok(Self { sync, auto_commit })
+        Ok(Self {
+            sync,
+            auto_commit,
+            auto_push_secs,
+            sync_interval_secs,
+        })
+    }
+}
+
+/// Parse a positive-seconds env var. Unset/blank → `None`; `0` or a non-number
+/// is a hard error, never a silent off.
+fn parse_secs(raw: Option<String>, var: &str) -> Result<Option<u64>> {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) => {
+            let n: u64 = s
+                .parse()
+                .with_context(|| format!("{var} must be a positive integer, got {s:?}"))?;
+            if n == 0 {
+                bail!("{var} must be a positive integer, got 0");
+            }
+            Ok(Some(n))
+        }
     }
 }
 
@@ -242,6 +284,8 @@ impl Config {
         let git = GitConfig::resolve(
             std::env::var("MD_GIT_SYNC").ok(),
             std::env::var("MD_GIT_AUTO_COMMIT").ok(),
+            std::env::var("MD_GIT_AUTO_PUSH_SECS").ok(),
+            std::env::var("MD_GIT_SYNC_INTERVAL_SECS").ok(),
         )?;
 
         Ok(Self {

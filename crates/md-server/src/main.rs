@@ -44,6 +44,12 @@ async fn main() -> Result<()> {
                 if config.git.auto_commit {
                     server = server.with_auto_commit();
                 }
+                if let Some(secs) = config.git.auto_push_secs {
+                    server = server.with_auto_push(std::time::Duration::from_secs(secs));
+                }
+                if let Some(secs) = config.git.sync_interval_secs {
+                    server = server.with_sync_interval(std::time::Duration::from_secs(secs));
+                }
             }
             // Automation layers ride on the driver, so this disables them too.
             Err(warning) => tracing::warn!("{warning}"),

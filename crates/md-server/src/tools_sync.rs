@@ -38,20 +38,32 @@ impl MdServer {
         description = "Synchronize the vault with its git remote: commit local changes, rebase onto the fetched upstream, and push. Returns {status, pulled, pushed, conflicts}. status:\"conflict\" means the rebase was aborted and the vault left unchanged — the listed paths need manual/agent resolution. Errors are reserved for git execution failures."
     )]
     pub async fn sync_vault(&self) -> Result<Json<SyncVaultResponse>, ErrorData> {
+        self.run_sync()
+            .await
+            .map(Json)
+            .map_err(|e| ErrorData::internal_error(e, None))
+    }
+}
+
+impl MdServer {
+    /// The full sync sequence — shared by the `sync_vault` tool and the
+    /// automation tasks (ADR-0018). `Err` is a git execution failure;
+    /// conflicts are a normal result.
+    pub(crate) async fn run_sync(&self) -> Result<SyncVaultResponse, String> {
         let Some(git) = self.git_sync() else {
-            return Err(ErrorData::internal_error("git sync is not enabled", None));
+            return Err("git sync is not enabled".into());
         };
-        let internal = |e: String| ErrorData::internal_error(e, None);
 
         let mut pulled = 0usize;
         let mut last_push_err = String::new();
         for attempt in 0..2 {
             let Some(old_upstream) = git.upstream_tip().await else {
-                return Err(internal(
-                    "current branch has no upstream; set one (e.g. git push -u origin <branch>) to sync".into(),
-                ));
+                return Err(
+                    "current branch has no upstream; set one (e.g. git push -u origin <branch>) to sync"
+                        .into(),
+                );
             };
-            git.fetch().await.map_err(internal)?;
+            git.fetch().await?;
             let new_upstream = git
                 .upstream_tip()
                 .await
@@ -61,22 +73,17 @@ impl MdServer {
             // (write guard) and with cooperating external tools (flock).
             {
                 let _guard = self.lock().write().await;
-                let _flock = self
-                    .vault()
-                    .exclusive_lock()
-                    .map_err(|e| internal(e.to_string()))?;
-                git.commit_all("mcp(sync): checkpoint")
-                    .await
-                    .map_err(internal)?;
-                match git.rebase_onto_upstream().await.map_err(internal)? {
+                let _flock = self.vault().exclusive_lock().map_err(|e| e.to_string())?;
+                git.commit_all("mcp(sync): checkpoint").await?;
+                match git.rebase_onto_upstream().await? {
                     Rebase::Ok => {}
                     Rebase::Conflict(conflicts) => {
-                        return Ok(Json(SyncVaultResponse {
+                        return Ok(SyncVaultResponse {
                             status: "conflict".into(),
                             pulled,
                             pushed: 0,
                             conflicts,
-                        }));
+                        });
                     }
                 }
             }
@@ -91,33 +98,31 @@ impl MdServer {
 
             let ahead = git.ahead_count().await;
             if ahead == 0 {
-                return Ok(Json(SyncVaultResponse {
+                return Ok(SyncVaultResponse {
                     status: "clean".into(),
                     pulled,
                     pushed: 0,
                     conflicts: vec![],
-                }));
+                });
             }
             match git.push().await {
                 Ok(()) => {
-                    return Ok(Json(SyncVaultResponse {
+                    return Ok(SyncVaultResponse {
                         status: "clean".into(),
                         pulled,
                         pushed: ahead,
                         conflicts: vec![],
-                    }));
+                    });
                 }
                 Err(e) if attempt == 0 => {
                     // Likely a non-fast-forward race; refetch and retry once.
                     tracing::info!("push rejected, retrying after refetch: {e}");
                     last_push_err = e;
                 }
-                Err(e) => return Err(internal(e)),
+                Err(e) => return Err(e),
             }
         }
-        Err(internal(format!(
-            "push failed after retry: {last_push_err}"
-        )))
+        Err(format!("push failed after retry: {last_push_err}"))
     }
 }
 
@@ -295,6 +300,67 @@ mod tests {
             .unwrap();
         let status = String::from_utf8_lossy(&status.stdout).to_string();
         assert!(status.contains("external.md"), "got: {status}");
+    }
+
+    #[tokio::test]
+    async fn auto_push_lands_commits_on_the_remote_after_the_quiet_window() {
+        let (root, vault_dir, _clone) = repo_fixture();
+        let bare = root.path().join("remote.git");
+        let s = server_with_sync(&vault_dir)
+            .await
+            .with_auto_commit()
+            .with_auto_push(std::time::Duration::from_millis(100));
+        s.create_notes(Parameters(CreateNotesRequest {
+            notes: vec![NoteInput {
+                path: "pushed.md".into(),
+                content: "# Pushed\n".into(),
+                frontmatter: None,
+            }],
+            overwrite: false,
+        }))
+        .await
+        .unwrap();
+
+        // Poll the bare remote until the auto-commit arrives.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let out = Command::new("git")
+                .args(["log", "--format=%s", "main"])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            let log = String::from_utf8_lossy(&out.stdout).to_string();
+            if log.contains("mcp(create_notes)") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "auto-push never landed; remote log:\n{log}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn interval_sync_pulls_remote_changes_unattended() {
+        let (_root, vault_dir, clone) = repo_fixture();
+        std::fs::write(clone.join("from-remote.md"), "# From remote\n").unwrap();
+        git(&clone, &["add", "-A"]);
+        git(&clone, &["commit", "-m", "remote note"]);
+        git(&clone, &["push"]);
+
+        let _s = server_with_sync(&vault_dir)
+            .await
+            .with_sync_interval(std::time::Duration::from_millis(100));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !vault_dir.join("from-remote.md").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "interval sync never pulled the remote note"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]

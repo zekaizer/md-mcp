@@ -36,6 +36,8 @@ pub struct MdServer {
     git: Option<Arc<sync::GitSync>>,
     /// Per-batch auto-commit (ADR-0018); meaningful only with `git` set.
     auto_commit: bool,
+    /// Signals the debounced auto-push task after each auto-commit (ADR-0018).
+    push_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     /// The advertised tool set: the base families, plus `sync_vault` when git
     /// sync is enabled.
     tool_router: ToolRouter<Self>,
@@ -51,6 +53,7 @@ impl MdServer {
             events: None,
             git: None,
             auto_commit: false,
+            push_tx: None,
             tool_router: Self::base_router(),
         }
     }
@@ -74,6 +77,24 @@ impl MdServer {
     #[must_use]
     pub fn with_auto_commit(mut self) -> Self {
         self.auto_commit = true;
+        self
+    }
+
+    /// Push `debounce` after the most recent auto-commit (ADR-0018); spawns
+    /// the background task, so a tokio runtime must be running.
+    #[must_use]
+    pub fn with_auto_push(mut self, debounce: std::time::Duration) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.push_tx = Some(tx);
+        tokio::spawn(sync::auto_push_task(self.clone(), rx, debounce));
+        self
+    }
+
+    /// Run a full sync every `every` (ADR-0018); spawns the background task,
+    /// so a tokio runtime must be running.
+    #[must_use]
+    pub fn with_sync_interval(self, every: std::time::Duration) -> Self {
+        tokio::spawn(sync::interval_sync_task(self.clone(), every));
         self
     }
 
@@ -130,8 +151,15 @@ impl MdServer {
                 return;
             }
         };
-        if let Err(e) = git.commit_paths(&message, &paths).await {
-            tracing::warn!("auto-commit failed: {e}");
+        match git.commit_paths(&message, &paths).await {
+            Ok(true) => {
+                // Wake the debounced push task, if configured.
+                if let Some(tx) = &self.push_tx {
+                    let _ = tx.send(());
+                }
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!("auto-commit failed: {e}"),
         }
         drop(flock);
     }

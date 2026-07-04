@@ -231,6 +231,57 @@ impl GitSync {
     }
 }
 
+// --- automation tasks (ADR-0018) --------------------------------------------
+
+/// Debounced auto-push: waits until `debounce` passes with no new commit
+/// signal, then pushes. A rejected push falls back to one full sync (whose
+/// conflicts are logged and left local — an explicit `sync_vault` reports
+/// them to an agent).
+pub(crate) async fn auto_push_task(
+    server: crate::MdServer,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    debounce: std::time::Duration,
+) {
+    while rx.recv().await.is_some() {
+        loop {
+            match tokio::time::timeout(debounce, rx.recv()).await {
+                Ok(Some(())) => {} // another commit: restart the quiet window
+                Ok(None) => return,
+                Err(_) => break, // window elapsed quietly
+            }
+        }
+        let Some(git) = server.git_sync() else { return };
+        if git.ahead_count().await == 0 {
+            continue;
+        }
+        if git.push().await.is_ok() {
+            continue;
+        }
+        log_background_sync("auto-push", server.run_sync().await);
+    }
+}
+
+/// Periodic full sync, pulling remote changes without agent involvement.
+pub(crate) async fn interval_sync_task(server: crate::MdServer, every: std::time::Duration) {
+    loop {
+        tokio::time::sleep(every).await;
+        log_background_sync("interval sync", server.run_sync().await);
+    }
+}
+
+fn log_background_sync(what: &str, result: Result<crate::tools_sync::SyncVaultResponse, String>) {
+    match result {
+        Ok(r) if r.status == "conflict" => {
+            tracing::warn!(
+                "{what}: conflicts left local, resolve via sync_vault: {:?}",
+                r.conflicts
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("{what} failed: {e}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
