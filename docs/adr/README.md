@@ -28,3 +28,4 @@ immutable; a changed decision supersedes the old one with a new ADR.
 - [0017](0017-event-journal-and-hook.md) — Event journal and commit hook
 - [0018](0018-git-automation.md) — Git automation: per-batch auto-commit, debounced push, interval sync
 - [0019](0019-sync-health-and-push-retry.md) — Sync health: push-failure visibility and auto-push retry
+- [0020](0020-deployment-and-configuration-posture.md) — Deployment: systemd + a single env file (no config-file format)
