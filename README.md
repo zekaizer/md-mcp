@@ -90,6 +90,13 @@ Unit tests and one in-process rmcp protocol test live with the crates
 drives the real binary over its wire protocol
 ([tests/e2e](tests/e2e/README.md), [ADR-0015](docs/adr/0015-stdio-end-to-end-suite.md)).
 
+## Deployment
+
+Production runs as a systemd service reading one env file, behind a Cloudflare
+Tunnel — see [deploy/README.md](deploy/README.md) for the unit file, an
+annotated sample env, and the step-by-step guide
+([ADR-0020](docs/adr/0020-deployment-and-configuration-posture.md)).
+
 ## Documentation
 
 - **[CONTEXT.md](CONTEXT.md)** — glossary / ubiquitous language. Start here.
