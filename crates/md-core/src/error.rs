@@ -36,6 +36,8 @@ pub enum Code {
     Traversal,
     /// A note's frontmatter is not parseable YAML.
     FrontmatterParse,
+    /// A single write payload exceeds the server's per-item size limit.
+    TooLarge,
     /// An unexpected I/O failure.
     Io,
 }
@@ -58,6 +60,7 @@ impl Code {
             Code::InvalidHeading => "INVALID_HEADING",
             Code::Traversal => "TRAVERSAL",
             Code::FrontmatterParse => "FRONTMATTER_PARSE",
+            Code::TooLarge => "TOO_LARGE",
             Code::Io => "IO",
         }
     }

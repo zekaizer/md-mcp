@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::MdServer;
-use crate::envelope::{ApiError, batch_limit};
+use crate::envelope::{ApiError, MAX_WRITE_BYTES, batch_limit, write_size_error};
 use crate::tools_read::ScopeArg;
 
 /// Distinguish an omitted `value` (remove) from an explicit `null` (set null).
@@ -324,7 +324,12 @@ impl MdServer {
                 }
                 let fm = note.frontmatter.clone().unwrap_or(Value::Null);
                 let result = frontmatter::with_frontmatter(&note.content, &fm)
-                    .and_then(|text| self.vault().create_note(&note.path, text.as_bytes(), req.overwrite));
+                    .and_then(|text| {
+                        if text.len() > MAX_WRITE_BYTES {
+                            return Err(write_size_error("note", text.len()));
+                        }
+                        self.vault().create_note(&note.path, text.as_bytes(), req.overwrite)
+                    });
                 match result {
                     Ok(()) => CreateResult { path: note.path.clone(), created: true, error: None },
                     Err(e) => CreateResult { path: note.path.clone(), created: false, error: Some(ApiError::from_core(&e)) },
@@ -404,6 +409,14 @@ impl MdServer {
         };
         let combined =
             md_core::text::normalize_newlines(&format!("{base}{}", item.content)).into_owned();
+        // Bound the resulting note, so repeated appends can't grow it unbounded.
+        if combined.len() > MAX_WRITE_BYTES {
+            return AppendResult {
+                path: item.path.clone(),
+                appended: false,
+                error: Some(ApiError::from_core(&write_size_error("note", combined.len()))),
+            };
+        }
         match self.vault().write_atomic(&item.path, combined.as_bytes()) {
             Ok(()) => AppendResult {
                 path: item.path.clone(),
@@ -455,6 +468,14 @@ impl MdServer {
                 }
             };
             match patch::patch_sections(&source, &core_edits) {
+                Ok(new_source) if new_source.len() > MAX_WRITE_BYTES => {
+                    // The edit would grow the note past the write limit; reject
+                    // the whole batch (all-or-nothing) at the first item.
+                    errors.push(ApiError::at(
+                        items[0].0,
+                        &write_size_error("edited note", new_source.len()),
+                    ));
+                }
                 Ok(new_source) => {
                     for (li, (gi, item)) in items.iter().enumerate() {
                         let _ = li;
@@ -554,6 +575,13 @@ impl MdServer {
                     }
                 }
             }
+            if path_ok && source.len() > MAX_WRITE_BYTES {
+                errors.push(ApiError::at(
+                    items[0].0,
+                    &write_size_error("note", source.len()),
+                ));
+                path_ok = false;
+            }
             if path_ok {
                 writes.push(Op::Write {
                     path: (*path).to_string(),
@@ -620,6 +648,67 @@ mod tests {
             .await;
         let err = result.err().expect("over-limit batch must be rejected");
         assert!(format!("{err:?}").contains("exceeds"), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn oversized_writes_are_rejected_per_tool() {
+        let (_d, s) = server(&[("seed.md", "# A\nbody\n")]);
+        let big = "z".repeat(MAX_WRITE_BYTES + 1);
+
+        // create: per-item TOO_LARGE, siblings unaffected (partial success).
+        let r = s
+            .create_notes(Parameters(CreateNotesRequest {
+                notes: vec![
+                    NoteInput { path: "big.md".into(), content: big.clone(), frontmatter: None },
+                    NoteInput { path: "small.md".into(), content: "ok\n".into(), frontmatter: None },
+                ],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!r.created[0].created);
+        assert_eq!(r.created[0].error.as_ref().unwrap().code, "TOO_LARGE");
+        assert!(r.created[1].created);
+        assert!(!s.vault().exists("big.md").unwrap());
+
+        // append: bounded by the resulting note size.
+        let r = s
+            .append_notes(Parameters(AppendNotesRequest {
+                appends: vec![AppendInput {
+                    path: "seed.md".into(),
+                    content: big.clone(),
+                    create_if_missing: false,
+                }],
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!r.appended[0].appended);
+        assert_eq!(r.appended[0].error.as_ref().unwrap().code, "TOO_LARGE");
+        assert_eq!(s.vault().read_note("seed.md").unwrap(), "# A\nbody\n");
+
+        // edit_sections: all-or-nothing rejection.
+        let r = s
+            .edit_sections(Parameters(EditSectionsRequest {
+                edits: vec![EditItem {
+                    path: "seed.md".into(),
+                    heading_path: vec!["A".into()],
+                    occurrence: None,
+                    operation: OperationArg::Replace,
+                    scope: ScopeArg::Body,
+                    content: Some(big.clone()),
+                    new_heading: None,
+                    destination: None,
+                    expected_hash: None,
+                }],
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!r.ok);
+        assert_eq!(r.errors[0].code, "TOO_LARGE");
+        assert_eq!(s.vault().read_note("seed.md").unwrap(), "# A\nbody\n");
     }
 
     #[tokio::test]
