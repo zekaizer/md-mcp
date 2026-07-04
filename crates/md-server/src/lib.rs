@@ -188,7 +188,7 @@ impl MdServer {
             return;
         }
         if let Err(e) = sink.emit(tool, batch_id, ops) {
-            tracing::warn!("event journal append failed: {e}");
+            tracing::warn!(error = %e, "event journal append failed");
         }
     }
 
@@ -225,7 +225,7 @@ impl MdServer {
         let flock = match self.vault().exclusive_lock() {
             Ok(l) => l,
             Err(e) => {
-                tracing::warn!("auto-commit skipped, cannot take vault lock: {e}");
+                tracing::warn!(error = %e, "auto-commit skipped, cannot take vault lock");
                 return;
             }
         };
@@ -237,7 +237,7 @@ impl MdServer {
                 }
             }
             Ok(false) => {}
-            Err(e) => tracing::warn!("auto-commit failed: {e}"),
+            Err(e) => tracing::warn!(error = %e, tool, "auto-commit failed"),
         }
         drop(flock);
     }

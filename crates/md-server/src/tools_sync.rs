@@ -65,7 +65,14 @@ impl MdServer {
                         ),
                     );
                 }
-                Ok(_) => self.report_sync_ok(),
+                Ok(r) => {
+                    // One structured line per sync that moved anything, so the
+                    // shipped log timeline shows every pull/push (ADR-0021).
+                    if r.pulled > 0 || r.pushed > 0 {
+                        tracing::info!(pulled = r.pulled, pushed = r.pushed, "sync applied");
+                    }
+                    self.report_sync_ok();
+                }
                 Err(e) => {
                     let ahead = git.ahead_count().await;
                     let first_line = e.lines().next().unwrap_or(e).to_string();
@@ -143,7 +150,7 @@ impl MdServer {
                 }
                 Err(e) if attempt == 0 => {
                     // Likely a non-fast-forward race; refetch and retry once.
-                    tracing::info!("push rejected, retrying after refetch: {e}");
+                    tracing::info!(error = %e, "push rejected; retrying after refetch");
                     last_push_err = e;
                 }
                 Err(e) => return Err(e),
