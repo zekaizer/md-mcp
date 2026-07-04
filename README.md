@@ -35,6 +35,11 @@ channel). See [ADR-0013](docs/adr/0013-http-transport.md).
 advertised in the MCP server instructions, so connecting agents read the vault's
 own introduction before working in it.
 
+`MD_LOG_FORMAT` (optional, `text` | `json`) switches stderr logging to one JSON
+object per line for log shipping, and `/mcp` requests get a structured access
+log (tool, status, duration) — see
+[ADR-0021](docs/adr/0021-structured-logging.md).
+
 ### HTTP options
 
 | Variable | Default | Meaning |

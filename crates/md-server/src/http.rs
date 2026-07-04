@@ -63,14 +63,20 @@ pub fn router(server: MdServer, cfg: &HttpConfig) -> Router {
     // OAuth is enabled exactly when a static token is set (ADR-0014): the token is the
     // `/authorize` ownership gate and the Claude Code (CLI) bearer. Without it, the
     // loopback-dev default stays unguarded as in ADR-0013.
+    // The access log is the outermost /mcp layer (added last), so it also
+    // captures auth rejections: one structured line per request with the
+    // JSON-RPC method / tool name (small bodies only) and the duration
+    // (ADR-0021). It never touches the oauth discovery routes.
     match &cfg.token {
-        None => mcp,
+        None => mcp.layer(middleware::from_fn(access_log)),
         Some(token) => {
             let oauth = OAuthState::load(token.clone(), cfg.state_dir.join("oauth-state.json"));
-            let guarded = mcp.layer(middleware::from_fn_with_state(
-                oauth.clone(),
-                require_bearer,
-            ));
+            let guarded = mcp
+                .layer(middleware::from_fn_with_state(
+                    oauth.clone(),
+                    require_bearer,
+                ))
+                .layer(middleware::from_fn(access_log));
             // OAuth discovery + flow routes stay unauthenticated (they are the auth flow);
             // only `/mcp` is guarded. A single outer Host guard validates the `Host` before
             // any handler derives a public base URL / the 401 challenge from it (ADR-0014).
@@ -199,6 +205,155 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received");
 }
 
+/// Largest request body the access log will buffer to sniff the JSON-RPC
+/// method / tool name; larger bodies stream through unsniffed (their log line
+/// just lacks `rpc`/`tool`). Covers every routine call; only huge write
+/// batches exceed it.
+const ACCESS_SNIFF_MAX: usize = 256 * 1024;
+
+/// One structured log line per `/mcp` request: HTTP method, JSON-RPC method,
+/// tool name (for `tools/call`), response status, and duration (ADR-0021).
+/// Outermost layer, so 401s are captured too.
+///
+/// rmcp streams tool results over SSE — response *headers* leave before the
+/// tool body runs — so the line is emitted when the response body ends (or the
+/// client disconnects), and `duration_ms` is the real request-to-completion
+/// wall time, not time-to-first-byte.
+async fn access_log(request: Request, next: Next) -> Response {
+    let started = std::time::Instant::now();
+    let http_method = request.method().clone();
+
+    let (parts, body) = request.into_parts();
+    let content_length = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
+    let (request, call) = match content_length {
+        Some(n) if n <= ACCESS_SNIFF_MAX => match axum::body::to_bytes(body, n).await {
+            Ok(bytes) => {
+                let call = parse_rpc_call(&bytes);
+                (
+                    Request::from_parts(parts, axum::body::Body::from(bytes)),
+                    call,
+                )
+            }
+            Err(_) => {
+                tracing::warn!("access: request body shorter than its Content-Length");
+                return (StatusCode::BAD_REQUEST, "bad request body").into_response();
+            }
+        },
+        _ => (Request::from_parts(parts, body), None),
+    };
+
+    let response = next.run(request).await;
+    let (rpc, tool) = call.map_or((None, None), |(rpc, tool)| (Some(rpc), tool));
+    let meta = AccessMeta {
+        method: http_method,
+        rpc,
+        tool,
+        status: response.status().as_u16(),
+        started,
+    };
+    let (parts, body) = response.into_parts();
+    // An already-empty body (401s, 202 notifications) may be dropped by hyper
+    // without ever being polled to EOS; log it as complete now rather than
+    // letting Drop mislabel it aborted.
+    if http_body::Body::is_end_stream(&body) {
+        meta.emit("complete");
+        return Response::from_parts(parts, body);
+    }
+    Response::from_parts(
+        parts,
+        axum::body::Body::new(AccessLoggedBody {
+            inner: body,
+            meta: Some(meta),
+        }),
+    )
+}
+
+/// The access-log fields captured up front, emitted once at end-of-stream.
+struct AccessMeta {
+    method: axum::http::Method,
+    rpc: Option<String>,
+    tool: Option<String>,
+    status: u16,
+    started: std::time::Instant,
+}
+
+impl AccessMeta {
+    fn emit(&self, outcome: &'static str) {
+        let duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(
+            target: "md_server::access",
+            method = %self.method,
+            rpc = self.rpc.as_deref(),
+            tool = self.tool.as_deref(),
+            status = self.status,
+            duration_ms,
+            outcome,
+            "mcp"
+        );
+    }
+}
+
+/// A response body that emits the access-log line exactly once: at
+/// end-of-stream (`complete`), or on drop before that (`aborted` — the client
+/// disconnected or the connection died).
+struct AccessLoggedBody {
+    inner: axum::body::Body,
+    meta: Option<AccessMeta>,
+}
+
+impl http_body::Body for AccessLoggedBody {
+    type Data = <axum::body::Body as http_body::Body>::Data;
+    type Error = <axum::body::Body as http_body::Body>::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        if let std::task::Poll::Ready(None) = &poll
+            && let Some(meta) = self.meta.take()
+        {
+            meta.emit("complete");
+        }
+        poll
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for AccessLoggedBody {
+    fn drop(&mut self) {
+        if let Some(meta) = self.meta.take() {
+            meta.emit("aborted");
+        }
+    }
+}
+
+/// The `(json-rpc method, tool name)` of a request body, when it parses as a
+/// JSON-RPC call; the tool name only for `tools/call`.
+fn parse_rpc_call(bytes: &[u8]) -> Option<(String, Option<String>)> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let method = v.get("method")?.as_str()?.to_string();
+    let tool = if method == "tools/call" {
+        v.pointer("/params/name")
+            .and_then(|n| n.as_str())
+            .map(str::to_string)
+    } else {
+        None
+    };
+    Some((method, tool))
+}
+
 /// Reject any request to `/mcp` whose bearer is neither a live issued OAuth access token
 /// nor the static `MD_HTTP_TOKEN`. On failure, advertise the protected-resource metadata
 /// so the claude.ai connector can start the OAuth flow (ADR-0014).
@@ -279,6 +434,20 @@ mod tests {
         // Bracket-stripping + case folding so `[::1]` matches `::1`.
         assert_eq!(normalize_host("[::1]"), "::1");
         assert_eq!(normalize_host("Example.COM"), "example.com");
+    }
+
+    #[test]
+    fn parse_rpc_call_extracts_method_and_tool() {
+        use super::parse_rpc_call;
+        let call = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_notes","arguments":{}}}"#;
+        assert_eq!(
+            parse_rpc_call(call),
+            Some(("tools/call".into(), Some("create_notes".into())))
+        );
+        let init = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        assert_eq!(parse_rpc_call(init), Some(("initialize".into(), None)));
+        assert_eq!(parse_rpc_call(b"not json"), None);
+        assert_eq!(parse_rpc_call(br#"{"no":"method"}"#), None);
     }
 
     #[test]

@@ -45,7 +45,7 @@ pub fn ensure_git_exclude(vault_root: &Path) {
     });
     match appended {
         Ok(()) => tracing::info!("added {EXCLUDE_LINE} to .git/info/exclude"),
-        Err(e) => tracing::warn!("cannot write .git/info/exclude: {e}"),
+        Err(e) => tracing::warn!(error = %e, "cannot write .git/info/exclude"),
     }
 }
 
@@ -305,13 +305,17 @@ pub(crate) async fn auto_push_task(
         match server.run_sync().await {
             Ok(r) if r.status == "conflict" => {
                 tracing::warn!(
-                    "auto-push: conflicts left local, resolve via sync_vault: {:?}",
-                    r.conflicts
+                    conflicts = ?r.conflicts,
+                    "auto-push: rebase conflict left local; resolve via sync_vault"
                 );
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::warn!("auto-push failed: {e}; retrying in {backoff:?}");
+                tracing::warn!(
+                    error = %e,
+                    retry_in_secs = backoff.as_secs(),
+                    "auto-push failed; retry armed"
+                );
                 retry_at = Some(tokio::time::Instant::now() + backoff);
                 backoff = (backoff * 2).min(retry_cap);
             }
@@ -331,12 +335,13 @@ fn log_background_sync(what: &str, result: Result<crate::tools_sync::SyncVaultRe
     match result {
         Ok(r) if r.status == "conflict" => {
             tracing::warn!(
-                "{what}: conflicts left local, resolve via sync_vault: {:?}",
-                r.conflicts
+                task = what,
+                conflicts = ?r.conflicts,
+                "background sync: rebase conflict left local; resolve via sync_vault"
             );
         }
         Ok(_) => {}
-        Err(e) => tracing::warn!("{what} failed: {e}"),
+        Err(e) => tracing::warn!(task = what, error = %e, "background sync failed"),
     }
 }
 

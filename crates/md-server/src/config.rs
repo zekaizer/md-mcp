@@ -158,6 +158,32 @@ impl EventsConfig {
     }
 }
 
+/// Log output format (`MD_LOG_FORMAT`, ADR-0021).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogFormat {
+    /// Human-readable lines (the dev default).
+    #[default]
+    Text,
+    /// One flattened JSON object per line, for log shipping.
+    Json,
+}
+
+/// Parse `MD_LOG_FORMAT` from the environment. Unset/blank → text; anything
+/// other than `text`/`json` is a hard error (fail-closed, as everywhere here).
+pub fn log_format_from_env() -> Result<LogFormat> {
+    parse_log_format(std::env::var("MD_LOG_FORMAT").ok())
+}
+
+fn parse_log_format(raw: Option<String>) -> Result<LogFormat> {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") | Some("text") => Ok(LogFormat::Text),
+        Some("json") => Ok(LogFormat::Json),
+        Some(other) => {
+            bail!("MD_LOG_FORMAT must be \"text\" or \"json\" (or unset), got {other:?}")
+        }
+    }
+}
+
 /// Parse an on/off env flag. Unset/blank → off; `1`/`true` → on; anything else
 /// is a hard error, never a silent off (fail-closed, as everywhere here).
 fn parse_flag(raw: Option<String>, var: &str) -> Result<bool> {
@@ -345,6 +371,21 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn log_format_parses_fail_closed() {
+        assert_eq!(parse_log_format(None).unwrap(), LogFormat::Text);
+        assert_eq!(parse_log_format(Some(" ".into())).unwrap(), LogFormat::Text);
+        assert_eq!(
+            parse_log_format(Some("text".into())).unwrap(),
+            LogFormat::Text
+        );
+        assert_eq!(
+            parse_log_format(Some("json".into())).unwrap(),
+            LogFormat::Json
+        );
+        assert!(parse_log_format(Some("yaml".into())).is_err());
     }
 
     fn sd() -> PathBuf {
