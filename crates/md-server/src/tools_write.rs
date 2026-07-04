@@ -51,6 +51,7 @@ pub struct NoteInput {
     /// The note body (no leading `---` frontmatter block — pass frontmatter separately).
     pub content: String,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub frontmatter: Option<Value>,
 }
 
@@ -137,18 +138,23 @@ pub struct EditItem {
     pub path: String,
     pub heading_path: Vec<String>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub occurrence: Option<usize>,
     pub operation: OperationArg,
     #[serde(default)]
     pub scope: ScopeArg,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub new_heading: Option<String>,
     /// Destination for the `move` operation.
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub destination: Option<DestinationArg>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_hash: Option<String>,
 }
 
@@ -165,6 +171,7 @@ pub enum PositionArg {
 pub struct DestinationArg {
     pub heading_path: Vec<String>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub occurrence: Option<usize>,
     pub position: PositionArg,
 }
@@ -283,8 +290,14 @@ pub struct EditPropertiesRequest {
 pub struct PropertyEdit {
     pub path: String,
     pub key: String,
-    /// Present (even `null`) sets the key; omitted removes it.
-    #[serde(default, deserialize_with = "deserialize_some")]
+    /// Present (even `null`) sets the key; omitted removes it. Serialization
+    /// mirrors that (`None` omitted), so a condensed commit-body call reads
+    /// back faithfully.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_some",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub value: Option<Value>,
 }
 
