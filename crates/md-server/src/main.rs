@@ -23,7 +23,38 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config = Config::from_env_and_args(&args)?;
     let vault = Vault::open(&config.vault_dir)?;
-    let server = MdServer::new(vault);
+    // Keep .md-mcp/ out of any git repo the vault lives in (ADR-0016).
+    md_server::sync::ensure_git_exclude(&config.vault_dir);
+    let mut server = MdServer::new(vault);
+    if config.events.enabled {
+        let hook_tx = config
+            .events
+            .hook
+            .clone()
+            .map(md_server::events::spawn_hook);
+        let sink = md_server::events::EventSink::open(&config.vault_dir, hook_tx)?;
+        server = server.with_event_sink(sink);
+    }
+    if config.git.sync {
+        // Precondition failure disables sync with a warning (ADR-0016), it
+        // never fails startup: the vault itself is fully usable without git.
+        match md_server::sync::GitSync::preflight(&config.vault_dir).await {
+            Ok(git) => {
+                server = server.with_git_sync(git);
+                if config.git.auto_commit {
+                    server = server.with_auto_commit();
+                }
+                if let Some(secs) = config.git.auto_push_secs {
+                    server = server.with_auto_push(std::time::Duration::from_secs(secs));
+                }
+                if let Some(secs) = config.git.sync_interval_secs {
+                    server = server.with_sync_interval(std::time::Duration::from_secs(secs));
+                }
+            }
+            // Automation layers ride on the driver, so this disables them too.
+            Err(warning) => tracing::warn!("{warning}"),
+        }
+    }
 
     match config.transport {
         Transport::Stdio => {

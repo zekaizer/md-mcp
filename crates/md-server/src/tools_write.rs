@@ -17,6 +17,7 @@ use serde_json::Value;
 
 use crate::MdServer;
 use crate::envelope::{ApiError, MAX_WRITE_BYTES, batch_limit, write_size_error};
+use crate::events::EventOp;
 use crate::tools_read::ScopeArg;
 
 /// Distinguish an omitted `value` (remove) from an explicit `null` (set null).
@@ -307,7 +308,7 @@ impl MdServer {
     ) -> Result<Json<CreateNotesResponse>, ErrorData> {
         batch_limit(req.notes.len())?;
         let _guard = self.lock().write().await;
-        let created = req
+        let created: Vec<CreateResult> = req
             .notes
             .iter()
             .map(|note| {
@@ -336,6 +337,17 @@ impl MdServer {
                 }
             })
             .collect();
+        let ops: Vec<EventOp> = created
+            .iter()
+            .filter(|c| c.created)
+            .map(|c| EventOp::Create {
+                path: c.path.clone(),
+            })
+            .collect();
+        for op in &ops {
+            self.emit_event("create_notes", None, std::slice::from_ref(op));
+        }
+        self.auto_commit("create_notes", &ops).await;
         Ok(Json(CreateNotesResponse { created }))
     }
 
@@ -350,9 +362,19 @@ impl MdServer {
         batch_limit(req.appends.len())?;
         let _guard = self.lock().write().await;
         let mut appended = Vec::with_capacity(req.appends.len());
+        let mut ops = Vec::new();
         for item in &req.appends {
-            appended.push(self.append_one(item));
+            let result = self.append_one(item);
+            if result.appended {
+                let op = EventOp::Write {
+                    path: result.path.clone(),
+                };
+                self.emit_event("append_notes", None, std::slice::from_ref(&op));
+                ops.push(op);
+            }
+            appended.push(result);
         }
+        self.auto_commit("append_notes", &ops).await;
         Ok(Json(AppendNotesResponse { appended }))
     }
 
@@ -366,7 +388,7 @@ impl MdServer {
     ) -> Result<Json<EditSectionsResponse>, ErrorData> {
         batch_limit(req.edits.len())?;
         let _guard = self.lock().write().await;
-        Ok(Json(self.run_edit_sections(&req.edits)))
+        Ok(Json(self.run_edit_sections(&req.edits).await))
     }
 
     /// Set or remove frontmatter properties (all-or-nothing).
@@ -379,7 +401,7 @@ impl MdServer {
     ) -> Result<Json<EditPropertiesResponse>, ErrorData> {
         batch_limit(req.edits.len())?;
         let _guard = self.lock().write().await;
-        Ok(Json(self.run_edit_properties(&req.edits)))
+        Ok(Json(self.run_edit_properties(&req.edits).await))
     }
 }
 
@@ -391,7 +413,7 @@ impl MdServer {
                 appended: false,
                 error: Some(ApiError {
                     code: Code::Traversal.as_str().to_string(),
-                    message: "cannot target the internal state directory".to_string(),
+                    message: "cannot target a protected directory".to_string(),
                     index: None,
                 }),
             };
@@ -434,7 +456,7 @@ impl MdServer {
         }
     }
 
-    fn run_edit_sections(&self, edits: &[EditItem]) -> EditSectionsResponse {
+    async fn run_edit_sections(&self, edits: &[EditItem]) -> EditSectionsResponse {
         // Group edits by path, keeping each edit's global index.
         let mut by_path: BTreeMap<&str, Vec<(usize, &EditItem)>> = BTreeMap::new();
         for (i, e) in edits.iter().enumerate() {
@@ -512,12 +534,19 @@ impl MdServer {
                 errors,
             };
         }
-        if let Err(e) = self.vault().commit_batch(&writes) {
-            return EditSectionsResponse {
-                ok: false,
-                applied: vec![],
-                errors: vec![ApiError::from_core(&e)],
-            };
+        match self.vault().commit_batch(&writes) {
+            Ok(receipt) => {
+                let ops = EventOp::from_outcomes(&receipt.outcomes);
+                self.emit_event("edit_sections", Some(&receipt.batch_id), &ops);
+                self.auto_commit("edit_sections", &ops).await;
+            }
+            Err(e) => {
+                return EditSectionsResponse {
+                    ok: false,
+                    applied: vec![],
+                    errors: vec![ApiError::from_core(&e)],
+                };
+            }
         }
         applied.sort_by_key(|a| a.index);
         EditSectionsResponse {
@@ -527,7 +556,7 @@ impl MdServer {
         }
     }
 
-    fn run_edit_properties(&self, edits: &[PropertyEdit]) -> EditPropertiesResponse {
+    async fn run_edit_properties(&self, edits: &[PropertyEdit]) -> EditPropertiesResponse {
         // Apply per path in order, accumulating into one new content per path.
         let mut by_path: BTreeMap<&str, Vec<(usize, &PropertyEdit)>> = BTreeMap::new();
         for (i, e) in edits.iter().enumerate() {
@@ -601,12 +630,19 @@ impl MdServer {
                 errors,
             };
         }
-        if let Err(e) = self.vault().commit_batch(&writes) {
-            return EditPropertiesResponse {
-                ok: false,
-                applied: vec![],
-                errors: vec![ApiError::from_core(&e)],
-            };
+        match self.vault().commit_batch(&writes) {
+            Ok(receipt) => {
+                let ops = EventOp::from_outcomes(&receipt.outcomes);
+                self.emit_event("edit_properties", Some(&receipt.batch_id), &ops);
+                self.auto_commit("edit_properties", &ops).await;
+            }
+            Err(e) => {
+                return EditPropertiesResponse {
+                    ok: false,
+                    applied: vec![],
+                    errors: vec![ApiError::from_core(&e)],
+                };
+            }
         }
         applied.sort_by_key(|a| a.index);
         EditPropertiesResponse {

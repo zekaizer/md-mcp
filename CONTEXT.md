@@ -169,3 +169,37 @@ Writes are serialized and the commit step is exclusive with reads, so a multi-no
 read never sees a torn snapshot (some notes new, some old). External-change
 detection is a separate layer, handled by `content hash`. See
 [ADR on concurrency](docs/adr/0008-concurrency-and-isolation.md).
+
+**vault lock**:
+The cross-process OS lock (`.md-mcp/lock`) held around every transaction commit
+and git operation, so a cooperating external tool never interleaves with a
+mid-batch tree. See [ADR on git sync](docs/adr/0016-git-sync-integration.md).
+_Avoid_: flock (as a noun), mutex.
+
+## Sync & events
+
+**sync**:
+Replicating the vault through its git repository — commit, rebase onto the
+upstream, push. Git is a replication layer above the transaction; the journal,
+not git, is the durability layer. See [ADR on git sync](docs/adr/0016-git-sync-integration.md)
+and [ADR on git automation](docs/adr/0018-git-automation.md).
+_Avoid_: backup, mirror.
+
+**sweep commit**:
+`sync`'s commit of everything dirty at sync time (`mcp(sync): checkpoint`).
+With `auto-commit` on it contains only external edits.
+
+**auto-commit**:
+The opt-in per-batch git commit: one write batch, one path-scoped commit, made
+while the write guard is held. See [ADR on git automation](docs/adr/0018-git-automation.md).
+
+**event journal**:
+The opt-in append-only stream (`.md-mcp/events.jsonl`) of vault mutations: one
+record per destructive batch and per succeeded non-destructive item, `seq`-ordered,
+at-least-once, best-effort complete. See [ADR on the event journal](docs/adr/0017-event-journal-and-hook.md).
+_Avoid_: log (unqualified), audit trail.
+
+**commit hook**:
+The configured command run once per event record with the record JSON on stdin;
+push delivery only — the journal is the catch-up path.
+_Avoid_: webhook, callback.

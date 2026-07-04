@@ -139,6 +139,100 @@ fn parse_allowlist(raw: Option<String>, var: &str) -> Result<Option<Vec<String>>
     }
 }
 
+/// Event journal + commit hook configuration (ADR-0017).
+#[derive(Debug, Clone, Default)]
+pub struct EventsConfig {
+    /// Whether the journal is written (`MD_EVENTS=1`, or implied by a hook).
+    pub enabled: bool,
+    /// Hook command (`MD_ON_COMMIT_HOOK`), run per record with JSON on stdin.
+    pub hook: Option<String>,
+}
+
+impl EventsConfig {
+    /// Resolve from raw env values (pure; env-free). A hook implies the
+    /// journal: its catch-up story depends on the journal existing.
+    fn resolve(events: Option<String>, hook: Option<String>) -> Result<Self> {
+        let hook = hook.map(|h| h.trim().to_string()).filter(|h| !h.is_empty());
+        let enabled = parse_flag(events, "MD_EVENTS")? || hook.is_some();
+        Ok(Self { enabled, hook })
+    }
+}
+
+/// Parse an on/off env flag. Unset/blank → off; `1`/`true` → on; anything else
+/// is a hard error, never a silent off (fail-closed, as everywhere here).
+fn parse_flag(raw: Option<String>, var: &str) -> Result<bool> {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => Ok(false),
+        Some("1" | "true") => Ok(true),
+        Some(other) => bail!("{var} must be \"1\" or \"true\" (or unset), got {other:?}"),
+    }
+}
+
+/// Git sync configuration (ADR-0016) and automation layers (ADR-0018).
+#[derive(Debug, Clone, Default)]
+pub struct GitConfig {
+    /// Whether git sync is requested (`MD_GIT_SYNC=1`); gates the
+    /// `sync_vault` tool and is the base every automation layer requires.
+    pub sync: bool,
+    /// Per-batch auto-commit (`MD_GIT_AUTO_COMMIT=1`).
+    pub auto_commit: bool,
+    /// Debounced push, N seconds after the most recent commit
+    /// (`MD_GIT_AUTO_PUSH_SECS`).
+    pub auto_push_secs: Option<u64>,
+    /// Periodic full sync (`MD_GIT_SYNC_INTERVAL_SECS`).
+    pub sync_interval_secs: Option<u64>,
+}
+
+impl GitConfig {
+    fn resolve(
+        sync: Option<String>,
+        auto_commit: Option<String>,
+        auto_push_secs: Option<String>,
+        sync_interval_secs: Option<String>,
+    ) -> Result<Self> {
+        let sync = parse_flag(sync, "MD_GIT_SYNC")?;
+        let auto_commit = parse_flag(auto_commit, "MD_GIT_AUTO_COMMIT")?;
+        let auto_push_secs = parse_secs(auto_push_secs, "MD_GIT_AUTO_PUSH_SECS")?;
+        let sync_interval_secs = parse_secs(sync_interval_secs, "MD_GIT_SYNC_INTERVAL_SECS")?;
+        // An automation layer without the base is a misconfiguration, not a
+        // silent no-op (ADR-0018).
+        if !sync {
+            if auto_commit {
+                bail!("MD_GIT_AUTO_COMMIT requires MD_GIT_SYNC=1");
+            }
+            if auto_push_secs.is_some() {
+                bail!("MD_GIT_AUTO_PUSH_SECS requires MD_GIT_SYNC=1");
+            }
+            if sync_interval_secs.is_some() {
+                bail!("MD_GIT_SYNC_INTERVAL_SECS requires MD_GIT_SYNC=1");
+            }
+        }
+        Ok(Self {
+            sync,
+            auto_commit,
+            auto_push_secs,
+            sync_interval_secs,
+        })
+    }
+}
+
+/// Parse a positive-seconds env var. Unset/blank → `None`; `0` or a non-number
+/// is a hard error, never a silent off.
+fn parse_secs(raw: Option<String>, var: &str) -> Result<Option<u64>> {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) => {
+            let n: u64 = s
+                .parse()
+                .with_context(|| format!("{var} must be a positive integer, got {s:?}"))?;
+            if n == 0 {
+                bail!("{var} must be a positive integer, got 0");
+            }
+            Ok(Some(n))
+        }
+    }
+}
+
 /// Runtime configuration for the md-mcp server.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -146,6 +240,10 @@ pub struct Config {
     pub vault_dir: PathBuf,
     /// The selected transport.
     pub transport: Transport,
+    /// Event journal + hook (ADR-0017).
+    pub events: EventsConfig,
+    /// Git sync (ADR-0016).
+    pub git: GitConfig,
 }
 
 impl Config {
@@ -179,9 +277,22 @@ impl Config {
             )?),
         };
 
+        let events = EventsConfig::resolve(
+            std::env::var("MD_EVENTS").ok(),
+            std::env::var("MD_ON_COMMIT_HOOK").ok(),
+        )?;
+        let git = GitConfig::resolve(
+            std::env::var("MD_GIT_SYNC").ok(),
+            std::env::var("MD_GIT_AUTO_COMMIT").ok(),
+            std::env::var("MD_GIT_AUTO_PUSH_SECS").ok(),
+            std::env::var("MD_GIT_SYNC_INTERVAL_SECS").ok(),
+        )?;
+
         Ok(Self {
             vault_dir,
             transport,
+            events,
+            git,
         })
     }
 }

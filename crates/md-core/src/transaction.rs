@@ -38,6 +38,14 @@ pub enum OpOutcome {
     Moved { from: String, to: String },
 }
 
+/// A committed batch: its id and the per-op outcomes, in op order. The id is
+/// the batch's identity in the event journal (ADR-0017).
+#[derive(Clone, Debug)]
+pub struct CommitReceipt {
+    pub batch_id: String,
+    pub outcomes: Vec<OpOutcome>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Journal {
     batch_id: String,
@@ -69,7 +77,7 @@ fn strip_slash(path: &str) -> &str {
 
 impl Vault {
     /// Apply a batch of ops atomically. On any failure nothing is left changed.
-    pub fn commit_batch(&self, ops: &[Op]) -> Result<Vec<OpOutcome>> {
+    pub fn commit_batch(&self, ops: &[Op]) -> Result<CommitReceipt> {
         // Agent ops may never target the internal `.md-mcp/` state directory.
         for op in ops {
             let paths: Vec<&str> = match op {
@@ -79,7 +87,7 @@ impl Vault {
             for p in paths {
                 if Self::is_internal_path(p) {
                     return Err(Error::traversal(format!(
-                        "cannot target the internal state directory: {p}"
+                        "cannot target a protected directory: {p}"
                     )));
                 }
             }
@@ -142,6 +150,10 @@ impl Vault {
             .collect::<Result<_>>()?;
         let ops = &ops[..];
 
+        // Cross-process exclusion (ADR-0016): a cooperating external tool
+        // holding the same flock never observes a mid-batch tree.
+        let _flock = self.exclusive_lock()?;
+
         let batch_id = new_batch_id();
         let journal_path = format!("{JOURNAL_DIR}/{batch_id}.json");
         let mut journal = Journal {
@@ -172,7 +184,7 @@ impl Vault {
         match self.write_journal(&journal_path, &journal) {
             Ok(()) => {
                 self.cleanup(&batch_id, &journal_path);
-                Ok(outcomes)
+                Ok(CommitReceipt { batch_id, outcomes })
             }
             Err(e) => {
                 if self.rollback(&journal) {
@@ -188,6 +200,10 @@ impl Vault {
         let Ok(entries) = self.dir().read_dir(JOURNAL_DIR) else {
             return Ok(());
         };
+        // Journals exist, so .md-mcp/ does too: recovery mutates the tree and
+        // takes the same cross-process lock as a commit. (Skipped above for a
+        // fresh vault, so a plain open never creates .md-mcp/.)
+        let _flock = self.exclusive_lock()?;
         let mut journal_paths = Vec::new();
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str()
@@ -423,7 +439,7 @@ mod tests {
                 to: nfc.to_string(),
             }])
             .unwrap();
-        assert!(matches!(&outcomes[0], OpOutcome::Moved { to, .. } if to == nfc));
+        assert!(matches!(&outcomes.outcomes[0], OpOutcome::Moved { to, .. } if to == nfc));
         // The on-disk byte spelling actually changed.
         let names: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -482,7 +498,7 @@ mod tests {
         assert!(!vault.exists("fresh.md").unwrap());
         // delete outcome reports the trash location.
         assert!(
-            matches!(&outcomes[2], OpOutcome::Deleted { trashed_to, .. } if trashed_to.starts_with(".md-mcp/trash/"))
+            matches!(&outcomes.outcomes[2], OpOutcome::Deleted { trashed_to, .. } if trashed_to.starts_with(".md-mcp/trash/"))
         );
         // journal + backups cleaned up.
         assert!(

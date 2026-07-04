@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::MdServer;
 use crate::envelope::{ApiError, batch_limit};
+use crate::events::EventOp;
 
 // --- path helpers -----------------------------------------------------------
 
@@ -205,7 +206,7 @@ impl MdServer {
     ) -> Result<Json<DeleteNotesResponse>, ErrorData> {
         batch_limit(req.paths.len())?;
         let _guard = self.lock().write().await;
-        Ok(Json(self.run_delete(&req.paths)))
+        Ok(Json(self.run_delete(&req.paths).await))
     }
 
     /// Rename a note or directory in place (same parent). All-or-nothing.
@@ -218,7 +219,7 @@ impl MdServer {
     ) -> Result<Json<RenameResponse>, ErrorData> {
         batch_limit(req.renames.len())?;
         let _guard = self.lock().write().await;
-        let r = self.run_rename(&req.renames, req.overwrite);
+        let r = self.run_rename(&req.renames, req.overwrite).await;
         Ok(Json(RenameResponse {
             ok: r.ok,
             renamed: r.moved,
@@ -236,12 +237,12 @@ impl MdServer {
     ) -> Result<Json<MoveResponse>, ErrorData> {
         batch_limit(req.moves.len())?;
         let _guard = self.lock().write().await;
-        Ok(Json(self.run_relocate(&req.moves, req.overwrite)))
+        Ok(Json(self.run_relocate(&req.moves, req.overwrite).await))
     }
 }
 
 impl MdServer {
-    fn run_delete(&self, paths: &[String]) -> DeleteNotesResponse {
+    async fn run_delete(&self, paths: &[String]) -> DeleteNotesResponse {
         let mut errors = Vec::new();
         for (i, p) in paths.iter().enumerate() {
             if let Err(e) = Vault::validate_rel(p) {
@@ -282,8 +283,12 @@ impl MdServer {
             .map(|p| Op::Delete { path: p.clone() })
             .collect();
         match self.vault().commit_batch(&ops) {
-            Ok(outcomes) => {
-                let deleted = outcomes
+            Ok(receipt) => {
+                let ops = EventOp::from_outcomes(&receipt.outcomes);
+                self.emit_event("delete_notes", Some(&receipt.batch_id), &ops);
+                self.auto_commit("delete_notes", &ops).await;
+                let deleted = receipt
+                    .outcomes
                     .into_iter()
                     .zip(paths)
                     .filter_map(|(o, requested)| match o {
@@ -308,7 +313,7 @@ impl MdServer {
         }
     }
 
-    fn run_rename(&self, renames: &[RenameItem], overwrite: bool) -> MoveResponse {
+    async fn run_rename(&self, renames: &[RenameItem], overwrite: bool) -> MoveResponse {
         let mut errors = Vec::new();
         let mut pairs: Vec<(usize, String, String)> = Vec::new();
 
@@ -342,10 +347,10 @@ impl MdServer {
                 Err(e) => errors.push(ApiError::at(i, &e)),
             }
         }
-        self.finish_move(pairs, errors)
+        self.finish_move("rename_notes", pairs, errors).await
     }
 
-    fn run_relocate(&self, moves: &[RelocateItem], overwrite: bool) -> MoveResponse {
+    async fn run_relocate(&self, moves: &[RelocateItem], overwrite: bool) -> MoveResponse {
         let mut errors = Vec::new();
         let mut pairs: Vec<(usize, String, String)> = Vec::new();
 
@@ -372,7 +377,7 @@ impl MdServer {
                 Err(e) => errors.push(ApiError::at(i, &e)),
             }
         }
-        self.finish_move(pairs, errors)
+        self.finish_move("relocate_notes", pairs, errors).await
     }
 
     fn compute_rename(&self, r: &RenameItem) -> Result<String, Error> {
@@ -473,8 +478,9 @@ impl MdServer {
         Ok(to)
     }
 
-    fn finish_move(
+    async fn finish_move(
         &self,
+        tool: &str,
         pairs: Vec<(usize, String, String)>,
         mut errors: Vec<ApiError>,
     ) -> MoveResponse {
@@ -495,8 +501,12 @@ impl MdServer {
             })
             .collect();
         match self.vault().commit_batch(&ops) {
-            Ok(outcomes) => {
-                let moved = outcomes
+            Ok(receipt) => {
+                let ops = EventOp::from_outcomes(&receipt.outcomes);
+                self.emit_event(tool, Some(&receipt.batch_id), &ops);
+                self.auto_commit(tool, &ops).await;
+                let moved = receipt
+                    .outcomes
                     .into_iter()
                     .zip(&pairs)
                     .filter_map(|(o, (_, pfrom, pto))| match o {

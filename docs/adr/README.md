@@ -26,3 +26,4 @@ immutable; a changed decision supersedes the old one with a new ADR.
 - [0015](0015-stdio-end-to-end-suite.md) — stdio end-to-end test suite
 - [0016](0016-git-sync-integration.md) — Git sync integration: coexistence hardening and the `sync_vault` tool
 - [0017](0017-event-journal-and-hook.md) — Event journal and commit hook
+- [0018](0018-git-automation.md) — Git automation: per-batch auto-commit, debounced push, interval sync

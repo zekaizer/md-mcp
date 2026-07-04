@@ -19,6 +19,17 @@ use crate::text::nfc;
 /// The server's internal state directory, off-limits to agent note operations.
 pub(crate) const INTERNAL_DIR: &str = ".md-mcp";
 
+/// The git repository metadata directory. Off-limits like `.md-mcp/`: a note
+/// operation writing into `.git/` could corrupt the repository
+/// ([ADR-0016](../../../docs/adr/0016-git-sync-integration.md)).
+const GIT_DIR: &str = ".git";
+
+/// Directories no agent note operation may target.
+const PROTECTED_DIRS: [&str; 2] = [INTERNAL_DIR, GIT_DIR];
+
+/// The cross-process lock file, inside the internal state directory.
+const LOCK_FILE: &str = ".md-mcp/lock";
+
 /// Maximum bytes in one path component (file or directory name). Matches the
 /// common filesystem `NAME_MAX`, so an over-long name is a validation error
 /// rather than a raw `ENAMETOOLONG` at commit time.
@@ -28,6 +39,12 @@ const MAX_PATH_COMPONENT_BYTES: usize = 255;
 pub struct Vault {
     root: Dir,
     root_path: PathBuf,
+}
+
+/// RAII guard for the cross-process vault lock; the OS lock is released when
+/// the guard (and its file handle) drops.
+pub struct VaultLock {
+    _file: std::fs::File,
 }
 
 impl Vault {
@@ -115,23 +132,26 @@ impl Vault {
         Ok(clean.to_string())
     }
 
-    /// Whether `rel` targets the server's internal state directory (`.md-mcp/`),
-    /// which agent-facing note operations must not touch.
+    /// Whether `rel` targets a protected directory — the server's internal
+    /// state (`.md-mcp/`) or the git metadata (`.git/`) — which agent-facing
+    /// note operations must not touch.
     #[must_use]
     pub fn is_internal_path(rel: &str) -> bool {
         match Self::validate_rel(rel) {
-            Ok(clean) => clean == INTERNAL_DIR || clean.starts_with(&format!("{INTERNAL_DIR}/")),
+            Ok(clean) => PROTECTED_DIRS
+                .iter()
+                .any(|d| clean == *d || clean.starts_with(&format!("{d}/"))),
             Err(_) => false,
         }
     }
 
-    /// Validate an agent-supplied note path: traversal-safe and not inside the
-    /// internal `.md-mcp/` state directory.
+    /// Validate an agent-supplied note path: traversal-safe and not inside a
+    /// protected directory (`.md-mcp/`, `.git/`).
     pub fn validate_note_rel(rel: &str) -> Result<String> {
         let clean = Self::validate_rel(rel)?;
-        if clean == INTERNAL_DIR || clean.starts_with(&format!("{INTERNAL_DIR}/")) {
+        if Self::is_internal_path(&clean) {
             return Err(Error::traversal(format!(
-                "cannot target the internal state directory: {rel}"
+                "cannot target a protected directory: {rel}"
             )));
         }
         Ok(clean)
@@ -271,6 +291,30 @@ impl Vault {
             .map_err(|e| Error::io(format!("commit {rel}: {e}")))?;
         self.fsync_parent(&clean);
         Ok(())
+    }
+
+    /// Acquire the exclusive cross-process vault lock (an OS lock on
+    /// `.md-mcp/lock`), blocking until available; released on drop.
+    ///
+    /// Held around every transaction commit and every git operation
+    /// ([ADR-0016](../../../docs/adr/0016-git-sync-integration.md)). External
+    /// tools that mutate the vault (e.g. `flock <vault>/.md-mcp/lock git pull`)
+    /// take the same lock, so a checkout can never interleave with a
+    /// transaction.
+    pub fn exclusive_lock(&self) -> Result<VaultLock> {
+        self.root
+            .create_dir_all(INTERNAL_DIR)
+            .map_err(|e| Error::io(format!("create {INTERNAL_DIR}: {e}")))?;
+        let mut opts = cap_std::fs::OpenOptions::new();
+        opts.create(true).write(true).read(true);
+        let file = self
+            .root
+            .open_with(LOCK_FILE, &opts)
+            .map_err(|e| Error::io(format!("open {LOCK_FILE}: {e}")))?
+            .into_std();
+        file.lock()
+            .map_err(|e| Error::io(format!("lock {LOCK_FILE}: {e}")))?;
+        Ok(VaultLock { _file: file })
     }
 
     /// Create a new note, refusing to overwrite an existing target unless
@@ -476,7 +520,9 @@ mod tests {
                 path: "노트.md".to_string(),
             }])
             .unwrap();
-        assert!(matches!(&outcomes[0], crate::OpOutcome::Deleted { path, .. } if path == nfd));
+        assert!(
+            matches!(&outcomes.outcomes[0], crate::OpOutcome::Deleted { path, .. } if path == nfd)
+        );
         assert!(!vault.exists(nfd).unwrap());
     }
 
@@ -530,6 +576,12 @@ mod tests {
         assert!(Vault::is_internal_path("./.md-mcp/trash/a.md"));
         assert!(!Vault::is_internal_path("notes/.md-mcp.md"));
         assert!(!Vault::is_internal_path("a.md"));
+        // .git/ is protected like .md-mcp/ (ADR-0016); look-alikes are not.
+        assert!(Vault::is_internal_path(".git"));
+        assert!(Vault::is_internal_path(".git/config"));
+        assert!(Vault::is_internal_path("./.git/hooks/pre-commit.md"));
+        assert!(!Vault::is_internal_path(".gitignore"));
+        assert!(!Vault::is_internal_path("notes/.git.md"));
     }
 
     #[test]
@@ -553,6 +605,38 @@ mod tests {
             .create_note(".md-mcp/journal/evil.md", b"x", false)
             .unwrap_err();
         assert_eq!(e.code, Code::Traversal);
+    }
+
+    #[test]
+    fn git_dir_is_write_protected_and_hidden() {
+        let (vdir, vault) = temp_vault();
+        std::fs::create_dir_all(vdir.path().join(".git")).unwrap();
+        std::fs::write(vdir.path().join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        // No creation, no transaction op, no read inside .git/.
+        let e = vault.create_note(".git/evil.md", b"x", false).unwrap_err();
+        assert_eq!(e.code, Code::Traversal);
+        let e = vault
+            .commit_batch(&[crate::Op::Delete {
+                path: ".git/HEAD".into(),
+            }])
+            .unwrap_err();
+        assert_eq!(e.code, Code::Traversal);
+        let e = vault.read_note(".git/HEAD").unwrap_err();
+        assert_eq!(e.code, Code::NotFound);
+    }
+
+    // --- cross-process lock --------------------------------------------------
+
+    #[test]
+    fn exclusive_lock_excludes_other_holders_until_dropped() {
+        let (vdir, vault) = temp_vault();
+        let guard = vault.exclusive_lock().unwrap();
+        // A second handle on the lock file (as an external tool would open it)
+        // cannot take the lock while the guard lives.
+        let other = std::fs::File::open(vdir.path().join(".md-mcp/lock")).unwrap();
+        assert!(other.try_lock().is_err(), "lock must be held");
+        drop(guard);
+        assert!(other.try_lock().is_ok(), "lock must be released on drop");
     }
 
     #[test]
