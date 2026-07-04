@@ -107,10 +107,36 @@ impl Vault {
                     Op::Delete { path } => Op::Delete {
                         path: resolve(path)?,
                     },
-                    Op::Move { from, to } => Op::Move {
-                        from: resolve(from)?,
-                        to: resolve(to)?,
-                    },
+                    Op::Move { from, to } => {
+                        let rfrom = resolve(from)?;
+                        let mut rto = resolve(to)?;
+                        // Same file, different requested spelling (e.g. an
+                        // NFD-stored name renamed to its NFC form): resolving
+                        // the leaf would collapse the move into a no-op, so
+                        // keep the requested leaf and resolve only the parent.
+                        if strip_slash(&rto) == strip_slash(&rfrom)
+                            && strip_slash(to) != strip_slash(&rfrom)
+                        {
+                            let stripped = strip_slash(to);
+                            let joined = match stripped.rfind('/') {
+                                Some(i) => format!(
+                                    "{}/{}",
+                                    self.resolve_rel(&stripped[..i])?,
+                                    &stripped[i + 1..]
+                                ),
+                                None => stripped.to_string(),
+                            };
+                            rto = if to.ends_with('/') {
+                                format!("{joined}/")
+                            } else {
+                                joined
+                            };
+                        }
+                        Op::Move {
+                            from: rfrom,
+                            to: rto,
+                        }
+                    }
                 })
             })
             .collect::<Result<_>>()?;
@@ -250,6 +276,13 @@ impl Vault {
             Op::Move { from, to } => {
                 let from = strip_slash(from);
                 let to = strip_slash(to);
+                // Defense-in-depth: a same-path move would back the target up
+                // (removing the source) and then fail with a raw ENOENT.
+                if from == to {
+                    return Err(Error::conflict(format!(
+                        "move source and destination are the same path: {from}"
+                    )));
+                }
                 if self.dir().exists(to) {
                     let backup = format!("{BACKUP_DIR}/{batch_id}/{k}");
                     journal.undo.push(UndoStep::RestoreFromBackup {
@@ -371,6 +404,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = Vault::open(dir.path()).unwrap();
         (dir, vault)
+    }
+
+    #[test]
+    fn move_to_an_nfc_respelling_of_the_same_file_renames_it() {
+        // An NFD-stored name renamed to its NFC form must change the on-disk
+        // bytes instead of collapsing into a same-path move.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let nfd = "\u{1112}\u{1161}\u{11ab}.md"; // 한.md in NFD
+        let nfc = "\u{d55c}.md"; // 한.md in NFC
+        assert_ne!(nfd, nfc);
+        vault.write_atomic(nfd, b"content").unwrap();
+
+        let outcomes = vault
+            .commit_batch(&[Op::Move {
+                from: nfd.to_string(),
+                to: nfc.to_string(),
+            }])
+            .unwrap();
+        assert!(matches!(&outcomes[0], OpOutcome::Moved { to, .. } if to == nfc));
+        // The on-disk byte spelling actually changed.
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".md"))
+            .collect();
+        assert_eq!(names, vec![nfc.to_string()]);
+        assert_eq!(vault.read_note(nfc).unwrap(), "content");
+    }
+
+    #[test]
+    fn same_path_move_is_a_clean_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        vault.write_atomic("a.md", b"x").unwrap();
+        let e = vault
+            .commit_batch(&[Op::Move {
+                from: "a.md".to_string(),
+                to: "a.md".to_string(),
+            }])
+            .unwrap_err();
+        assert_eq!(e.code, crate::error::Code::Conflict);
+        // Rolled back to no effect: the note is untouched.
+        assert_eq!(vault.read_note("a.md").unwrap(), "x");
     }
 
     #[test]
