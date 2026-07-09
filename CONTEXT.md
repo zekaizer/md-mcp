@@ -13,8 +13,11 @@ restate behavior. For the full behavioral contract see the
 [tool specification](docs/tool_spec.md); for the rationale behind each design
 choice see the [architecture decisions](docs/adr/README.md).
 
-Scope note: md-mcp is **pure Markdown + YAML frontmatter only**. Obsidian-flavored
-syntax — wikilinks, block ids, backlinks, tags-as-graph — is out of scope.
+Scope note: md-mcp is **pure Markdown + YAML frontmatter only**. Standard-Markdown
+links (`[text](path)`, `![alt](path)`, reference definitions) are part of that:
+they are maintained across moves when asked (`update_links`,
+[ADR-0022](docs/adr/0022-link-rewrite-on-move.md)). Non-CommonMark extensions —
+wikilinks, block ids, a backlink graph, tags-as-graph — stay out of scope.
 
 ## Vault & notes
 

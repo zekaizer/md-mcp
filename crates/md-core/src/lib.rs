@@ -9,8 +9,10 @@
 pub mod document;
 pub mod error;
 pub mod frontmatter;
+pub mod links;
 pub mod listing;
 pub mod patch;
+pub mod relink;
 pub mod section;
 pub mod text;
 pub mod transaction;
@@ -18,7 +20,9 @@ pub mod vault;
 
 pub use document::{Document, Heading, OutlineEntry};
 pub use error::{Code, Error, Result};
+pub use links::{LinkKind, LinkOccurrence, extract_links};
 pub use patch::{Destination, Edit, Operation, Position, patch_sections};
+pub use relink::{MoveMap, resolve_dest, rewrite_body};
 pub use section::Scope;
 pub use transaction::{CommitReceipt, Op, OpOutcome};
 pub use vault::{Vault, VaultLock};
