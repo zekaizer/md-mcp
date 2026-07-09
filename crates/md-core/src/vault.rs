@@ -218,6 +218,22 @@ impl Vault {
             .unwrap_or(false))
     }
 
+    /// Remove `rel` if it is an empty directory; returns whether it was
+    /// removed. Delegates to `remove_dir`, which refuses a non-empty
+    /// directory — so this can never delete content. The vault root and the
+    /// internal state directory are refused. Best-effort by design (for
+    /// post-batch pruning): any failure just reports `false`.
+    pub fn remove_empty_dir(&self, rel: &str) -> bool {
+        let rel = rel.strip_suffix('/').unwrap_or(rel);
+        let Ok(clean) = self.resolve_rel(rel) else {
+            return false;
+        };
+        if clean.is_empty() || Self::is_internal_path(&clean) {
+            return false;
+        }
+        self.root.remove_dir(&clean).is_ok()
+    }
+
     /// Read a note's raw text (as stored on disk, UTF-8). The internal state
     /// directory is hidden — reading inside it reports the note as absent.
     pub fn read_note(&self, rel: &str) -> Result<String> {

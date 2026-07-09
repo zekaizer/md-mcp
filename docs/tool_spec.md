@@ -326,7 +326,8 @@ frontmatter 편집기 — **item 하나 = (노트, key) 하나**의 atomic 단�
       }
     },
     "overwrite": { "type": "boolean", "default": false },
-    "dry_run": { "type": "boolean", "default": false }
+    "dry_run": { "type": "boolean", "default": false },
+    "prune_empty": { "type": "boolean", "default": false }
   },
   "required": ["moves"]
 }
@@ -341,6 +342,8 @@ frontmatter 편집기 — **item 하나 = (노트, key) 하나**의 atomic 단�
 
 이름 변경 + 이동 동시 작업은 `relocate_notes` → `rename_notes` 2콜(각각 all-or-nothing이라 한 콜로 못 묶음). markdown 상대 링크 `[..](path.md)`는 이동으로 깨질 수 있음 — 링크 자동 갱신은 §4 참조.
 
+**`prune_empty` (relocate/delete 공통)**: `prune_empty: true`면 성공한 배치가 **비워 놓은** source 디렉터리를 부모 방향으로 거슬러 올라가며 정리하고 `pruned: [dir/…]`로 보고한다. `remove_dir(2)` 기반이라 내용이 남은 디렉터리는 절대 지우지 못하며(안전 내장), 배치 전부터 비어 있던 무관한 디렉터리는 건드리지 않는다(source의 조상만 후보). rename은 같은 부모 안이라 대상 아님. best-effort — prune 실패는 배치 성공에 영향 없다. 빈 디렉터리 *생성*은 제공하지 않는다: git이 빈 디렉터리를 추적하지 못해 sync로 전파되지 않으므로, 필요하면 placeholder 노트를 만든다.
+
 **`dry_run` (rename/relocate/delete 공통)**: `dry_run: true`면 all-or-nothing 검증(§4)을 전부 수행하되 아무것도 쓰지 않는다 — 통과 시 계획된 결과(`renamed`/`moved`/`deleted`)를, 거부 시 위반 전수를 평소와 같은 envelope으로 반환하고, 응답에 `dry_run: true`를 에코해 실제 적용과 구분한다. `delete_notes`의 dry-run `trashed_to`는 현재 기준 예정 위치라 실제 실행 시 uniquifier(`.n`)가 달라질 수 있다. event journal·auto-commit은 발생하지 않는다.
 
 ### delete_notes (파괴적 · all-or-nothing)
@@ -348,7 +351,8 @@ frontmatter 편집기 — **item 하나 = (노트, key) 하나**의 atomic 단�
 {
   "properties": {
     "paths": { "type": "array", "items": { "type": "string" } },
-    "dry_run": { "type": "boolean", "default": false }
+    "dry_run": { "type": "boolean", "default": false },
+    "prune_empty": { "type": "boolean", "default": false }
   },
   "required": ["paths"]
 }

@@ -116,6 +116,9 @@ pub struct DeleteNotesRequest {
     /// Validate and report what would happen without writing anything.
     #[serde(default)]
     pub dry_run: bool,
+    /// After the batch, remove source directories it left empty (ascending).
+    #[serde(default)]
+    pub prune_empty: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -126,6 +129,9 @@ pub struct DeleteNotesResponse {
     pub deleted: Vec<DeletedItem>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
+    /// Directories removed because the batch emptied them (prune_empty).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pruned: Vec<String>,
     /// True when this was a dry run: nothing was written.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
@@ -171,6 +177,9 @@ pub struct RelocateNotesRequest {
     /// Validate and report what would happen without writing anything.
     #[serde(default)]
     pub dry_run: bool,
+    /// After the batch, remove source directories it left empty (ascending).
+    #[serde(default)]
+    pub prune_empty: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
@@ -190,6 +199,9 @@ pub struct MoveResponse {
     pub moved: Vec<MovedItem>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
+    /// Directories removed because the batch emptied them (prune_empty).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pruned: Vec<String>,
     /// True when this was a dry run: nothing was written.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
@@ -225,7 +237,7 @@ pub struct MovedItem {
 impl MdServer {
     /// Delete notes or directories (to a recoverable trash). All-or-nothing.
     #[tool(
-        description = "Delete notes (or directories ending in /) to a recoverable trash. All-or-nothing: a missing path, the vault root, or two overlapping targets reject the whole batch and nothing is deleted. Returns each item's trash location. dry_run:true validates and returns the planned outcome (or every rejection) without deleting."
+        description = "Delete notes (or directories ending in /) to a recoverable trash. All-or-nothing: a missing path, the vault root, or two overlapping targets reject the whole batch and nothing is deleted. Returns each item's trash location. dry_run:true validates and returns the planned outcome (or every rejection) without deleting. prune_empty:true also removes source directories the batch left empty (reported as pruned)."
     )]
     pub async fn delete_notes(
         &self,
@@ -233,7 +245,9 @@ impl MdServer {
     ) -> Result<Json<DeleteNotesResponse>, ErrorData> {
         batch_limit(req.paths.len())?;
         let _guard = self.lock().write().await;
-        let mut r = self.run_delete(&req.paths, req.dry_run).await;
+        let mut r = self
+            .run_delete(&req.paths, req.dry_run, req.prune_empty)
+            .await;
         r.sync_warning = self.sync_warning();
         Ok(Json(r))
     }
@@ -248,7 +262,9 @@ impl MdServer {
     ) -> Result<Json<RenameResponse>, ErrorData> {
         batch_limit(req.renames.len())?;
         let _guard = self.lock().write().await;
-        let r = self.run_rename(&req.renames, req.overwrite, req.dry_run).await;
+        let r = self
+            .run_rename(&req.renames, req.overwrite, req.dry_run)
+            .await;
         Ok(Json(RenameResponse {
             ok: r.ok,
             renamed: r.moved,
@@ -260,7 +276,7 @@ impl MdServer {
 
     /// Move notes or directories into a destination directory. All-or-nothing.
     #[tool(
-        description = "Relocate notes or directories into dest_dir (ends with /), keeping the basename; multiple items may target one directory. All-or-nothing: collisions (without overwrite), moving a directory into its own subtree, or in-batch overlaps reject the whole batch. dry_run:true validates and returns the planned destinations without moving."
+        description = "Relocate notes or directories into dest_dir (ends with /), keeping the basename; multiple items may target one directory. All-or-nothing: collisions (without overwrite), moving a directory into its own subtree, or in-batch overlaps reject the whole batch. dry_run:true validates and returns the planned destinations without moving. prune_empty:true also removes source directories the batch left empty (reported as pruned)."
     )]
     pub async fn relocate_notes(
         &self,
@@ -268,14 +284,21 @@ impl MdServer {
     ) -> Result<Json<MoveResponse>, ErrorData> {
         batch_limit(req.moves.len())?;
         let _guard = self.lock().write().await;
-        let mut r = self.run_relocate(&req.moves, req.overwrite, req.dry_run).await;
+        let mut r = self
+            .run_relocate(&req.moves, req.overwrite, req.dry_run, req.prune_empty)
+            .await;
         r.sync_warning = self.sync_warning();
         Ok(Json(r))
     }
 }
 
 impl MdServer {
-    async fn run_delete(&self, paths: &[String], dry_run: bool) -> DeleteNotesResponse {
+    async fn run_delete(
+        &self,
+        paths: &[String],
+        dry_run: bool,
+        prune_empty: bool,
+    ) -> DeleteNotesResponse {
         let mut errors = Vec::new();
         for (i, p) in paths.iter().enumerate() {
             if let Err(e) = Vault::validate_rel(p) {
@@ -308,6 +331,7 @@ impl MdServer {
                 ok: false,
                 deleted: vec![],
                 errors,
+                pruned: vec![],
                 dry_run,
                 sync_warning: None,
             };
@@ -325,6 +349,7 @@ impl MdServer {
                 ok: true,
                 deleted,
                 errors: vec![],
+                pruned: vec![],
                 dry_run: true,
                 sync_warning: None,
             };
@@ -351,10 +376,16 @@ impl MdServer {
                         _ => None,
                     })
                     .collect();
+                let pruned = if prune_empty {
+                    self.prune_emptied_dirs(paths.iter().map(String::as_str))
+                } else {
+                    vec![]
+                };
                 DeleteNotesResponse {
                     ok: true,
                     deleted,
                     errors: vec![],
+                    pruned,
                     dry_run: false,
                     sync_warning: None,
                 }
@@ -363,6 +394,7 @@ impl MdServer {
                 ok: false,
                 deleted: vec![],
                 errors: vec![ApiError::from_core(&e)],
+                pruned: vec![],
                 dry_run: false,
                 sync_warning: None,
             },
@@ -413,6 +445,7 @@ impl MdServer {
             pairs,
             errors,
             dry_run,
+            false, // a rename stays in its parent — it can never empty a dir
             serde_json::json!({"renames": renames, "overwrite": overwrite}),
         )
         .await
@@ -423,6 +456,7 @@ impl MdServer {
         moves: &[RelocateItem],
         overwrite: bool,
         dry_run: bool,
+        prune_empty: bool,
     ) -> MoveResponse {
         let mut errors = Vec::new();
         let mut pairs: Vec<(usize, String, String)> = Vec::new();
@@ -455,9 +489,28 @@ impl MdServer {
             pairs,
             errors,
             dry_run,
+            prune_empty,
             serde_json::json!({"moves": moves, "overwrite": overwrite}),
         )
         .await
+    }
+
+    /// Best-effort post-batch pruning: ascend from each source's parent,
+    /// removing directories the batch left empty. `remove_empty_dir` refuses a
+    /// non-empty directory, so any remaining content stops the ascent — this
+    /// can never delete notes. Returns pruned dirs with the `/` suffix.
+    fn prune_emptied_dirs<'a>(&self, sources: impl Iterator<Item = &'a str>) -> Vec<String> {
+        let mut pruned = Vec::new();
+        for src in sources {
+            let mut dir = parent_dir(src);
+            while !dir.is_empty() && self.vault().remove_empty_dir(&dir) {
+                pruned.push(dir.clone());
+                dir = parent_dir(&dir);
+            }
+        }
+        pruned.sort();
+        pruned.dedup();
+        pruned
     }
 
     fn compute_rename(&self, r: &RenameItem) -> Result<String, Error> {
@@ -564,6 +617,7 @@ impl MdServer {
         pairs: Vec<(usize, String, String)>,
         mut errors: Vec<ApiError>,
         dry_run: bool,
+        prune_empty: bool,
         args: serde_json::Value,
     ) -> MoveResponse {
         check_move_collisions(&pairs, &mut errors);
@@ -573,6 +627,7 @@ impl MdServer {
                 ok: false,
                 moved: vec![],
                 errors,
+                pruned: vec![],
                 dry_run,
                 sync_warning: None,
             };
@@ -587,6 +642,7 @@ impl MdServer {
                 ok: true,
                 moved,
                 errors: vec![],
+                pruned: vec![],
                 dry_run: true,
                 sync_warning: None,
             };
@@ -615,10 +671,16 @@ impl MdServer {
                         _ => None,
                     })
                     .collect();
+                let pruned = if prune_empty {
+                    self.prune_emptied_dirs(pairs.iter().map(|(_, from, _)| from.as_str()))
+                } else {
+                    vec![]
+                };
                 MoveResponse {
                     ok: true,
                     moved,
                     errors: vec![],
+                    pruned,
                     dry_run: false,
                     sync_warning: None,
                 }
@@ -627,6 +689,7 @@ impl MdServer {
                 ok: false,
                 moved: vec![],
                 errors: vec![ApiError::from_core(&e)],
+                pruned: vec![],
                 dry_run: false,
                 sync_warning: None,
             },
@@ -656,6 +719,7 @@ mod tests {
             .delete_notes(Parameters(DeleteNotesRequest {
                 paths: vec!["a.md".into(), "missing.md".into()],
                 dry_run: false,
+                prune_empty: false,
             }))
             .await
             .unwrap()
@@ -667,6 +731,7 @@ mod tests {
             .delete_notes(Parameters(DeleteNotesRequest {
                 paths: vec!["a.md".into()],
                 dry_run: false,
+                prune_empty: false,
             }))
             .await
             .unwrap()
@@ -689,6 +754,7 @@ mod tests {
                 }],
                 overwrite: false,
                 dry_run: true,
+                prune_empty: false,
             }))
             .await
             .unwrap()
@@ -722,6 +788,7 @@ mod tests {
             .delete_notes(Parameters(DeleteNotesRequest {
                 paths: vec!["b.md".into()],
                 dry_run: true,
+                prune_empty: false,
             }))
             .await
             .unwrap()
@@ -730,6 +797,66 @@ mod tests {
         assert!(r.dry_run);
         assert!(r.deleted[0].trashed_to.starts_with(".md-mcp/trash/"));
         assert!(s.vault().exists("b.md").unwrap(), "not applied");
+    }
+
+    #[tokio::test]
+    async fn prune_empty_removes_only_dirs_the_batch_emptied() {
+        let (_d, s) = server(&[("a/b/n.md", "x"), ("a/keep.md", "y")]);
+        let r = s
+            .relocate_notes(Parameters(RelocateNotesRequest {
+                moves: vec![RelocateItem {
+                    source: "a/b/n.md".into(),
+                    dest_dir: "dst/".into(),
+                }],
+                overwrite: false,
+                dry_run: false,
+                prune_empty: true,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(r.ok, "{:?}", r.errors);
+        // a/b/ was emptied and pruned; a/ still holds keep.md and stays.
+        assert_eq!(r.pruned, vec!["a/b/"]);
+        assert!(!s.vault().exists("a/b").unwrap());
+        assert!(s.vault().exists("a/keep.md").unwrap());
+    }
+
+    #[tokio::test]
+    async fn prune_empty_ascends_and_defaults_off() {
+        // Default: the emptied chain stays.
+        let (_d, s) = server(&[("x/y/n.md", "v")]);
+        let r = s
+            .relocate_notes(Parameters(RelocateNotesRequest {
+                moves: vec![RelocateItem {
+                    source: "x/y/n.md".into(),
+                    dest_dir: "/".into(),
+                }],
+                overwrite: false,
+                dry_run: false,
+                prune_empty: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(r.ok, "{:?}", r.errors);
+        assert!(r.pruned.is_empty());
+        assert!(s.vault().is_dir("x/y").unwrap(), "kept without the flag");
+
+        // With the flag, delete ascends the emptied chain: x/y/, then x/.
+        let (_d2, s2) = server(&[("x/y/n.md", "v")]);
+        let r = s2
+            .delete_notes(Parameters(DeleteNotesRequest {
+                paths: vec!["x/y/n.md".into()],
+                dry_run: false,
+                prune_empty: true,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(r.pruned, vec!["x/", "x/y/"]);
+        assert!(!s2.vault().exists("x").unwrap());
     }
 
     #[tokio::test]
@@ -750,6 +877,7 @@ mod tests {
                 ],
                 overwrite: false,
                 dry_run: true,
+                prune_empty: false,
             }))
             .await
             .unwrap()
@@ -771,6 +899,7 @@ mod tests {
                 }],
                 overwrite: false,
                 dry_run: false,
+                prune_empty: false,
             }))
             .await
             .unwrap()
@@ -788,6 +917,7 @@ mod tests {
                 }],
                 overwrite: false,
                 dry_run: false,
+                prune_empty: false,
             }))
             .await
             .unwrap()
@@ -808,6 +938,7 @@ mod tests {
             .delete_notes(Parameters(DeleteNotesRequest {
                 paths: vec![format!("{nfd_dir}/"), "\u{d55c}/c.md".into()],
                 dry_run: false,
+                prune_empty: false,
             }))
             .await
             .unwrap()
@@ -923,6 +1054,7 @@ mod tests {
                 }],
                 overwrite: false,
                 dry_run: false,
+                prune_empty: false,
             }))
             .await
             .unwrap()
@@ -963,6 +1095,7 @@ mod tests {
                 }],
                 overwrite: false,
                 dry_run: false,
+                prune_empty: false,
             }))
             .await
             .unwrap()
@@ -973,6 +1106,7 @@ mod tests {
             .delete_notes(Parameters(DeleteNotesRequest {
                 paths: vec!["arch/e/".into()],
                 dry_run: false,
+                prune_empty: false,
             }))
             .await
             .unwrap()
@@ -1026,6 +1160,7 @@ mod tests {
                 }],
                 overwrite: false,
                 dry_run: false,
+                prune_empty: false,
             }))
             .await
             .unwrap()
@@ -1054,6 +1189,7 @@ mod tests {
                 ],
                 overwrite: false,
                 dry_run: false,
+                prune_empty: false,
             }))
             .await
             .unwrap()
@@ -1094,6 +1230,7 @@ mod tests {
                 }],
                 overwrite: false,
                 dry_run: false,
+                prune_empty: false,
             }))
             .await
             .unwrap()
@@ -1123,6 +1260,7 @@ mod tests {
                 ],
                 overwrite: false,
                 dry_run: false,
+                prune_empty: false,
             }))
             .await
             .unwrap()

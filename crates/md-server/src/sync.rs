@@ -405,7 +405,10 @@ mod tests {
 
         // Idempotent: a second run appends nothing.
         ensure_git_exclude(dir.path());
-        assert_eq!(std::fs::read_to_string(&exclude).unwrap(), ".md-mcp/\n.*/\n");
+        assert_eq!(
+            std::fs::read_to_string(&exclude).unwrap(),
+            ".md-mcp/\n.*/\n"
+        );
     }
 
     #[test]
@@ -417,7 +420,10 @@ mod tests {
         let exclude = dir.path().join(".git/info/exclude");
         std::fs::write(&exclude, ".md-mcp/\n").unwrap();
         ensure_git_exclude(dir.path());
-        assert_eq!(std::fs::read_to_string(&exclude).unwrap(), ".md-mcp/\n.*/\n");
+        assert_eq!(
+            std::fs::read_to_string(&exclude).unwrap(),
+            ".md-mcp/\n.*/\n"
+        );
     }
 
     #[test]
@@ -504,7 +510,10 @@ mod tests {
         // Delete gone.md and also target `ghost` — a path git no longer tracks.
         std::fs::remove_file(dir.path().join("gone.md")).unwrap();
         let created = git
-            .commit_paths("mcp(delete_notes): 2 notes", &["gone.md".into(), "ghost".into()])
+            .commit_paths(
+                "mcp(delete_notes): 2 notes",
+                &["gone.md".into(), "ghost".into()],
+            )
             .await
             .expect("a vanished pathspec must not fail the whole commit");
 
@@ -513,7 +522,10 @@ mod tests {
             .run(&["log", "-1", "--name-status", "--format="])
             .await
             .unwrap();
-        assert!(log.contains("gone.md"), "deletion not committed; log: {log}");
+        assert!(
+            log.contains("gone.md"),
+            "deletion not committed; log: {log}"
+        );
     }
 
     /// When every path in the batch has vanished, there is simply nothing to
