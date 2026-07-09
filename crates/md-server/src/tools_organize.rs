@@ -260,7 +260,8 @@ struct MoveOpts {
 impl MdServer {
     /// Delete notes or directories (to a recoverable trash). All-or-nothing.
     #[tool(
-        description = "Delete notes (or directories ending in /) to a recoverable trash. All-or-nothing: a missing path, the vault root, or two overlapping targets reject the whole batch and nothing is deleted. Returns each item's trash location. dry_run:true validates and returns the planned outcome (or every rejection) without deleting. prune_empty:true also removes source directories the batch left empty (reported as pruned)."
+        description = "Delete notes (or directories ending in /) to a recoverable trash. All-or-nothing: a missing path, the vault root, or two overlapping targets reject the whole batch and nothing is deleted. Returns each item's trash location. dry_run:true validates and returns the planned outcome (or every rejection) without deleting. prune_empty:true also removes source directories the batch left empty (reported as pruned).",
+        annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false)
     )]
     pub async fn delete_notes(
         &self,
@@ -277,7 +278,8 @@ impl MdServer {
 
     /// Rename a note or directory in place (same parent). All-or-nothing.
     #[tool(
-        description = "Rename notes or directories in place (same parent, basename only; new_name must not contain '/'). A note keeps its .md extension. All-or-nothing: collisions (without overwrite) or in-batch swaps reject the whole batch. dry_run:true validates and returns the planned outcome without renaming. update_links:true also rewrites standard-Markdown links vault-wide so they keep pointing at the renamed notes (relinked notes are reported; wikilinks untouched)."
+        description = "Rename notes or directories in place (same parent, basename only; new_name must not contain '/'). A note keeps its .md extension. All-or-nothing: collisions (without overwrite) or in-batch swaps reject the whole batch. dry_run:true validates and returns the planned outcome without renaming. update_links:true also rewrites standard-Markdown links vault-wide so they keep pointing at the renamed notes (relinked notes are reported; wikilinks untouched).",
+        annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false)
     )]
     pub async fn rename_notes(
         &self,
@@ -300,7 +302,8 @@ impl MdServer {
 
     /// Move notes or directories into a destination directory. All-or-nothing.
     #[tool(
-        description = "Relocate notes or directories into dest_dir (ends with /), keeping the basename; multiple items may target one directory. All-or-nothing: collisions (without overwrite), moving a directory into its own subtree, or in-batch overlaps reject the whole batch. dry_run:true validates and returns the planned destinations without moving. prune_empty:true also removes source directories the batch left empty (reported as pruned). update_links:true also rewrites standard-Markdown links vault-wide so they keep pointing at the moved notes (relinked notes are reported; wikilinks untouched)."
+        description = "Relocate notes or directories into dest_dir (ends with /), keeping the basename; multiple items may target one directory. All-or-nothing: collisions (without overwrite), moving a directory into its own subtree, or in-batch overlaps reject the whole batch. dry_run:true validates and returns the planned destinations without moving. prune_empty:true also removes source directories the batch left empty (reported as pruned). update_links:true also rewrites standard-Markdown links vault-wide so they keep pointing at the moved notes (relinked notes are reported; wikilinks untouched).",
+        annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false)
     )]
     pub async fn relocate_notes(
         &self,

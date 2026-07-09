@@ -326,7 +326,8 @@ pub struct PropertyApplied {
 impl MdServer {
     /// Create new notes (refusing to overwrite unless `overwrite` is set).
     #[tool(
-        description = "Create one or more notes. content is the body only; pass frontmatter as a separate object (a leading --- block in content is rejected). Partial success: a failing note does not block the others. overwrite:false refuses an existing note."
+        description = "Create one or more notes. content is the body only; pass frontmatter as a separate object (a leading --- block in content is rejected). Partial success: a failing note does not block the others. overwrite:false refuses an existing note.",
+        annotations(read_only_hint = false, destructive_hint = false, open_world_hint = false)
     )]
     pub async fn create_notes(
         &self,
@@ -382,7 +383,8 @@ impl MdServer {
 
     /// Append raw content to the end of notes (no separator inserted).
     #[tool(
-        description = "Append raw content to the end of each note (no separator is inserted; include your own newline). Partial success. create_if_missing creates an absent note. For section-internal edits use edit_sections."
+        description = "Append raw content to the end of each note (no separator is inserted; include your own newline). Partial success. create_if_missing creates an absent note. For section-internal edits use edit_sections.",
+        annotations(read_only_hint = false, destructive_hint = false, open_world_hint = false)
     )]
     pub async fn append_notes(
         &self,
@@ -412,7 +414,8 @@ impl MdServer {
 
     /// Edit note sections by heading path (all-or-nothing).
     #[tool(
-        description = "Edit sections by heading_path: replace/append/delete (by scope body|section), insert_before/insert_after, rename (new_heading), move (to a destination section). All-or-nothing: any rejected edit (unresolved/ambiguous heading, overlap, HASH_MISMATCH, HEADING_LEVEL) rejects the whole batch and nothing is written. Pass expected_hash from read_sections for optimistic concurrency."
+        description = "Edit sections by heading_path: replace/append/delete (by scope body|section), insert_before/insert_after, rename (new_heading), move (to a destination section). All-or-nothing: any rejected edit (unresolved/ambiguous heading, overlap, HASH_MISMATCH, HEADING_LEVEL) rejects the whole batch and nothing is written. Pass expected_hash from read_sections for optimistic concurrency.",
+        annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false)
     )]
     pub async fn edit_sections(
         &self,
@@ -427,7 +430,8 @@ impl MdServer {
 
     /// Set or remove frontmatter properties (all-or-nothing).
     #[tool(
-        description = "Set or remove top-level frontmatter properties. One item = one (note, key): value present (even null) sets it, value omitted removes it. All-or-nothing: removing an absent key or editing over broken YAML rejects the whole batch."
+        description = "Set or remove top-level frontmatter properties. One item = one (note, key): value present (even null) sets it, value omitted removes it. All-or-nothing: removing an absent key or editing over broken YAML rejects the whole batch.",
+        annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false)
     )]
     pub async fn edit_properties(
         &self,

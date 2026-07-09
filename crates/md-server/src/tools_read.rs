@@ -335,7 +335,8 @@ fn read_one_section(vault: &Vault, t: &SectionTarget) -> SectionRead {
 impl MdServer {
     /// Read one or more notes in full (body and/or frontmatter).
     #[tool(
-        description = "Read one or more notes by vault-relative path. Returns each note's body (frontmatter excluded) and/or parsed frontmatter. Missing notes are reported with exists:false rather than failing the call."
+        description = "Read one or more notes by vault-relative path. Returns each note's body (frontmatter excluded) and/or parsed frontmatter. Missing notes are reported with exists:false rather than failing the call.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub async fn read_notes(
         &self,
@@ -362,7 +363,8 @@ impl MdServer {
 
     /// Read the heading outline (table of contents) of one or more notes.
     #[tool(
-        description = "Read the heading outline of one or more notes without their bodies. Use this on a large note to find the heading_path/occurrence of a section before reading or editing it."
+        description = "Read the heading outline of one or more notes without their bodies. Use this on a large note to find the heading_path/occurrence of a section before reading or editing it.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub async fn read_outlines(
         &self,
@@ -387,7 +389,8 @@ impl MdServer {
 
     /// Read specific sections by heading path, with their content_hash.
     #[tool(
-        description = "Read specific sections of notes by heading_path (empty = the whole body). Returns each section's content and content_hash for the chosen scope; pass the same scope and occurrence to edit_sections so expected_hash matches."
+        description = "Read specific sections of notes by heading_path (empty = the whole body). Returns each section's content and content_hash for the chosen scope; pass the same scope and occurrence to edit_sections so expected_hash matches.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub async fn read_sections(
         &self,

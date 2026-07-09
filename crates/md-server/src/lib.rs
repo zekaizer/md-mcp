@@ -363,4 +363,53 @@ mod tests {
         assert_eq!(info.server_info.name, "md-mcp");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
     }
+
+    #[test]
+    fn tools_carry_behavioral_annotations() {
+        // Clients use these hints to auto-approve reads and warn on writes.
+        // Every exposed tool must classify itself; the classes below are the
+        // contract, so a new unannotated tool fails the exhaustiveness check.
+        let read_only = ["list_notes", "search_notes", "read_notes", "read_outlines", "read_sections"];
+        let additive = ["create_notes", "append_notes"];
+        let destructive = [
+            "edit_sections", "edit_properties", "delete_notes", "rename_notes",
+            "relocate_notes", "sync_vault",
+        ];
+        // Only sync_vault reaches an external git remote.
+        let open_world = ["sync_vault"];
+
+        let tools = MdServer::base_router() + MdServer::sync_router();
+        let tools = tools.list_all();
+        for name in read_only.iter().chain(&additive).chain(&destructive) {
+            let t = tools
+                .iter()
+                .find(|t| t.name == *name)
+                .unwrap_or_else(|| panic!("tool {name} not registered"));
+            let a = t
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("tool {name} has no annotations"));
+
+            let expect_read_only = read_only.contains(name);
+            assert_eq!(
+                a.read_only_hint,
+                Some(expect_read_only),
+                "{name} read_only_hint"
+            );
+            // destructive_hint is meaningful only for writers.
+            if !expect_read_only {
+                let expect_destructive = destructive.contains(name);
+                assert_eq!(
+                    a.destructive_hint,
+                    Some(expect_destructive),
+                    "{name} destructive_hint"
+                );
+            }
+            assert_eq!(
+                a.open_world_hint,
+                Some(open_world.contains(name)),
+                "{name} open_world_hint"
+            );
+        }
+    }
 }
