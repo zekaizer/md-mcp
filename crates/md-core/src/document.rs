@@ -294,7 +294,7 @@ impl Document {
 }
 
 /// A `Vec` of `(start, end)` byte spans, one per line, including the trailing `\n`.
-fn line_spans(source: &str) -> Vec<(usize, usize)> {
+pub(crate) fn line_spans(source: &str) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut start = 0;
     for (i, b) in source.bytes().enumerate() {
@@ -327,14 +327,14 @@ fn detect_frontmatter(source: &str, lines: &[(usize, usize)]) -> (Option<Span>, 
 }
 
 #[derive(Clone, Copy)]
-struct Fence {
+pub(crate) struct Fence {
     ch: u8,
     len: usize,
 }
 
 impl Fence {
     /// If `trimmed` (indent already stripped) opens a fenced code block, return it.
-    fn opens(trimmed: &str) -> Option<Fence> {
+    pub(crate) fn opens(trimmed: &str) -> Option<Fence> {
         let bytes = trimmed.as_bytes();
         let ch = *bytes.first()?;
         if ch != b'`' && ch != b'~' {
@@ -353,7 +353,7 @@ impl Fence {
 
     /// Whether `trimmed` closes this fence: a run of ≥`len` of the same char,
     /// then only whitespace.
-    fn closes(self, trimmed: &str) -> bool {
+    pub(crate) fn closes(self, trimmed: &str) -> bool {
         let run = trimmed.bytes().take_while(|&b| b == self.ch).count();
         run >= self.len && trimmed[run..].trim().is_empty()
     }
