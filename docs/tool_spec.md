@@ -302,7 +302,8 @@ frontmatter 편집기 — **item 하나 = (노트, key) 하나**의 atomic 단�
         "required": ["path","new_name"]
       }
     },
-    "overwrite": { "type": "boolean", "default": false }
+    "overwrite": { "type": "boolean", "default": false },
+    "dry_run": { "type": "boolean", "default": false }
   },
   "required": ["renames"]
 }
@@ -324,7 +325,8 @@ frontmatter 편집기 — **item 하나 = (노트, key) 하나**의 atomic 단�
         "required": ["source","dest_dir"]
       }
     },
-    "overwrite": { "type": "boolean", "default": false }
+    "overwrite": { "type": "boolean", "default": false },
+    "dry_run": { "type": "boolean", "default": false }
   },
   "required": ["moves"]
 }
@@ -339,11 +341,14 @@ frontmatter 편집기 — **item 하나 = (노트, key) 하나**의 atomic 단�
 
 이름 변경 + 이동 동시 작업은 `relocate_notes` → `rename_notes` 2콜(각각 all-or-nothing이라 한 콜로 못 묶음). markdown 상대 링크 `[..](path.md)`는 이동으로 깨질 수 있음 — 링크 자동 갱신은 §4 참조.
 
+**`dry_run` (rename/relocate/delete 공통)**: `dry_run: true`면 all-or-nothing 검증(§4)을 전부 수행하되 아무것도 쓰지 않는다 — 통과 시 계획된 결과(`renamed`/`moved`/`deleted`)를, 거부 시 위반 전수를 평소와 같은 envelope으로 반환하고, 응답에 `dry_run: true`를 에코해 실제 적용과 구분한다. `delete_notes`의 dry-run `trashed_to`는 현재 기준 예정 위치라 실제 실행 시 uniquifier(`.n`)가 달라질 수 있다. event journal·auto-commit은 발생하지 않는다.
+
 ### delete_notes (파괴적 · all-or-nothing)
 ```json
 {
   "properties": {
-    "paths": { "type": "array", "items": { "type": "string" } }
+    "paths": { "type": "array", "items": { "type": "string" } },
+    "dry_run": { "type": "boolean", "default": false }
   },
   "required": ["paths"]
 }

@@ -113,6 +113,9 @@ fn check_move_collisions(pairs: &[(usize, String, String)], errors: &mut Vec<Api
 pub struct DeleteNotesRequest {
     #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
     pub paths: Vec<String>,
+    /// Validate and report what would happen without writing anything.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -123,6 +126,9 @@ pub struct DeleteNotesResponse {
     pub deleted: Vec<DeletedItem>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
+    /// True when this was a dry run: nothing was written.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
     /// Present while git sync is failing (ADR-0019); see sync_vault.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_warning: Option<String>,
@@ -142,6 +148,9 @@ pub struct RenameNotesRequest {
     pub renames: Vec<RenameItem>,
     #[serde(default)]
     pub overwrite: bool,
+    /// Validate and report what would happen without writing anything.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
@@ -159,6 +168,9 @@ pub struct RelocateNotesRequest {
     pub moves: Vec<RelocateItem>,
     #[serde(default)]
     pub overwrite: bool,
+    /// Validate and report what would happen without writing anything.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
@@ -178,6 +190,9 @@ pub struct MoveResponse {
     pub moved: Vec<MovedItem>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
+    /// True when this was a dry run: nothing was written.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
     /// Present while git sync is failing (ADR-0019); see sync_vault.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_warning: Option<String>,
@@ -191,6 +206,9 @@ pub struct RenameResponse {
     pub renamed: Vec<MovedItem>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
+    /// True when this was a dry run: nothing was written.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
     /// Present while git sync is failing (ADR-0019); see sync_vault.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_warning: Option<String>,
@@ -207,7 +225,7 @@ pub struct MovedItem {
 impl MdServer {
     /// Delete notes or directories (to a recoverable trash). All-or-nothing.
     #[tool(
-        description = "Delete notes (or directories ending in /) to a recoverable trash. All-or-nothing: a missing path, the vault root, or two overlapping targets reject the whole batch and nothing is deleted. Returns each item's trash location."
+        description = "Delete notes (or directories ending in /) to a recoverable trash. All-or-nothing: a missing path, the vault root, or two overlapping targets reject the whole batch and nothing is deleted. Returns each item's trash location. dry_run:true validates and returns the planned outcome (or every rejection) without deleting."
     )]
     pub async fn delete_notes(
         &self,
@@ -215,14 +233,14 @@ impl MdServer {
     ) -> Result<Json<DeleteNotesResponse>, ErrorData> {
         batch_limit(req.paths.len())?;
         let _guard = self.lock().write().await;
-        let mut r = self.run_delete(&req.paths).await;
+        let mut r = self.run_delete(&req.paths, req.dry_run).await;
         r.sync_warning = self.sync_warning();
         Ok(Json(r))
     }
 
     /// Rename a note or directory in place (same parent). All-or-nothing.
     #[tool(
-        description = "Rename notes or directories in place (same parent, basename only; new_name must not contain '/'). A note keeps its .md extension. All-or-nothing: collisions (without overwrite) or in-batch swaps reject the whole batch."
+        description = "Rename notes or directories in place (same parent, basename only; new_name must not contain '/'). A note keeps its .md extension. All-or-nothing: collisions (without overwrite) or in-batch swaps reject the whole batch. dry_run:true validates and returns the planned outcome without renaming."
     )]
     pub async fn rename_notes(
         &self,
@@ -230,18 +248,19 @@ impl MdServer {
     ) -> Result<Json<RenameResponse>, ErrorData> {
         batch_limit(req.renames.len())?;
         let _guard = self.lock().write().await;
-        let r = self.run_rename(&req.renames, req.overwrite).await;
+        let r = self.run_rename(&req.renames, req.overwrite, req.dry_run).await;
         Ok(Json(RenameResponse {
             ok: r.ok,
             renamed: r.moved,
             errors: r.errors,
+            dry_run: r.dry_run,
             sync_warning: self.sync_warning(),
         }))
     }
 
     /// Move notes or directories into a destination directory. All-or-nothing.
     #[tool(
-        description = "Relocate notes or directories into dest_dir (ends with /), keeping the basename; multiple items may target one directory. All-or-nothing: collisions (without overwrite), moving a directory into its own subtree, or in-batch overlaps reject the whole batch."
+        description = "Relocate notes or directories into dest_dir (ends with /), keeping the basename; multiple items may target one directory. All-or-nothing: collisions (without overwrite), moving a directory into its own subtree, or in-batch overlaps reject the whole batch. dry_run:true validates and returns the planned destinations without moving."
     )]
     pub async fn relocate_notes(
         &self,
@@ -249,14 +268,14 @@ impl MdServer {
     ) -> Result<Json<MoveResponse>, ErrorData> {
         batch_limit(req.moves.len())?;
         let _guard = self.lock().write().await;
-        let mut r = self.run_relocate(&req.moves, req.overwrite).await;
+        let mut r = self.run_relocate(&req.moves, req.overwrite, req.dry_run).await;
         r.sync_warning = self.sync_warning();
         Ok(Json(r))
     }
 }
 
 impl MdServer {
-    async fn run_delete(&self, paths: &[String]) -> DeleteNotesResponse {
+    async fn run_delete(&self, paths: &[String], dry_run: bool) -> DeleteNotesResponse {
         let mut errors = Vec::new();
         for (i, p) in paths.iter().enumerate() {
             if let Err(e) = Vault::validate_rel(p) {
@@ -289,6 +308,24 @@ impl MdServer {
                 ok: false,
                 deleted: vec![],
                 errors,
+                dry_run,
+                sync_warning: None,
+            };
+        }
+        if dry_run {
+            // Validation passed; report the plan without touching the vault.
+            let deleted = paths
+                .iter()
+                .map(|p| DeletedItem {
+                    path: p.clone(),
+                    trashed_to: self.vault().planned_trash_path(p),
+                })
+                .collect();
+            return DeleteNotesResponse {
+                ok: true,
+                deleted,
+                errors: vec![],
+                dry_run: true,
                 sync_warning: None,
             };
         }
@@ -318,6 +355,7 @@ impl MdServer {
                     ok: true,
                     deleted,
                     errors: vec![],
+                    dry_run: false,
                     sync_warning: None,
                 }
             }
@@ -325,12 +363,18 @@ impl MdServer {
                 ok: false,
                 deleted: vec![],
                 errors: vec![ApiError::from_core(&e)],
+                dry_run: false,
                 sync_warning: None,
             },
         }
     }
 
-    async fn run_rename(&self, renames: &[RenameItem], overwrite: bool) -> MoveResponse {
+    async fn run_rename(
+        &self,
+        renames: &[RenameItem],
+        overwrite: bool,
+        dry_run: bool,
+    ) -> MoveResponse {
         let mut errors = Vec::new();
         let mut pairs: Vec<(usize, String, String)> = Vec::new();
 
@@ -368,12 +412,18 @@ impl MdServer {
             "rename_notes",
             pairs,
             errors,
+            dry_run,
             serde_json::json!({"renames": renames, "overwrite": overwrite}),
         )
         .await
     }
 
-    async fn run_relocate(&self, moves: &[RelocateItem], overwrite: bool) -> MoveResponse {
+    async fn run_relocate(
+        &self,
+        moves: &[RelocateItem],
+        overwrite: bool,
+        dry_run: bool,
+    ) -> MoveResponse {
         let mut errors = Vec::new();
         let mut pairs: Vec<(usize, String, String)> = Vec::new();
 
@@ -404,6 +454,7 @@ impl MdServer {
             "relocate_notes",
             pairs,
             errors,
+            dry_run,
             serde_json::json!({"moves": moves, "overwrite": overwrite}),
         )
         .await
@@ -512,6 +563,7 @@ impl MdServer {
         tool: &str,
         pairs: Vec<(usize, String, String)>,
         mut errors: Vec<ApiError>,
+        dry_run: bool,
         args: serde_json::Value,
     ) -> MoveResponse {
         check_move_collisions(&pairs, &mut errors);
@@ -521,6 +573,21 @@ impl MdServer {
                 ok: false,
                 moved: vec![],
                 errors,
+                dry_run,
+                sync_warning: None,
+            };
+        }
+        if dry_run {
+            // Validation passed; report the plan without touching the vault.
+            let moved = pairs
+                .into_iter()
+                .map(|(_, from, to)| MovedItem { from, to })
+                .collect();
+            return MoveResponse {
+                ok: true,
+                moved,
+                errors: vec![],
+                dry_run: true,
                 sync_warning: None,
             };
         }
@@ -552,6 +619,7 @@ impl MdServer {
                     ok: true,
                     moved,
                     errors: vec![],
+                    dry_run: false,
                     sync_warning: None,
                 }
             }
@@ -559,6 +627,7 @@ impl MdServer {
                 ok: false,
                 moved: vec![],
                 errors: vec![ApiError::from_core(&e)],
+                dry_run: false,
                 sync_warning: None,
             },
         }
@@ -586,6 +655,7 @@ mod tests {
         let bad = s
             .delete_notes(Parameters(DeleteNotesRequest {
                 paths: vec!["a.md".into(), "missing.md".into()],
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -596,6 +666,7 @@ mod tests {
         let ok = s
             .delete_notes(Parameters(DeleteNotesRequest {
                 paths: vec!["a.md".into()],
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -603,6 +674,90 @@ mod tests {
         assert!(ok.ok);
         assert!(ok.deleted[0].trashed_to.starts_with(".md-mcp/trash/"));
         assert!(!s.vault().exists("a.md").unwrap());
+    }
+
+    #[tokio::test]
+    async fn dry_run_previews_a_valid_batch_without_writing() {
+        let (_d, s) = server(&[("업무/plan.md", "x"), ("b.md", "y")]);
+
+        // relocate --dry_run: the planned destination comes back, nothing moves.
+        let r = s
+            .relocate_notes(Parameters(RelocateNotesRequest {
+                moves: vec![RelocateItem {
+                    source: "업무/plan.md".into(),
+                    dest_dir: "02-areas/work/".into(),
+                }],
+                overwrite: false,
+                dry_run: true,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(r.ok, "{:?}", r.errors);
+        assert!(r.dry_run);
+        assert_eq!(r.moved[0].to, "02-areas/work/plan.md");
+        assert!(s.vault().exists("업무/plan.md").unwrap(), "not applied");
+        assert!(!s.vault().exists("02-areas/work/plan.md").unwrap());
+
+        // rename --dry_run: same shape, nothing renamed.
+        let r = s
+            .rename_notes(Parameters(RenameNotesRequest {
+                renames: vec![RenameItem {
+                    path: "b.md".into(),
+                    new_name: "c.md".into(),
+                }],
+                overwrite: false,
+                dry_run: true,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(r.ok, "{:?}", r.errors);
+        assert!(r.dry_run);
+        assert_eq!(r.renamed[0].to, "c.md");
+        assert!(s.vault().exists("b.md").unwrap(), "not applied");
+
+        // delete --dry_run: the planned trash location, note still present.
+        let r = s
+            .delete_notes(Parameters(DeleteNotesRequest {
+                paths: vec!["b.md".into()],
+                dry_run: true,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(r.ok, "{:?}", r.errors);
+        assert!(r.dry_run);
+        assert!(r.deleted[0].trashed_to.starts_with(".md-mcp/trash/"));
+        assert!(s.vault().exists("b.md").unwrap(), "not applied");
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_every_rejection_without_writing() {
+        // The same all-or-nothing validation runs; dry_run only skips the write.
+        let (_d, s) = server(&[("a.md", "x"), ("b.md", "y")]);
+        let r = s
+            .relocate_notes(Parameters(RelocateNotesRequest {
+                moves: vec![
+                    RelocateItem {
+                        source: "a.md".into(),
+                        dest_dir: "dst/".into(),
+                    },
+                    RelocateItem {
+                        source: "missing.md".into(),
+                        dest_dir: "dst/".into(),
+                    },
+                ],
+                overwrite: false,
+                dry_run: true,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!r.ok);
+        assert!(r.dry_run);
+        assert_eq!(r.errors[0].code, "NOT_FOUND");
+        assert!(s.vault().exists("a.md").unwrap());
     }
 
     #[tokio::test]
@@ -615,6 +770,7 @@ mod tests {
                     dest_dir: "/".into(),
                 }],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -631,6 +787,7 @@ mod tests {
                     dest_dir: "/".into(),
                 }],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -650,6 +807,7 @@ mod tests {
         let bad = s
             .delete_notes(Parameters(DeleteNotesRequest {
                 paths: vec![format!("{nfd_dir}/"), "\u{d55c}/c.md".into()],
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -671,6 +829,7 @@ mod tests {
                     },
                 ],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -698,6 +857,7 @@ mod tests {
                     new_name: nfc.into(),
                 }],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -718,6 +878,7 @@ mod tests {
                     new_name: nfd.into(),
                 }],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -739,6 +900,7 @@ mod tests {
                     new_name: "a.md".into(),
                 }],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -760,6 +922,7 @@ mod tests {
                     dest_dir: "d/".into(),
                 }],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -784,6 +947,7 @@ mod tests {
                     new_name: "e".into(),
                 }],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -798,6 +962,7 @@ mod tests {
                     dest_dir: "arch/".into(),
                 }],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -807,6 +972,7 @@ mod tests {
         let ok = s
             .delete_notes(Parameters(DeleteNotesRequest {
                 paths: vec!["arch/e/".into()],
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -824,6 +990,7 @@ mod tests {
                     new_name: "renamed.md".into(),
                 }],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -840,6 +1007,7 @@ mod tests {
                     new_name: "sub/x.md".into(),
                 }],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -857,6 +1025,7 @@ mod tests {
                     dest_dir: "archive/".into(),
                 }],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -884,6 +1053,7 @@ mod tests {
                     },
                 ],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -903,6 +1073,7 @@ mod tests {
                     new_name: "still-ghost.md".into(),
                 }],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -922,6 +1093,7 @@ mod tests {
                     dest_dir: "archive/".into(),
                 }],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()
@@ -950,6 +1122,7 @@ mod tests {
                     },
                 ],
                 overwrite: false,
+                dry_run: false,
             }))
             .await
             .unwrap()

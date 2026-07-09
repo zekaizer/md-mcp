@@ -351,6 +351,13 @@ impl Vault {
         Ok(())
     }
 
+    /// Where a delete of `path` would land in the trash right now. Read-only
+    /// probing (for dry runs); the real commit re-probes, so a concurrent
+    /// trash landing may shift the final name by a `.n` suffix.
+    pub fn planned_trash_path(&self, path: &str) -> String {
+        self.unique_trash_path(path)
+    }
+
     fn unique_trash_path(&self, path: &str) -> String {
         let base = format!("{TRASH_DIR}/{path}");
         if !self.dir().exists(&base) {
