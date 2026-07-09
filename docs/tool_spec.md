@@ -356,6 +356,8 @@ frontmatter 편집기 — **item 하나 = (노트, key) 하나**의 atomic 단�
 ```
 `MD_GIT_SYNC=1`로 기동했고 preflight(git binary 존재, vault root == repo toplevel)를 통과한 경우에만 노출되는 git 동기화 도구([ADR-0016](adr/0016-git-sync-integration.md)). 시퀀스: fetch(락 밖) → write guard + flock 아래 { 로컬 dirty 일괄 commit, upstream 위로 rebase } → push(락 밖), non-fast-forward push는 fetch부터 1회 재시도. 출력: `{ status: "clean"|"conflict", pulled, pushed, conflicts:[path…] }`. **conflict는 오류가 아니라 정상 결말** — rebase를 abort해 vault를 원상 복구하고 conflict marker는 절대 노트에 남기지 않으며, 해소는 에이전트/사용자 몫. MCP error는 git 실행 실패(binary 부재, 인증 실패 등)에만 쓴다. pull로 들어온 변경은 event journal에 `tool:"sync_vault"` 레코드로 발행된다(ADR-0017). 자동화 계층(per-batch auto-commit·debounced push·interval sync)은 [ADR-0018](adr/0018-git-automation.md).
 
+**커밋 모델** ([ADR-0018](adr/0018-git-automation.md)): `MD_GIT_AUTO_COMMIT=1`이면 **모든 쓰기 배치가 착지 즉시 별도 커밋**이 된다 — path-scoped(`git add -- <touched paths>`, `-A` 아님), 메시지는 `mcp(<tool>): <n> notes`. 따라서 `sync_vault`의 sweep 커밋(`mcp(sync): checkpoint`, `add -A`)에는 **mcp 밖에서 만든 외부 편집만** 담기고, 쓰기 직후의 `status:"clean"`·`pushed:0`은 "변경이 유실됨"이 아니라 "이미 커밋(및 auto-push)됨"을 뜻한다. dot-디렉토리는 `.git/info/exclude`(`.md-mcp/`·`.*/`)로 sweep에서도 제외된다 — listing의 숨김 규칙과 동일 경계. 커밋 메시지는 자동 생성만 지원(호출자 지정 메시지는 미지원).
+
 ---
 
 ## 4. 설계 고려사항 (구현 시 필수)
