@@ -303,7 +303,8 @@ frontmatter 편집기 — **item 하나 = (노트, key) 하나**의 atomic 단�
       }
     },
     "overwrite": { "type": "boolean", "default": false },
-    "dry_run": { "type": "boolean", "default": false }
+    "dry_run": { "type": "boolean", "default": false },
+    "update_links": { "type": "boolean", "default": false }
   },
   "required": ["renames"]
 }
@@ -327,7 +328,8 @@ frontmatter 편집기 — **item 하나 = (노트, key) 하나**의 atomic 단�
     },
     "overwrite": { "type": "boolean", "default": false },
     "dry_run": { "type": "boolean", "default": false },
-    "prune_empty": { "type": "boolean", "default": false }
+    "prune_empty": { "type": "boolean", "default": false },
+    "update_links": { "type": "boolean", "default": false }
   },
   "required": ["moves"]
 }
@@ -340,7 +342,9 @@ frontmatter 편집기 — **item 하나 = (노트, key) 하나**의 atomic 단�
 - 충돌(`dest_dir`에 동일 이름 존재) + overwrite:false → batch 전체 거부(merge 아님).
 - 출력(성공): `{ moved: [{ from, to }] }` — `to`=`dest_dir` + basename(디렉토리 대상이면 `/`로 끝남). 체이닝(예: 이동 후 rename)에 이 `to`를 그대로 쓴다.
 
-이름 변경 + 이동 동시 작업은 `relocate_notes` → `rename_notes` 2콜(각각 all-or-nothing이라 한 콜로 못 묶음). markdown 상대 링크 `[..](path.md)`는 이동으로 깨질 수 있음 — 링크 자동 갱신은 §4 참조.
+이름 변경 + 이동 동시 작업은 `relocate_notes` → `rename_notes` 2콜(각각 all-or-nothing이라 한 콜로 못 묶음). markdown 상대 링크 `[..](path.md)`는 이동으로 깨질 수 있음 — `update_links: true`로 자동 갱신(아래·§4 참조).
+
+**`update_links` (rename/relocate 공통, [ADR-0022](adr/0022-link-rewrite-on-move.md))**: `update_links: true`면 표준 Markdown 링크(inline `[..](path)`·이미지 `![..](path)`·reference 정의 `[label]: path`)를 vault 전수 스캔으로 찾아, 이 배치가 옮긴 노트를 가리키는 **inbound** 링크와 옮겨진 노트 자신의 상대 **outbound** 링크를 함께 재작성한다. 링크 해석은 노트 기준 상대(root-절대 `/a/b.md`는 vault root 기준)이며, `#fragment`/`?query`/title·절대/`<angle>` 형태는 보존된다. 재작성은 move와 **같은 트랜잭션**(all-or-nothing, 동일 auto-commit)이고, 고쳐진 노트는 `relinked: [path…]`(배치 후 경로)로 보고된다. wikilink `[[..]]`·scheme URL·code block/span 안은 건드리지 않는다. frontmatter는 재작성 대상이 아니다. 인덱스는 없다 — 배치당 1회 전수 스캔이며 성능 카운터(`notes_total`/`candidates`/`rewritten`/`elapsed_us`)가 서버 로그(`update_links scan`)로 남는다. `dry_run`과 조합하면 재작성 계획을 쓰기 없이 미리 본다. `delete_notes`엔 없다(유효한 새 대상이 없음).
 
 **`prune_empty` (relocate/delete 공통)**: `prune_empty: true`면 성공한 배치가 **비워 놓은** source 디렉터리를 부모 방향으로 거슬러 올라가며 정리하고 `pruned: [dir/…]`로 보고한다. `remove_dir(2)` 기반이라 내용이 남은 디렉터리는 절대 지우지 못하며(안전 내장), 배치 전부터 비어 있던 무관한 디렉터리는 건드리지 않는다(source의 조상만 후보). rename은 같은 부모 안이라 대상 아님. best-effort — prune 실패는 배치 성공에 영향 없다. 빈 디렉터리 *생성*은 제공하지 않는다: git이 빈 디렉터리를 추적하지 못해 sync로 전파되지 않으므로, 필요하면 placeholder 노트를 만든다.
 
@@ -382,7 +386,7 @@ frontmatter 편집기 — **item 하나 = (노트, key) 하나**의 atomic 단�
 - **줄바꿈·인코딩**: 파싱은 LF·CRLF 모두 인식, **write는 항상 LF(`\n`)로 정규화**(CRLF·혼재를 LF로 통일). frontmatter "원본 byte 보존"도 줄바꿈은 LF 기준. 파일 인코딩 UTF-8.
 - **content_hash 정의·출처**: **대상 섹션의 content**(대상 heading 라인 제외, **LF 정규화한 canonical 형태** — CRLF/LF 차이로 false conflict가 나지 않게)를 주어진 `scope`로 해석한 해시(예: SHA-256). **노트 전체 파일 해시 개념은 없다.** **scope 의존** — `scope=body`면 lead 본문만, `section`이면 하위 subsection 포함 범위로 해시하므로, read와 edit의 `scope`가 같아야 `expected_hash`가 일치한다. 섹션 단위라 겹치지 않는 섹션(또는 body vs subsection)을 동시 편집해도 false conflict가 없다. **생산처는 `read_sections`(읽은 섹션)와 `edit_sections`(편집 후 섹션)**, **소비처는 `edit_sections`의 `expected_hash`**. 빈 `heading_path`(노트 전체 body)도 하나의 섹션으로 취급. `read_notes`·`read_outlines`·`create`/`append`·`edit_properties`는 hash와 무관 — frontmatter는 섹션이 아니므로 `edit_properties`엔 optimistic concurrency가 없다(last-write-wins).
 - **조건부 필수(서버 검증)**: JSON Schema로 표현이 어려운 조건부 필수는 서버가 강제한다 — `edit_sections`는 `operation`이 replace/append/insert_*면 `content`, `rename`이면 `new_heading`, `move`면 `destination` 누락을 거부(`delete`는 추가 필드 없음). `edit_properties`는 `value` 필드 유무로 set/remove를 가르며(생략=제거), 이 "필드 부재" 의미를 서버가 명시적으로 해석한다. `search_notes`는 `query`·`frontmatter`·`frontmatter_exists` 중 최소 하나가 없으면 거부.
-- **상대 링크 무결성(범위 밖·후속)**: `rename_notes`·`relocate_notes`는 노트 경로를 바꿔 markdown 상대 링크 `[..](path.md)`를 깨뜨릴 수 있다. 링크 자동 갱신은 현 spec 범위 밖(후속 옵션) — 두 도구가 §4의 이 항목을 참조한다.
+- **상대 링크 무결성**: `rename_notes`·`relocate_notes`는 노트 경로를 바꿔 markdown 상대 링크 `[..](path.md)`를 깨뜨릴 수 있다. opt-in `update_links: true`가 표준 Markdown 링크를 배치와 원자적으로 재작성한다([ADR-0022](adr/0022-link-rewrite-on-move.md)); 기본값(false)에서는 종전대로 링크가 깨질 수 있다. wikilink는 여전히 범위 밖.
 - **콜 간 비원자성**: 여러 도구 호출에 걸친 트랜잭션은 없다 — `relocate_notes`→`rename_notes` 2콜 중 후자가 실패해도 전자는 이미 적용된다. 각 콜이 결과를 보고하므로 에이전트가 부분완료를 감지·복구해야 한다. 무인 대규모 재구성이 필요해지면 별도 `begin/commit_transaction`을 후속 ADR로 검토.
 - **토큰 비용 통제**: `list_notes`/`search_notes`에 limit 강제 + cursor paging. 본문 전체 반환은 read 계열로 한정. 큰 노트는 `read_outlines`→`read_sections` 경로 유도. 본문 반환 응답이 과대하면 도구가 **item 단위로** 잘라 빠진 index를 `omitted:[…]`로 보고(반환된 item은 완전 — content 중간 절단 금지). item당 content 크기·단일 노트 heading 수에도 서버 상한을 둬 단일 거대 입력/출력을 막는다. **쓰기 측 per-item 상한**: create/append/edit_sections/edit_properties는 기록될 노트가 서버 상한(`MAX_WRITE_BYTES`)을 넘으면 `TOO_LARGE`로 거부한다 — 비파괴 도구는 per-item, 파괴적 도구는 all-or-nothing. append는 결과 노트 크기 기준이라 반복 append의 무한 성장도 막는다.
 - **Cursor 안정성**: paging 정렬 기준을 고정(list=path 사전순, search=content score 있으면 score·없으면 path 사전순)해야 cursor가 중복·누락 없이 이어진다. cursor는 정렬 기준 위치를 인코딩한 opaque 문자열. vault 변경 중 paging은 best-effort(중간 삽입/삭제까지 보장하지 않음)임을 명시.
