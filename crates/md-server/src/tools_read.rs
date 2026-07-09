@@ -494,7 +494,7 @@ mod tests {
         assert_eq!(s.note_exists, Some(true));
         assert!(s.found);
         assert_eq!(s.content.as_deref(), Some("lead\n"));
-        assert_eq!(s.content_hash.unwrap().len(), 64);
+        assert_eq!(s.content_hash.unwrap().len(), 8);
     }
 
     #[test]

@@ -46,13 +46,16 @@ impl Document {
         self.content_span(index, scope).of(source)
     }
 
-    /// The `content_hash` of a section at `scope`: blake3 of its LF-normalized
-    /// content bytes, as 64-char lowercase hex.
+    /// The `content_hash` of a section at `scope`: the first 8 hex chars of the
+    /// blake3 digest of its LF-normalized content bytes. This is an
+    /// optimistic-concurrency tag, not a security hash — 32 bits is ample to
+    /// detect a section that changed under a concurrent edit, and the short form
+    /// keeps the value cheap to carry through a model and copy back verbatim.
     #[must_use]
     pub fn content_hash(&self, source: &str, index: Option<usize>, scope: Scope) -> String {
         let span = self.content_span(index, scope);
         let bytes = normalize_newlines(span.of(source));
-        blake3::hash(bytes.as_bytes()).to_hex().to_string()
+        blake3::hash(bytes.as_bytes()).to_hex().as_str()[..8].to_string()
     }
 }
 
@@ -72,9 +75,9 @@ mod tests {
     }
 
     #[test]
-    fn hash_is_64_char_hex() {
+    fn hash_is_8_char_hex() {
         let h = hash_of("# A\nbody\n", &["A"], Scope::Section);
-        assert_eq!(h.len(), 64);
+        assert_eq!(h.len(), 8);
         assert!(
             h.bytes()
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
@@ -135,7 +138,7 @@ mod tests {
         let read = doc
             .section_content(src, Some(i), Scope::Section)
             .to_string();
-        let standalone = blake3::hash(read.as_bytes()).to_hex().to_string();
+        let standalone = blake3::hash(read.as_bytes()).to_hex().as_str()[..8].to_string();
         assert_eq!(doc.content_hash(src, Some(i), Scope::Section), standalone);
     }
 }
