@@ -60,7 +60,18 @@ backlog() {
 build_and_install() {
     echo "building release binary in $REPO ..."
     # Build as the invoking (non-root) user so target/ ownership stays sane.
-    sudo -u "${SUDO_USER:-$USER}" cargo build --release --manifest-path "$REPO/Cargo.toml"
+    # sudo resets PATH to secure_path, which drops ~/.cargo/bin, so a bare
+    # `cargo` is "command not found". Resolve cargo under the user's home and
+    # hand the rustup shim its HOME so it can locate the toolchain.
+    local user home cargo
+    user="${SUDO_USER:-$USER}"
+    home="$(getent passwd "$user" | cut -d: -f6)"
+    cargo="$home/.cargo/bin/cargo"
+    [ -x "$cargo" ] || cargo="$(sudo -u "$user" -i sh -c 'command -v cargo' 2>/dev/null)"
+    [ -n "$cargo" ] && [ -x "$cargo" ] \
+        || die "cargo not found for user $user (looked under $home/.cargo/bin)"
+    sudo -u "$user" env "HOME=$home" "$cargo" \
+        build --release --manifest-path "$REPO/Cargo.toml"
     if [ -x "$BIN" ]; then
         cp -f "$BIN" "$BIN.prev"
         echo "kept previous binary at $BIN.prev"
