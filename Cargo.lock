@@ -1163,7 +1163,7 @@ checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
 
 [[package]]
 name = "md-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "cap-std",
@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "md-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aho-corasick",
  "anyhow",
