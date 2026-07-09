@@ -157,6 +157,10 @@ pub struct RenameNotesRequest {
     /// Validate and report what would happen without writing anything.
     #[serde(default)]
     pub dry_run: bool,
+    /// Also rewrite standard-Markdown links so they keep pointing at the
+    /// moved notes (ADR-0022). Atomic with the batch; wikilinks untouched.
+    #[serde(default)]
+    pub update_links: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
@@ -180,6 +184,10 @@ pub struct RelocateNotesRequest {
     /// After the batch, remove source directories it left empty (ascending).
     #[serde(default)]
     pub prune_empty: bool,
+    /// Also rewrite standard-Markdown links so they keep pointing at the
+    /// moved notes (ADR-0022). Atomic with the batch; wikilinks untouched.
+    #[serde(default)]
+    pub update_links: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
@@ -202,6 +210,10 @@ pub struct MoveResponse {
     /// Directories removed because the batch emptied them (prune_empty).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pruned: Vec<String>,
+    /// Notes whose links were rewritten for this batch (update_links),
+    /// reported at their post-batch paths.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relinked: Vec<String>,
     /// True when this was a dry run: nothing was written.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
@@ -218,6 +230,10 @@ pub struct RenameResponse {
     pub renamed: Vec<MovedItem>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
+    /// Notes whose links were rewritten for this batch (update_links),
+    /// reported at their post-batch paths.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relinked: Vec<String>,
     /// True when this was a dry run: nothing was written.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
@@ -231,6 +247,13 @@ pub struct RenameResponse {
 pub struct MovedItem {
     pub from: String,
     pub to: String,
+}
+
+/// The per-batch behavior flags shared by rename and relocate.
+struct MoveOpts {
+    dry_run: bool,
+    prune_empty: bool,
+    update_links: bool,
 }
 
 #[tool_router(router = organize_router, vis = "pub(crate)")]
@@ -254,7 +277,7 @@ impl MdServer {
 
     /// Rename a note or directory in place (same parent). All-or-nothing.
     #[tool(
-        description = "Rename notes or directories in place (same parent, basename only; new_name must not contain '/'). A note keeps its .md extension. All-or-nothing: collisions (without overwrite) or in-batch swaps reject the whole batch. dry_run:true validates and returns the planned outcome without renaming."
+        description = "Rename notes or directories in place (same parent, basename only; new_name must not contain '/'). A note keeps its .md extension. All-or-nothing: collisions (without overwrite) or in-batch swaps reject the whole batch. dry_run:true validates and returns the planned outcome without renaming. update_links:true also rewrites standard-Markdown links vault-wide so they keep pointing at the renamed notes (relinked notes are reported; wikilinks untouched)."
     )]
     pub async fn rename_notes(
         &self,
@@ -263,12 +286,13 @@ impl MdServer {
         batch_limit(req.renames.len())?;
         let _guard = self.lock().write().await;
         let r = self
-            .run_rename(&req.renames, req.overwrite, req.dry_run)
+            .run_rename(&req.renames, req.overwrite, req.dry_run, req.update_links)
             .await;
         Ok(Json(RenameResponse {
             ok: r.ok,
             renamed: r.moved,
             errors: r.errors,
+            relinked: r.relinked,
             dry_run: r.dry_run,
             sync_warning: self.sync_warning(),
         }))
@@ -276,7 +300,7 @@ impl MdServer {
 
     /// Move notes or directories into a destination directory. All-or-nothing.
     #[tool(
-        description = "Relocate notes or directories into dest_dir (ends with /), keeping the basename; multiple items may target one directory. All-or-nothing: collisions (without overwrite), moving a directory into its own subtree, or in-batch overlaps reject the whole batch. dry_run:true validates and returns the planned destinations without moving. prune_empty:true also removes source directories the batch left empty (reported as pruned)."
+        description = "Relocate notes or directories into dest_dir (ends with /), keeping the basename; multiple items may target one directory. All-or-nothing: collisions (without overwrite), moving a directory into its own subtree, or in-batch overlaps reject the whole batch. dry_run:true validates and returns the planned destinations without moving. prune_empty:true also removes source directories the batch left empty (reported as pruned). update_links:true also rewrites standard-Markdown links vault-wide so they keep pointing at the moved notes (relinked notes are reported; wikilinks untouched)."
     )]
     pub async fn relocate_notes(
         &self,
@@ -285,7 +309,13 @@ impl MdServer {
         batch_limit(req.moves.len())?;
         let _guard = self.lock().write().await;
         let mut r = self
-            .run_relocate(&req.moves, req.overwrite, req.dry_run, req.prune_empty)
+            .run_relocate(
+                &req.moves,
+                req.overwrite,
+                req.dry_run,
+                req.prune_empty,
+                req.update_links,
+            )
             .await;
         r.sync_warning = self.sync_warning();
         Ok(Json(r))
@@ -406,6 +436,7 @@ impl MdServer {
         renames: &[RenameItem],
         overwrite: bool,
         dry_run: bool,
+        update_links: bool,
     ) -> MoveResponse {
         let mut errors = Vec::new();
         let mut pairs: Vec<(usize, String, String)> = Vec::new();
@@ -444,9 +475,12 @@ impl MdServer {
             "rename_notes",
             pairs,
             errors,
-            dry_run,
-            false, // a rename stays in its parent — it can never empty a dir
-            serde_json::json!({"renames": renames, "overwrite": overwrite}),
+            MoveOpts {
+                dry_run,
+                prune_empty: false, // a rename stays in its parent — it can never empty a dir
+                update_links,
+            },
+            serde_json::json!({"renames": renames, "overwrite": overwrite, "update_links": update_links}),
         )
         .await
     }
@@ -457,6 +491,7 @@ impl MdServer {
         overwrite: bool,
         dry_run: bool,
         prune_empty: bool,
+        update_links: bool,
     ) -> MoveResponse {
         let mut errors = Vec::new();
         let mut pairs: Vec<(usize, String, String)> = Vec::new();
@@ -488,9 +523,12 @@ impl MdServer {
             "relocate_notes",
             pairs,
             errors,
-            dry_run,
-            prune_empty,
-            serde_json::json!({"moves": moves, "overwrite": overwrite}),
+            MoveOpts {
+                dry_run,
+                prune_empty,
+                update_links,
+            },
+            serde_json::json!({"moves": moves, "overwrite": overwrite, "update_links": update_links}),
         )
         .await
     }
@@ -616,10 +654,14 @@ impl MdServer {
         tool: &str,
         pairs: Vec<(usize, String, String)>,
         mut errors: Vec<ApiError>,
-        dry_run: bool,
-        prune_empty: bool,
+        opts: MoveOpts,
         args: serde_json::Value,
     ) -> MoveResponse {
+        let MoveOpts {
+            dry_run,
+            prune_empty,
+            update_links,
+        } = opts;
         check_move_collisions(&pairs, &mut errors);
         if !errors.is_empty() {
             errors.sort_by_key(|e| e.index);
@@ -628,10 +670,16 @@ impl MdServer {
                 moved: vec![],
                 errors,
                 pruned: vec![],
+                relinked: vec![],
                 dry_run,
                 sync_warning: None,
             };
         }
+        let (link_ops, relinked) = if update_links && !pairs.is_empty() {
+            self.plan_link_rewrites(tool, &pairs, dry_run)
+        } else {
+            (vec![], vec![])
+        };
         if dry_run {
             // Validation passed; report the plan without touching the vault.
             let moved = pairs
@@ -643,16 +691,20 @@ impl MdServer {
                 moved,
                 errors: vec![],
                 pruned: vec![],
+                relinked,
                 dry_run: true,
                 sync_warning: None,
             };
         }
-        let ops: Vec<Op> = pairs
-            .iter()
-            .map(|(_, from, to)| Op::Move {
+        // Link rewrites go first, addressed at pre-move paths: the moves then
+        // carry the rewritten bodies, and a move that overwrites a rewritten
+        // note still wins (write-after-move would resurrect dead content).
+        let ops: Vec<Op> = link_ops
+            .into_iter()
+            .chain(pairs.iter().map(|(_, from, to)| Op::Move {
                 from: from.clone(),
                 to: to.clone(),
-            })
+            }))
             .collect();
         match self.vault().commit_batch(&ops) {
             Ok(receipt) => {
@@ -662,6 +714,7 @@ impl MdServer {
                 let moved = receipt
                     .outcomes
                     .into_iter()
+                    .filter(|o| matches!(o, OpOutcome::Moved { .. }))
                     .zip(&pairs)
                     .filter_map(|(o, (_, pfrom, pto))| match o {
                         OpOutcome::Moved { from, to } => Some(MovedItem {
@@ -681,6 +734,7 @@ impl MdServer {
                     moved,
                     errors: vec![],
                     pruned,
+                    relinked,
                     dry_run: false,
                     sync_warning: None,
                 }
@@ -690,10 +744,107 @@ impl MdServer {
                 moved: vec![],
                 errors: vec![ApiError::from_core(&e)],
                 pruned: vec![],
+                relinked: vec![],
                 dry_run: false,
                 sync_warning: None,
             },
         }
+    }
+
+    /// Plan the `update_links` rewrites for a validated batch: one full vault
+    /// scan (ADR-0022 — no index), returning `Op::Write`s at pre-move paths
+    /// plus the rewritten notes' post-batch paths for the response.
+    ///
+    /// Scan shape: every note is read once; a byte-level pre-filter (link
+    /// punctuation, plus a moved basename for notes the batch doesn't move)
+    /// rejects most notes before the CommonMark extractor runs. An unreadable
+    /// note is skipped with a warning rather than sinking the batch.
+    fn plan_link_rewrites(
+        &self,
+        tool: &str,
+        pairs: &[(usize, String, String)],
+        dry_run: bool,
+    ) -> (Vec<Op>, Vec<String>) {
+        use md_core::relink::MoveMap;
+
+        let started = std::time::Instant::now();
+        let map = MoveMap::new(
+            &pairs
+                .iter()
+                .map(|(_, f, t)| (f.clone(), t.clone()))
+                .collect::<Vec<_>>(),
+        );
+        // Pre-filter needles: a link to a moved path must spell its basename,
+        // raw or with the common %20 space encoding. Moved notes themselves
+        // bypass this (their own outbound links can point anywhere).
+        let needles: Vec<String> = pairs
+            .iter()
+            .flat_map(|(_, from, _)| {
+                let base = basename(from).to_string();
+                let encoded = base.replace(' ', "%20");
+                if encoded == base {
+                    vec![base]
+                } else {
+                    vec![base, encoded]
+                }
+            })
+            .collect();
+
+        let entries = match self.vault().list_entries("", true, None, false) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "update_links: vault listing failed; skipping rewrites");
+                return (vec![], vec![]);
+            }
+        };
+        let notes_total = entries.len();
+        let mut candidates = 0usize;
+        let mut ops = Vec::new();
+        let mut relinked = Vec::new();
+        for entry in entries {
+            let old_path = entry.path;
+            let new_path = map.apply(&old_path).unwrap_or_else(|| old_path.clone());
+            let source = match self.vault().read_note(&old_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(path = %old_path, error = %e, "update_links: unreadable note skipped");
+                    continue;
+                }
+            };
+            if !(source.contains("](") || source.contains("]:")) {
+                continue;
+            }
+            if old_path == new_path && !needles.iter().any(|n| source.contains(n.as_str())) {
+                continue;
+            }
+            candidates += 1;
+            // Links live in the body; frontmatter is never rewritten.
+            let body_start = md_core::Document::parse(&source)
+                .frontmatter
+                .map_or(0, |s| s.end);
+            let Some(new_body) =
+                md_core::rewrite_body(&source[body_start..], &old_path, &new_path, &map)
+            else {
+                continue;
+            };
+            let content = format!("{}{}", &source[..body_start], new_body);
+            ops.push(Op::Write {
+                path: old_path,
+                content: content.into_bytes(),
+            });
+            relinked.push(new_path);
+        }
+        tracing::info!(
+            tool,
+            moves = pairs.len(),
+            notes_total,
+            candidates,
+            rewritten = relinked.len(),
+            dry_run,
+            elapsed_us = started.elapsed().as_micros() as u64,
+            "update_links scan"
+        );
+        (ops, relinked)
     }
 }
 
@@ -753,6 +904,7 @@ mod tests {
                     dest_dir: "02-areas/work/".into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: true,
                 prune_empty: false,
             }))
@@ -773,6 +925,7 @@ mod tests {
                     new_name: "c.md".into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: true,
             }))
             .await
@@ -809,6 +962,7 @@ mod tests {
                     dest_dir: "dst/".into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
                 prune_empty: true,
             }))
@@ -833,6 +987,7 @@ mod tests {
                     dest_dir: "/".into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
                 prune_empty: false,
             }))
@@ -876,6 +1031,7 @@ mod tests {
                     },
                 ],
                 overwrite: false,
+                update_links: false,
                 dry_run: true,
                 prune_empty: false,
             }))
@@ -898,6 +1054,7 @@ mod tests {
                     dest_dir: "/".into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
                 prune_empty: false,
             }))
@@ -916,6 +1073,7 @@ mod tests {
                     dest_dir: "/".into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
                 prune_empty: false,
             }))
@@ -960,6 +1118,7 @@ mod tests {
                     },
                 ],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
             }))
             .await
@@ -988,6 +1147,7 @@ mod tests {
                     new_name: nfc.into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
             }))
             .await
@@ -1009,6 +1169,7 @@ mod tests {
                     new_name: nfd.into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
             }))
             .await
@@ -1031,6 +1192,7 @@ mod tests {
                     new_name: "a.md".into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
             }))
             .await
@@ -1053,6 +1215,7 @@ mod tests {
                     dest_dir: "d/".into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
                 prune_empty: false,
             }))
@@ -1079,6 +1242,7 @@ mod tests {
                     new_name: "e".into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
             }))
             .await
@@ -1094,6 +1258,7 @@ mod tests {
                     dest_dir: "arch/".into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
                 prune_empty: false,
             }))
@@ -1124,6 +1289,7 @@ mod tests {
                     new_name: "renamed.md".into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
             }))
             .await
@@ -1141,6 +1307,7 @@ mod tests {
                     new_name: "sub/x.md".into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
             }))
             .await
@@ -1159,6 +1326,7 @@ mod tests {
                     dest_dir: "archive/".into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
                 prune_empty: false,
             }))
@@ -1188,6 +1356,7 @@ mod tests {
                     },
                 ],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
                 prune_empty: false,
             }))
@@ -1209,6 +1378,7 @@ mod tests {
                     new_name: "still-ghost.md".into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
             }))
             .await
@@ -1229,6 +1399,7 @@ mod tests {
                     dest_dir: "archive/".into(),
                 }],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
                 prune_empty: false,
             }))
@@ -1259,6 +1430,7 @@ mod tests {
                     },
                 ],
                 overwrite: false,
+                update_links: false,
                 dry_run: false,
                 prune_empty: false,
             }))
@@ -1267,5 +1439,141 @@ mod tests {
             .0;
         assert!(!collide.ok);
         assert!(collide.errors.iter().all(|e| e.code == "BATCH_COLLISION"));
+    }
+
+    // --- update_links (ADR-0022) -----------------------------------------
+
+    async fn relocate_linked(
+        s: &MdServer,
+        source: &str,
+        dest_dir: &str,
+        dry_run: bool,
+    ) -> MoveResponse {
+        s.relocate_notes(Parameters(RelocateNotesRequest {
+            moves: vec![RelocateItem {
+                source: source.into(),
+                dest_dir: dest_dir.into(),
+            }],
+            overwrite: false,
+            update_links: true,
+            dry_run,
+            prune_empty: false,
+        }))
+        .await
+        .unwrap()
+        .0
+    }
+
+    #[tokio::test]
+    async fn update_links_repoints_inbound_links_atomically() {
+        let (_d, s) = server(&[
+            ("target.md", "# T"),
+            ("linker.md", "see [t](target.md#top) and [o](other.md)"),
+            ("other.md", "no links to the target"),
+        ]);
+        let r = relocate_linked(&s, "target.md", "sub/", false).await;
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(r.relinked, ["linker.md"]);
+        assert_eq!(
+            s.vault().read_note("linker.md").unwrap(),
+            "see [t](sub/target.md#top) and [o](other.md)",
+            "moved link repointed, fragment kept, other link untouched"
+        );
+        assert_eq!(
+            s.vault().read_note("other.md").unwrap(),
+            "no links to the target"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_links_recomputes_the_moved_notes_outbound_links() {
+        let (_d, s) = server(&[("note.md", "[s](sib.md)"), ("sib.md", "y")]);
+        let r = relocate_linked(&s, "note.md", "deep/", false).await;
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(r.relinked, ["deep/note.md"]);
+        assert_eq!(
+            s.vault().read_note("deep/note.md").unwrap(),
+            "[s](../sib.md)",
+            "the moved note's own relative link is recomputed"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_links_follows_a_directory_move() {
+        let (_d, s) = server(&[("dir/x.md", "# X"), ("linker.md", "[x](dir/x.md)")]);
+        let r = relocate_linked(&s, "dir/", "archive/", false).await;
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(r.relinked, ["linker.md"]);
+        assert_eq!(
+            s.vault().read_note("linker.md").unwrap(),
+            "[x](archive/dir/x.md)"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_links_dry_run_previews_without_writing() {
+        let (_d, s) = server(&[("target.md", "# T"), ("linker.md", "[t](target.md)")]);
+        let r = relocate_linked(&s, "target.md", "sub/", true).await;
+        assert!(r.ok && r.dry_run);
+        assert_eq!(r.relinked, ["linker.md"], "the plan names the note");
+        assert_eq!(
+            s.vault().read_note("linker.md").unwrap(),
+            "[t](target.md)",
+            "nothing written on dry_run"
+        );
+        assert!(s.vault().exists("target.md").unwrap());
+    }
+
+    #[tokio::test]
+    async fn update_links_off_by_default_leaves_links_alone() {
+        let (_d, s) = server(&[("target.md", "# T"), ("linker.md", "[t](target.md)")]);
+        let r = s
+            .relocate_notes(Parameters(RelocateNotesRequest {
+                moves: vec![RelocateItem {
+                    source: "target.md".into(),
+                    dest_dir: "sub/".into(),
+                }],
+                overwrite: false,
+                update_links: false,
+                dry_run: false,
+                prune_empty: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(r.ok);
+        assert!(r.relinked.is_empty());
+        assert_eq!(s.vault().read_note("linker.md").unwrap(), "[t](target.md)");
+    }
+
+    #[tokio::test]
+    async fn update_links_works_for_rename_and_skips_frontmatter() {
+        let (_d, s) = server(&[
+            ("old.md", "# O"),
+            (
+                "linker.md",
+                "---\nurl: [f](old.md)\n---\nbody [l](old.md)\n",
+            ),
+        ]);
+        let r = s
+            .rename_notes(Parameters(RenameNotesRequest {
+                renames: vec![RenameItem {
+                    path: "old.md".into(),
+                    new_name: "new.md".into(),
+                }],
+                overwrite: false,
+                update_links: true,
+                dry_run: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(r.relinked, ["linker.md"]);
+        assert_eq!(
+            s.vault().read_note("linker.md").unwrap(),
+            "---\nurl: [f](old.md)\n---\nbody [l](new.md)\n",
+            "body link rewritten; frontmatter never touched"
+        );
     }
 }
