@@ -23,12 +23,12 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bin: md-server
-            asset: md-server-x86_64-unknown-linux-gnu
+            ext: ""
             optional: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: md-server.exe
-            asset: md-server-x86_64-pc-windows-msvc.exe
+            ext: ".exe"
             optional: true
     steps:
       - uses: actions/checkout@v4
@@ -47,5 +47,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp "target/release/${{ matrix.bin }}" "${{ matrix.asset }}"
-          gh release upload "${{ github.event.release.tag_name }}" "${{ matrix.asset }}" --clobber
+          asset="md-server-${{ github.event.release.tag_name }}-${{ matrix.target }}${{ matrix.ext }}"
+          cp "target/release/${{ matrix.bin }}" "$asset"
+          gh release upload "${{ github.event.release.tag_name }}" "$asset" --clobber
