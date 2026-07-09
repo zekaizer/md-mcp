@@ -2,15 +2,20 @@
 //! optional; see ADR-0013).
 
 use anyhow::Result;
+use clap::Parser;
 use md_core::Vault;
 use md_server::MdServer;
-use md_server::config::{Config, Transport};
+use md_server::config::{Cli, Config, Transport};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parse args first so --help/--version print and exit cleanly (clap does
+    // this before any of our setup runs).
+    let cli = Cli::parse();
+
     // Logs always go to stderr: under stdio, stdout is the JSON-RPC channel and
     // any stray write corrupts it; under HTTP, stderr is simply the safe default.
     // MD_LOG_FORMAT=json emits one flattened JSON object per line for log
@@ -32,8 +37,7 @@ async fn main() -> Result<()> {
             .init(),
     }
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let config = Config::from_env_and_args(&args)?;
+    let config = Config::from_cli(cli)?;
     let vault = Vault::open(&config.vault_dir)?;
     // Keep .md-mcp/ out of any git repo the vault lives in (ADR-0016).
     md_server::sync::ensure_git_exclude(&config.vault_dir);

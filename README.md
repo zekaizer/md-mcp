@@ -26,10 +26,13 @@ MD_VAULT=/path/to/vault target/release/md-server
 MD_VAULT=/path/to/vault target/release/md-server --stdio
 ```
 
-`MD_VAULT` (the vault directory) is required. The transport is selected by the
-`--http` / `--stdio` flag, else the `MD_TRANSPORT` env var (`http` | `stdio`),
-else HTTP. The server logs to stderr (under stdio, stdout is the JSON-RPC
-channel). See [ADR-0013](docs/adr/0013-http-transport.md).
+The vault directory is required (`--vault <dir>` or `MD_VAULT`). Every setting is
+a `--flag` that falls back to its `MD_*` env var, with precedence CLI > env >
+default ([ADR-0023](docs/adr/0023-cli-arguments-and-clap.md)); run `md-server
+--help` for the full list. The transport is selected by the `--http` / `--stdio`
+flag, else the `MD_TRANSPORT` env var (`http` | `stdio`), else HTTP. The server
+logs to stderr (under stdio, stdout is the JSON-RPC channel). See
+[ADR-0013](docs/adr/0013-http-transport.md).
 
 `MD_INTRO_NOTE` (optional) names a vault-relative note (e.g. `meta/start-here.md`)
 advertised in the MCP server instructions, so connecting agents read the vault's
@@ -45,7 +48,7 @@ log (tool, status, duration) — see
 | Variable | Default | Meaning |
 |---|---|---|
 | `MD_HTTP_ADDR` | `127.0.0.1:7654` | bind address; `0.0.0.0:…` to expose beyond loopback |
-| `MD_HTTP_TOKEN` | unset | when set, every request must send `Authorization: Bearer <token>` |
+| `MD_HTTP_TOKEN` | unset | when set, every request must send `Authorization: Bearer <token>`. For a CLI-managed secret use `--http-token-file <path>` (the token is read from the file, never passed on argv) |
 | `MD_HTTP_ALLOWED_HOSTS` | unset | comma-separated `Host` allowlist; `*` disables the guard |
 | `MD_HTTP_ALLOWED_ORIGINS` | unset | comma-separated `Origin` allowlist; `*` disables the guard |
 

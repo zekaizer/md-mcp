@@ -1,13 +1,80 @@
-//! Server configuration, read from the environment and CLI args (fail-closed).
+//! Server configuration, read from CLI args and the environment (fail-closed).
 //!
-//! Transport selection (ADR-0013): a `--http` / `--stdio` CLI flag wins; else the
-//! `MD_TRANSPORT` env var; else HTTP. The parsing and precedence are pure
+//! Arguments are parsed with clap ([ADR-0023](../../../docs/adr/0023-cli-arguments-and-clap.md)):
+//! every setting is a `--flag` whose value falls back to its `MD_*` env var, with
+//! precedence CLI > env > default. Secrets never become value flags — the bearer
+//! token stays in `MD_HTTP_TOKEN` or `--http-token-file <path>`, so it is never on
+//! argv. Transport selection (ADR-0013): a `--http` / `--stdio` flag wins; else the
+//! `MD_TRANSPORT` env var; else HTTP. The value parsing and precedence are pure
 //! functions so they are unit-testable without touching the process environment.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use clap::Parser;
+
+/// md-mcp server command line. Each option falls back to its `MD_*` env var
+/// (ADR-0023); the bearer token is env/file only, never a value flag.
+#[derive(Debug, Parser)]
+#[command(
+    name = "md-server",
+    version,
+    about = "md-mcp — an MCP server over a Markdown vault"
+)]
+pub struct Cli {
+    /// Serve MCP over Streamable HTTP (the default transport).
+    #[arg(long)]
+    pub http: bool,
+    /// Serve MCP over stdio (stdin/stdout); logs go to stderr.
+    #[arg(long, conflicts_with = "http")]
+    pub stdio: bool,
+
+    /// Vault root directory (required).
+    #[arg(long, env = "MD_VAULT")]
+    pub vault: PathBuf,
+
+    /// HTTP bind address [default: 127.0.0.1:7654].
+    #[arg(long, env = "MD_HTTP_ADDR")]
+    pub http_addr: Option<String>,
+    /// Read the HTTP bearer token from this file (trimmed). Keeps the secret
+    /// off argv; falls back to the MD_HTTP_TOKEN env var.
+    #[arg(long, value_name = "PATH")]
+    pub http_token_file: Option<PathBuf>,
+    /// Comma-separated Host allowlist ("*" disables the guard).
+    #[arg(long, env = "MD_HTTP_ALLOWED_HOSTS")]
+    pub http_allowed_hosts: Option<String>,
+    /// Comma-separated Origin allowlist ("*" disables the guard).
+    #[arg(long, env = "MD_HTTP_ALLOWED_ORIGINS")]
+    pub http_allowed_origins: Option<String>,
+    /// Server state directory (OAuth token store).
+    #[arg(long, env = "MD_STATE_DIR")]
+    pub state_dir: Option<String>,
+
+    /// Write the event journal.
+    #[arg(long, env = "MD_EVENTS")]
+    pub events: Option<String>,
+    /// Commit hook command, run per record with JSON on stdin.
+    #[arg(long, env = "MD_ON_COMMIT_HOOK")]
+    pub on_commit_hook: Option<String>,
+
+    /// Enable git sync (gates sync_vault and every automation layer).
+    #[arg(long, env = "MD_GIT_SYNC")]
+    pub git_sync: Option<String>,
+    /// Per-batch auto-commit (requires git sync).
+    #[arg(long, env = "MD_GIT_AUTO_COMMIT")]
+    pub git_auto_commit: Option<String>,
+    /// Debounced push, N seconds after the most recent commit.
+    #[arg(long, env = "MD_GIT_AUTO_PUSH_SECS")]
+    pub git_auto_push_secs: Option<String>,
+    /// Periodic full sync interval, in seconds.
+    #[arg(long, env = "MD_GIT_SYNC_INTERVAL_SECS")]
+    pub git_sync_interval_secs: Option<String>,
+
+    /// Vault-relative intro note advertised in the server instructions.
+    #[arg(long, env = "MD_INTRO_NOTE")]
+    pub intro_note: Option<String>,
+}
 
 /// Default HTTP bind address: loopback, port 7654 (an uncommon port, chosen to
 /// avoid the heavily-contended 8080/8000 band). Override with `MD_HTTP_ADDR`.
@@ -276,14 +343,10 @@ pub struct Config {
 }
 
 impl Config {
-    /// Read configuration from the environment and CLI args. `MD_VAULT` is
-    /// required; `args` is the process arguments **excluding** the program name.
-    pub fn from_env_and_args(args: &[String]) -> Result<Self> {
-        let vault_dir: PathBuf = std::env::var("MD_VAULT")
-            .context("MD_VAULT must be set to the vault directory")?
-            .into();
-
-        let cli_kind = parse_cli_transport(args)?;
+    /// Build a `Config` from parsed CLI args. The bearer token and `MD_TRANSPORT`
+    /// are read here from the file/environment (they are not value flags), so the
+    /// argv is never a channel for the secret.
+    pub fn from_cli(cli: Cli) -> Result<Self> {
         // A set-but-blank MD_TRANSPORT (e.g. `export MD_TRANSPORT=`) falls through
         // to the default rather than hard-failing.
         let env_kind = match std::env::var("MD_TRANSPORT") {
@@ -291,39 +354,36 @@ impl Config {
             _ => None,
         };
 
-        let transport = match select_transport(cli_kind, env_kind) {
+        let transport = match select_transport(cli_transport(cli.http, cli.stdio), env_kind) {
             TransportKind::Stdio => Transport::Stdio,
             TransportKind::Http => Transport::Http(HttpConfig::resolve(
-                std::env::var("MD_HTTP_ADDR").ok(),
-                std::env::var("MD_HTTP_TOKEN").ok(),
-                std::env::var("MD_HTTP_ALLOWED_HOSTS").ok(),
-                std::env::var("MD_HTTP_ALLOWED_ORIGINS").ok(),
+                cli.http_addr,
+                resolve_token(cli.http_token_file.as_deref())?,
+                cli.http_allowed_hosts,
+                cli.http_allowed_origins,
                 resolve_state_dir(
-                    std::env::var("MD_STATE_DIR").ok(),
+                    cli.state_dir,
                     std::env::var("XDG_STATE_HOME").ok(),
                     std::env::var("HOME").ok(),
                 ),
             )?),
         };
 
-        let events = EventsConfig::resolve(
-            std::env::var("MD_EVENTS").ok(),
-            std::env::var("MD_ON_COMMIT_HOOK").ok(),
-        )?;
+        let events = EventsConfig::resolve(cli.events, cli.on_commit_hook)?;
         let git = GitConfig::resolve(
-            std::env::var("MD_GIT_SYNC").ok(),
-            std::env::var("MD_GIT_AUTO_COMMIT").ok(),
-            std::env::var("MD_GIT_AUTO_PUSH_SECS").ok(),
-            std::env::var("MD_GIT_SYNC_INTERVAL_SECS").ok(),
+            cli.git_sync,
+            cli.git_auto_commit,
+            cli.git_auto_push_secs,
+            cli.git_sync_interval_secs,
         )?;
 
-        let intro_note = std::env::var("MD_INTRO_NOTE")
-            .ok()
+        let intro_note = cli
+            .intro_note
             .map(|p| p.trim().to_string())
             .filter(|p| !p.is_empty());
 
         Ok(Self {
-            vault_dir,
+            vault_dir: cli.vault,
             transport,
             events,
             git,
@@ -332,28 +392,31 @@ impl Config {
     }
 }
 
+/// Resolve the bearer token from its non-argv sources: `--http-token-file` (read
+/// and trimmed) wins over the `MD_HTTP_TOKEN` env var. A given token file that
+/// cannot be read is a hard error — never a silent fall-through to no auth.
+fn resolve_token(token_file: Option<&std::path::Path>) -> Result<Option<String>> {
+    if let Some(path) = token_file {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read --http-token-file {}", path.display()))?;
+        return Ok(Some(raw));
+    }
+    Ok(std::env::var("MD_HTTP_TOKEN").ok())
+}
+
+/// The transport a `--http` / `--stdio` flag pair selects; `None` when neither is
+/// given (clap rejects both). Env/default precedence is applied by the caller.
+fn cli_transport(http: bool, stdio: bool) -> Option<TransportKind> {
+    match (http, stdio) {
+        (_, true) => Some(TransportKind::Stdio),
+        (true, false) => Some(TransportKind::Http),
+        (false, false) => None,
+    }
+}
+
 /// Resolve the transport kind: CLI flag wins, else env, else HTTP.
 fn select_transport(cli: Option<TransportKind>, env: Option<TransportKind>) -> TransportKind {
     cli.or(env).unwrap_or(TransportKind::Http)
-}
-
-/// Parse a `--http` / `--stdio` flag out of `args`. Errors on an unknown
-/// argument or on both flags being present; `None` when neither is given.
-fn parse_cli_transport(args: &[String]) -> Result<Option<TransportKind>> {
-    let mut kind = None;
-    for arg in args {
-        let next = match arg.as_str() {
-            "--http" => TransportKind::Http,
-            "--stdio" => TransportKind::Stdio,
-            other => bail!("unknown argument {other:?} (expected --http or --stdio)"),
-        };
-        match kind {
-            None => kind = Some(next),
-            Some(prev) if prev == next => {}
-            Some(_) => bail!("--http and --stdio are mutually exclusive"),
-        }
-    }
-    Ok(kind)
 }
 
 /// Parse the `MD_TRANSPORT` value.
@@ -369,8 +432,40 @@ fn parse_transport_kind(value: &str) -> Result<TransportKind> {
 mod tests {
     use super::*;
 
-    fn args(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| (*s).to_string()).collect()
+    #[test]
+    fn cli_parses_flags_and_env_fallback() {
+        // Explicit flags win.
+        let cli = Cli::try_parse_from(["md-server", "--stdio", "--vault", "/v"]).unwrap();
+        assert!(cli.stdio && !cli.http);
+        assert_eq!(cli.vault, PathBuf::from("/v"));
+        // --http and --stdio are mutually exclusive.
+        assert!(Cli::try_parse_from(["md-server", "--http", "--stdio", "--vault", "/v"]).is_err());
+        // An unknown flag is rejected by clap.
+        assert!(Cli::try_parse_from(["md-server", "--bogus", "--vault", "/v"]).is_err());
+        // vault is required (no --vault and no MD_VAULT in this parse).
+        assert!(Cli::try_parse_from(["md-server"]).is_err());
+    }
+
+    #[test]
+    fn cli_transport_flag_maps_to_kind() {
+        assert_eq!(cli_transport(true, false), Some(TransportKind::Http));
+        assert_eq!(cli_transport(false, true), Some(TransportKind::Stdio));
+        assert_eq!(cli_transport(false, false), None);
+    }
+
+    #[test]
+    fn resolve_token_reads_file_over_env_and_errors_on_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tok");
+        std::fs::write(&path, "s3cret\n").unwrap();
+        // The file's contents come back raw (HttpConfig::resolve trims).
+        assert_eq!(
+            resolve_token(Some(&path)).unwrap().as_deref(),
+            Some("s3cret\n")
+        );
+        // No file → falls back to the env var (absent here → None).
+        // A given-but-unreadable file is a hard error, never silent no-auth.
+        assert!(resolve_token(Some(&dir.path().join("missing"))).is_err());
     }
 
     #[test]
@@ -390,30 +485,6 @@ mod tests {
 
     fn sd() -> PathBuf {
         PathBuf::from("/tmp/md-mcp-test-state")
-    }
-
-    #[test]
-    fn cli_flag_parses_each_transport() {
-        assert_eq!(
-            parse_cli_transport(&args(&["--http"])).unwrap(),
-            Some(TransportKind::Http)
-        );
-        assert_eq!(
-            parse_cli_transport(&args(&["--stdio"])).unwrap(),
-            Some(TransportKind::Stdio)
-        );
-        assert_eq!(parse_cli_transport(&args(&[])).unwrap(), None);
-    }
-
-    #[test]
-    fn cli_flag_rejects_conflicts_and_unknowns() {
-        assert!(parse_cli_transport(&args(&["--http", "--stdio"])).is_err());
-        assert!(parse_cli_transport(&args(&["--bogus"])).is_err());
-        // A repeated identical flag is harmless.
-        assert_eq!(
-            parse_cli_transport(&args(&["--http", "--http"])).unwrap(),
-            Some(TransportKind::Http)
-        );
     }
 
     #[test]

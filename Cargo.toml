@@ -62,6 +62,9 @@ unicode-normalization = "0.1"
 thiserror = "2"
 anyhow = "1"
 
+# CLI argument parsing with env fallback and --help/--version (ADR-0023).
+clap = { version = "4", features = ["derive", "env"] }
+
 # Async runtime + logging (server only). `net` for the HTTP TCP listener (ADR-0013).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 tracing = "0.1"
