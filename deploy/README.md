@@ -43,8 +43,11 @@ Quoting rules (the file feeds both shell `source` and systemd
 expanded by git at runtime, by design.
 
 The vault must be a clone of its GitHub repo with the synced branch checked
-out. The `branch.<name>.remote/merge` keys in the env file must match that
-branch (`main` in the sample).
+out and tracking its upstream. The clone's own `.git/config` supplies the
+remote and branch binding, so the env only injects the PAT credential helper —
+it must **not** re-declare `remote.origin.*` or `branch.<name>.*`, or git sees
+a duplicate `branch.<name>.merge` and refuses to push ("multiple upstream
+branches").
 
 ## 3. Service
 
