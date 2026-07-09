@@ -1,0 +1,51 @@
+name: release
+
+# Build the md-server binary and attach it to a release as soon as it is
+# published. Editing a release (or uploading its assets) does not re-trigger.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    # Windows is best-effort: a failure there must not block the release or the
+    # Linux asset (the production target).
+    continue-on-error: ${{ matrix.optional }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: md-server
+            asset: md-server-x86_64-unknown-linux-gnu
+            optional: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: md-server.exe
+            asset: md-server-x86_64-pc-windows-msvc.exe
+            optional: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Build the exact source the release tag points at, not the branch
+          # tip the event happened to fire from.
+          ref: ${{ github.event.release.tag_name }}
+
+      # rustup is preinstalled on the runners and honors rust-toolchain.toml,
+      # so the pinned channel installs automatically on first cargo invocation.
+      - name: Build release binary
+        run: cargo build --release --locked -p md-server
+
+      - name: Attach binary to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "target/release/${{ matrix.bin }}" "${{ matrix.asset }}"
+          gh release upload "${{ github.event.release.tag_name }}" "${{ matrix.asset }}" --clobber
