@@ -178,17 +178,41 @@ impl GitSync {
         if paths.is_empty() {
             return Ok(false);
         }
+        // A restructure can leave a batch path that git cannot stage: a
+        // directory whose notes were relocated out earlier is empty-in-git and
+        // gone from the worktree, so `git add -- <that path>` fails with
+        // "pathspec did not match any files" and aborts the *whole* batch. Keep
+        // only paths git can stage — present in the worktree (creates/edits) or
+        // tracked in the index (deletions) — so one vanished path never sinks a
+        // real change in the same batch.
+        let mut addable: Vec<&str> = Vec::new();
+        for p in paths {
+            let in_worktree = self.root.join(p).exists();
+            let tracked = in_worktree
+                || !self
+                    .run(&["ls-files", "--", p])
+                    .await
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty();
+            if tracked {
+                addable.push(p.as_str());
+            }
+        }
+        if addable.is_empty() {
+            return Ok(false);
+        }
         let mut args = vec!["add", "--"];
-        args.extend(paths.iter().map(String::as_str));
+        args.extend(addable.iter().copied());
         self.run(&args).await?;
         // `--cached -- <paths>` scopes the emptiness check to the batch.
         let mut check = vec!["diff", "--cached", "--quiet", "--"];
-        check.extend(paths.iter().map(String::as_str));
+        check.extend(addable.iter().copied());
         if self.output(&check).await?.status.success() {
             return Ok(false); // nothing staged for these paths
         }
         let mut commit = vec!["commit", "-m", message, "--"];
-        commit.extend(paths.iter().map(String::as_str));
+        commit.extend(addable.iter().copied());
         self.run(&commit).await?;
         Ok(true)
     }
@@ -390,5 +414,61 @@ mod tests {
             std::fs::read_to_string(dir.path().join(".git")).unwrap(),
             "gitdir: ../elsewhere\n"
         );
+    }
+
+    async fn init_repo(root: &Path) -> GitSync {
+        let git = GitSync {
+            root: root.to_path_buf(),
+        };
+        git.run(&["init", "-q"]).await.unwrap();
+        git.run(&["config", "user.email", "t@t"]).await.unwrap();
+        git.run(&["config", "user.name", "t"]).await.unwrap();
+        git
+    }
+
+    /// A restructure can leave a batch path that git cannot stage: a directory
+    /// whose notes were relocated out earlier is empty-in-git and absent from
+    /// the worktree, so `git add -- <that path>` fails with "pathspec did not
+    /// match any files" and would abort the whole batch. The real deletion in
+    /// the same batch must still commit; the vanished path is simply skipped.
+    #[tokio::test]
+    async fn commit_paths_skips_a_vanished_pathspec() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = init_repo(dir.path()).await;
+        std::fs::write(dir.path().join("keep.md"), "keep").unwrap();
+        std::fs::write(dir.path().join("gone.md"), "gone").unwrap();
+        git.run(&["add", "-A"]).await.unwrap();
+        git.run(&["commit", "-qm", "init"]).await.unwrap();
+
+        // Delete gone.md and also target `ghost` — a path git no longer tracks.
+        std::fs::remove_file(dir.path().join("gone.md")).unwrap();
+        let created = git
+            .commit_paths("mcp(delete_notes): 2 notes", &["gone.md".into(), "ghost".into()])
+            .await
+            .expect("a vanished pathspec must not fail the whole commit");
+
+        assert!(created, "the real deletion should still be committed");
+        let log = git
+            .run(&["log", "-1", "--name-status", "--format="])
+            .await
+            .unwrap();
+        assert!(log.contains("gone.md"), "deletion not committed; log: {log}");
+    }
+
+    /// When every path in the batch has vanished, there is simply nothing to
+    /// commit — a no-op, not an error.
+    #[tokio::test]
+    async fn commit_paths_is_a_noop_when_all_paths_vanished() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = init_repo(dir.path()).await;
+        std::fs::write(dir.path().join("keep.md"), "keep").unwrap();
+        git.run(&["add", "-A"]).await.unwrap();
+        git.run(&["commit", "-qm", "init"]).await.unwrap();
+
+        let created = git
+            .commit_paths("mcp(delete_notes): 1 notes", &["ghost".into()])
+            .await
+            .expect("an all-vanished batch must not error");
+        assert!(!created, "nothing stage-able means no commit");
     }
 }
