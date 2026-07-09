@@ -11,15 +11,22 @@ use std::process::Output;
 
 use crate::events::EventOp;
 
-/// The exclusion line keeping the server's internal state out of the repo.
-const EXCLUDE_LINE: &str = ".md-mcp/";
+/// Exclusion lines keeping non-note state out of the vault repo. `.md-mcp/` is
+/// the server's own state. `.*/` mirrors the listing rule ([`listing`]) that
+/// hides every dot-*directory* (`.claude/`, `.obsidian/`, …) while keeping
+/// dot-*files*, which are legitimate notes: a trailing `/` matches directories
+/// only. Without `.*/` the sync sweep's `git add -A` would push those hidden
+/// dirs to the remote.
+const EXCLUDE_LINES: &[&str] = &[".md-mcp/", ".*/"];
 
-/// Ensure `.md-mcp/` is excluded from the vault's git repository, if one
-/// exists. Written to `.git/info/exclude` — per-machine state, unlike the
-/// user-owned, replicated `.gitignore`, which is never touched. A `.git`
-/// *file* (worktree/submodule gitfile) is left alone: resolving the real git
-/// dir is not worth it for a hardening step. Best-effort: failures are logged,
-/// never fatal — a missing exclusion degrades sync hygiene, not correctness.
+/// Ensure the [`EXCLUDE_LINES`] are present in the vault's git repository, if
+/// one exists. Written to `.git/info/exclude` — per-machine state, unlike the
+/// user-owned, replicated `.gitignore`, which is never touched. Only the
+/// missing lines are appended, so an existing repo carrying just the legacy
+/// `.md-mcp/` line gains `.*/` without churn. A `.git` *file*
+/// (worktree/submodule gitfile) is left alone: resolving the real git dir is
+/// not worth it for a hardening step. Best-effort: failures are logged, never
+/// fatal — a missing exclusion degrades sync hygiene, not correctness.
 pub fn ensure_git_exclude(vault_root: &Path) {
     let git_dir = vault_root.join(".git");
     if !git_dir.is_dir() {
@@ -27,7 +34,12 @@ pub fn ensure_git_exclude(vault_root: &Path) {
     }
     let exclude = git_dir.join("info").join("exclude");
     let current = std::fs::read_to_string(&exclude).unwrap_or_default();
-    if current.lines().any(|l| l.trim() == EXCLUDE_LINE) {
+    let missing: Vec<&str> = EXCLUDE_LINES
+        .iter()
+        .copied()
+        .filter(|line| !current.lines().any(|l| l.trim() == *line))
+        .collect();
+    if missing.is_empty() {
         return;
     }
     let appended = std::fs::create_dir_all(git_dir.join("info")).and_then(|()| {
@@ -41,10 +53,14 @@ pub fn ensure_git_exclude(vault_root: &Path) {
         } else {
             "\n"
         };
-        writeln!(f, "{lead}{EXCLUDE_LINE}")
+        write!(f, "{lead}")?;
+        for line in &missing {
+            writeln!(f, "{line}")?;
+        }
+        Ok(())
     });
     match appended {
-        Ok(()) => tracing::info!("added {EXCLUDE_LINE} to .git/info/exclude"),
+        Ok(()) => tracing::info!(added = ?missing, "updated .git/info/exclude"),
         Err(e) => tracing::warn!(error = %e, "cannot write .git/info/exclude"),
     }
 }
@@ -380,16 +396,28 @@ mod tests {
         ensure_git_exclude(dir.path());
         assert!(!dir.path().join(".git").exists());
 
-        // A repo without info/exclude: the file is created with the line.
+        // A repo without info/exclude: the file is created with both lines.
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         ensure_git_exclude(dir.path());
         let exclude = dir.path().join(".git/info/exclude");
         let text = std::fs::read_to_string(&exclude).unwrap();
-        assert_eq!(text, ".md-mcp/\n");
+        assert_eq!(text, ".md-mcp/\n.*/\n");
 
         // Idempotent: a second run appends nothing.
         ensure_git_exclude(dir.path());
-        assert_eq!(std::fs::read_to_string(&exclude).unwrap(), ".md-mcp/\n");
+        assert_eq!(std::fs::read_to_string(&exclude).unwrap(), ".md-mcp/\n.*/\n");
+    }
+
+    #[test]
+    fn migrates_a_legacy_exclude_by_appending_only_the_missing_line() {
+        // An older repo already carries the legacy `.md-mcp/` line; the sweep
+        // guard `.*/` must be added without duplicating what is present.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+        let exclude = dir.path().join(".git/info/exclude");
+        std::fs::write(&exclude, ".md-mcp/\n").unwrap();
+        ensure_git_exclude(dir.path());
+        assert_eq!(std::fs::read_to_string(&exclude).unwrap(), ".md-mcp/\n.*/\n");
     }
 
     #[test]
@@ -401,7 +429,7 @@ mod tests {
         ensure_git_exclude(dir.path());
         assert_eq!(
             std::fs::read_to_string(&exclude).unwrap(),
-            "*.tmp\n.md-mcp/\n"
+            "*.tmp\n.md-mcp/\n.*/\n"
         );
     }
 
@@ -413,6 +441,39 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join(".git")).unwrap(),
             "gitdir: ../elsewhere\n"
+        );
+    }
+
+    /// The sync sweep stages the whole worktree with `git add -A`. It must not
+    /// carry dot-directories that the tools already hide from listing (e.g.
+    /// `.claude/` local agent state) onto the remote, while dot-*files* — which
+    /// are legitimate notes — must still commit.
+    #[tokio::test]
+    async fn sweep_excludes_hidden_dot_dirs_but_keeps_dot_file_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = init_repo(dir.path()).await;
+        ensure_git_exclude(dir.path());
+
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(dir.path().join(".claude/settings.json"), "{}").unwrap();
+        std::fs::write(dir.path().join(".keep.md"), "dot-file note").unwrap();
+        std::fs::write(dir.path().join("note.md"), "note").unwrap();
+
+        let created = git.commit_all("mcp(sync): checkpoint").await.unwrap();
+        assert!(created, "the real notes make the tree dirty");
+
+        let files = git
+            .run(&["log", "-1", "--name-only", "--format="])
+            .await
+            .unwrap();
+        assert!(
+            !files.contains(".claude"),
+            "hidden dot-dir leaked into the sweep: {files}"
+        );
+        assert!(files.contains("note.md"), "note not committed: {files}");
+        assert!(
+            files.contains(".keep.md"),
+            "dot-file note must still commit: {files}"
         );
     }
 
