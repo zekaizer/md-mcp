@@ -295,10 +295,16 @@ impl ServerHandler for MdServer {
         info.server_info.name = "md-mcp".into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        let mut instructions = "md-mcp manages a single vault of pure-Markdown notes (.md + \
-             YAML frontmatter). Address notes by vault-relative path; read large notes via \
-             read_outlines then read_sections. Destructive batches are all-or-nothing."
-            .to_string();
+        // The version is in server_info too, but most clients never surface
+        // that to the model — instructions are what an agent actually reads.
+        let mut instructions = concat!(
+            "md-mcp v",
+            env!("CARGO_PKG_VERSION"),
+            " manages a single vault of pure-Markdown notes (.md + YAML frontmatter). \
+             Address notes by vault-relative path; read large notes via read_outlines \
+             then read_sections. Destructive batches are all-or-nothing."
+        )
+        .to_string();
         if let Some(intro) = &self.intro_note {
             instructions.push_str(&format!(
                 " Before working in this vault, read \"{intro}\" (via read_notes): it \
@@ -331,8 +337,8 @@ mod tests {
         );
         let instructions = info.instructions.unwrap_or_default();
         assert!(
-            instructions.contains("md-mcp"),
-            "instructions: {instructions}"
+            instructions.contains(concat!("md-mcp v", env!("CARGO_PKG_VERSION"))),
+            "instructions must carry the server version: {instructions}"
         );
     }
 
