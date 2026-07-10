@@ -58,10 +58,10 @@ def run(binary: str, t: Runner, scratch: str) -> None:
     t.check("create traversal blocked", r.get("error", {}).get("code") == "TRAVERSAL" and not os.path.exists(os.path.join(scratch, "evil.txt")))
     r = sc(c.call("append_notes", {"appends": [{"path": "../evil.md", "content": "x", "create_if_missing": True}]}))["appended"][0]
     t.check("append traversal blocked", r.get("error", {}).get("code") == "TRAVERSAL")
-    r = sc(c.call("rename_notes", {"renames": [{"path": "legit.md", "new_name": "../escaped.md"}]}))
-    t.check("rename slash blocked (SUFFIX)", not r["ok"] and r["errors"][0]["code"] == "SUFFIX")
-    r = sc(c.call("relocate_notes", {"moves": [{"source": "legit.md", "dest_dir": "../"}]}))
-    t.check("relocate '../' blocked", not r["ok"] and r["errors"][0]["code"] in ("TRAVERSAL", "DEST_NOT_DIR"))
+    r = sc(c.call("move_notes", {"moves": [{"source": "legit.md", "dest": "../escaped.md"}]}))
+    t.check("move '../' full-path blocked", not r["ok"] and r["errors"][0]["code"] == "TRAVERSAL" and not os.path.exists(os.path.join(scratch, "escaped.md")))
+    r = sc(c.call("move_notes", {"moves": [{"source": "legit.md", "dest": "../"}]}))
+    t.check("move '../' dir-target blocked", not r["ok"] and r["errors"][0]["code"] in ("TRAVERSAL", "DEST_NOT_DIR"))
     r = sc(c.call("delete_notes", {"paths": ["../secret_outside.txt"]}))
     t.check("delete traversal blocked", not r["ok"] and os.path.exists(outside))
 

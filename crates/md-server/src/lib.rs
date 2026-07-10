@@ -369,11 +369,20 @@ mod tests {
         // Clients use these hints to auto-approve reads and warn on writes.
         // Every exposed tool must classify itself; the classes below are the
         // contract, so a new unannotated tool fails the exhaustiveness check.
-        let read_only = ["list_notes", "search_notes", "read_notes", "read_outlines", "read_sections"];
+        let read_only = [
+            "list_notes",
+            "search_notes",
+            "read_notes",
+            "read_outlines",
+            "read_sections",
+        ];
         let additive = ["create_notes", "append_notes"];
         let destructive = [
-            "edit_sections", "edit_properties", "delete_notes", "rename_notes",
-            "relocate_notes", "sync_vault",
+            "edit_sections",
+            "edit_properties",
+            "delete_notes",
+            "move_notes",
+            "sync_vault",
         ];
         // Only sync_vault reaches an external git remote.
         let open_world = ["sync_vault"];

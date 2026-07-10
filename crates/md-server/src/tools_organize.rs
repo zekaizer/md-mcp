@@ -1,9 +1,9 @@
-//! Organization tools: rename_notes, relocate_notes, delete_notes.
+//! Organization tools: move_notes, delete_notes.
 //!
-//! All three are destructive and all-or-nothing: the batch is validated for path
+//! Both are destructive and all-or-nothing: the batch is validated for path
 //! safety, suffix rules, collisions, and overlap before any move, then applied
 //! through the transaction engine
-//! ([ADR-0009](../../../docs/adr/0009-delete-recovery-and-move-validation.md)).
+//! ([ADR-0024](../../../docs/adr/0024-unified-move-primitive.md)).
 
 use md_core::{Code, Error, Op, OpOutcome, Vault};
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -57,9 +57,14 @@ fn overlap(a: &str, b: &str) -> bool {
     contains(a, b) || contains(b, a)
 }
 
+/// Whether `a` strictly contains `b` (b is inside a's subtree, not equal).
+fn contains_strict(a: &str, b: &str) -> bool {
+    nfc_key(b).starts_with(&format!("{}/", nfc_key(a)))
+}
+
 /// Echo an on-disk path with the directory suffix convention: when the caller
 /// addressed a directory (trailing `/`), the echoed path ends with `/` too, so
-/// it can be fed straight back into dest_dir/path arguments.
+/// it can be fed straight back into dest/path arguments.
 fn with_dir_suffix(actual: String, requested: &str) -> String {
     if is_dir_path(requested) && !actual.ends_with('/') {
         format!("{actual}/")
@@ -77,6 +82,12 @@ fn err(index: usize, code: Code, message: impl Into<String>) -> ApiError {
 }
 
 /// Reject in-batch source/dest collisions and source overlap among move pairs.
+///
+/// A destination strictly inside another item's *destination* subtree is NOT a
+/// collision: the batch declares a final tree and the engine applies ancestor
+/// destinations first (ADR-0024). A destination inside another item's *source*
+/// subtree — a path the batch vacates — stays rejected as order-sensitive in a
+/// confusing way.
 fn check_move_collisions(pairs: &[(usize, String, String)], errors: &mut Vec<ApiError>) {
     let n = pairs.len();
     let mut bad = vec![false; n];
@@ -89,6 +100,8 @@ fn check_move_collisions(pairs: &[(usize, String, String)], errors: &mut Vec<Api
                 || nfc_key(ti) == nfc_key(fj)
                 || nfc_key(tj) == nfc_key(fi)
                 || overlap(fi, fj)
+                || contains_strict(fi, tj)
+                || contains_strict(fj, ti)
             {
                 bad[i] = true;
                 bad[j] = true;
@@ -149,33 +162,9 @@ pub struct DeletedItem {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
-pub struct RenameNotesRequest {
+pub struct MoveNotesRequest {
     #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
-    pub renames: Vec<RenameItem>,
-    #[serde(default)]
-    pub overwrite: bool,
-    /// Validate and report what would happen without writing anything.
-    #[serde(default)]
-    pub dry_run: bool,
-    /// Also rewrite standard-Markdown links so they keep pointing at the
-    /// moved notes (ADR-0022). Atomic with the batch; wikilinks untouched.
-    #[serde(default)]
-    pub update_links: bool,
-}
-
-#[derive(Debug, Deserialize, JsonSchema, Serialize)]
-#[schemars(crate = "rmcp::schemars")]
-pub struct RenameItem {
-    pub path: String,
-    /// New basename (with extension for notes); no slash — use relocate to move.
-    pub new_name: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-pub struct RelocateNotesRequest {
-    #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
-    pub moves: Vec<RelocateItem>,
+    pub moves: Vec<MoveItem>,
     #[serde(default)]
     pub overwrite: bool,
     /// Validate and report what would happen without writing anything.
@@ -192,11 +181,13 @@ pub struct RelocateNotesRequest {
 
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
-pub struct RelocateItem {
+pub struct MoveItem {
     pub source: String,
-    /// Destination directory (ends with `/`; `/` alone is the vault root);
-    /// the source basename is kept.
-    pub dest_dir: String,
+    /// Destination (ADR-0024): ending in `/` it names a directory to move
+    /// into, keeping the source basename (`/` alone is the vault root);
+    /// otherwise it is the full destination path including the new basename
+    /// (a note keeps `.md`), renaming and moving in one step.
+    pub dest: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -224,32 +215,12 @@ pub struct MoveResponse {
 
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
-pub struct RenameResponse {
-    pub ok: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub renamed: Vec<MovedItem>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub errors: Vec<ApiError>,
-    /// Notes whose links were rewritten for this batch (update_links),
-    /// reported at their post-batch paths.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub relinked: Vec<String>,
-    /// True when this was a dry run: nothing was written.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub dry_run: bool,
-    /// Present while git sync is failing (ADR-0019); see sync_vault.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sync_warning: Option<String>,
-}
-
-#[derive(Debug, Serialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
 pub struct MovedItem {
     pub from: String,
     pub to: String,
 }
 
-/// The per-batch behavior flags shared by rename and relocate.
+/// The per-batch behavior flags for a move batch.
 struct MoveOpts {
     dry_run: bool,
     prune_empty: bool,
@@ -261,7 +232,11 @@ impl MdServer {
     /// Delete notes or directories (to a recoverable trash). All-or-nothing.
     #[tool(
         description = "Delete notes (or directories ending in /) to a recoverable trash. All-or-nothing: a missing path, the vault root, or two overlapping targets reject the whole batch and nothing is deleted. Returns each item's trash location. dry_run:true validates and returns the planned outcome (or every rejection) without deleting. prune_empty:true also removes source directories the batch left empty (reported as pruned).",
-        annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn delete_notes(
         &self,
@@ -276,43 +251,23 @@ impl MdServer {
         Ok(Json(r))
     }
 
-    /// Rename a note or directory in place (same parent). All-or-nothing.
+    /// Move or rename notes and directories. All-or-nothing.
     #[tool(
-        description = "Rename notes or directories in place (same parent, basename only; new_name must not contain '/'). A note keeps its .md extension. All-or-nothing: collisions (without overwrite) or in-batch swaps reject the whole batch. dry_run:true validates and returns the planned outcome without renaming. update_links:true also rewrites standard-Markdown links vault-wide so they keep pointing at the renamed notes (relinked notes are reported; wikilinks untouched).",
-        annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false)
+        description = "Move or rename notes and directories. Each item's dest either ends with '/' — move into that directory keeping the basename ('/' alone is the vault root) — or is the full destination path including the new basename (a note keeps .md), renaming and moving in one step. All-or-nothing: collisions (without overwrite), moving a directory into its own subtree, or in-batch duplicates/swaps reject the whole batch; an item may land inside another item's moved directory (ancestor destinations apply first). dry_run:true validates and returns the planned destinations without moving. prune_empty:true also removes source directories the batch left empty (reported as pruned). update_links:true also rewrites standard-Markdown links vault-wide so they keep pointing at the moved notes (relinked notes are reported; wikilinks untouched).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
     )]
-    pub async fn rename_notes(
+    pub async fn move_notes(
         &self,
-        Parameters(req): Parameters<RenameNotesRequest>,
-    ) -> Result<Json<RenameResponse>, ErrorData> {
-        batch_limit(req.renames.len())?;
-        let _guard = self.lock().write().await;
-        let r = self
-            .run_rename(&req.renames, req.overwrite, req.dry_run, req.update_links)
-            .await;
-        Ok(Json(RenameResponse {
-            ok: r.ok,
-            renamed: r.moved,
-            errors: r.errors,
-            relinked: r.relinked,
-            dry_run: r.dry_run,
-            sync_warning: self.sync_warning(),
-        }))
-    }
-
-    /// Move notes or directories into a destination directory. All-or-nothing.
-    #[tool(
-        description = "Relocate notes or directories into dest_dir (ends with /), keeping the basename; multiple items may target one directory. All-or-nothing: collisions (without overwrite), moving a directory into its own subtree, or in-batch overlaps reject the whole batch. dry_run:true validates and returns the planned destinations without moving. prune_empty:true also removes source directories the batch left empty (reported as pruned). update_links:true also rewrites standard-Markdown links vault-wide so they keep pointing at the moved notes (relinked notes are reported; wikilinks untouched).",
-        annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false)
-    )]
-    pub async fn relocate_notes(
-        &self,
-        Parameters(req): Parameters<RelocateNotesRequest>,
+        Parameters(req): Parameters<MoveNotesRequest>,
     ) -> Result<Json<MoveResponse>, ErrorData> {
         batch_limit(req.moves.len())?;
         let _guard = self.lock().write().await;
         let mut r = self
-            .run_relocate(
+            .run_move(
                 &req.moves,
                 req.overwrite,
                 req.dry_run,
@@ -434,63 +389,9 @@ impl MdServer {
         }
     }
 
-    async fn run_rename(
+    async fn run_move(
         &self,
-        renames: &[RenameItem],
-        overwrite: bool,
-        dry_run: bool,
-        update_links: bool,
-    ) -> MoveResponse {
-        let mut errors = Vec::new();
-        let mut pairs: Vec<(usize, String, String)> = Vec::new();
-
-        for (i, r) in renames.iter().enumerate() {
-            match self.compute_rename(r) {
-                Ok(to) => {
-                    // "Occupied" must mean a *different* file: a destination
-                    // that resolves to the source itself is a Unicode
-                    // respelling of the same note (e.g. NFD -> NFC), not a
-                    // collision.
-                    let same_file = matches!(
-                        (
-                            self.vault().resolve_rel(strip_slash(&to)),
-                            self.vault().resolve_rel(strip_slash(&r.path)),
-                        ),
-                        (Ok(a), Ok(b)) if a == b
-                    );
-                    if !overwrite
-                        && strip_slash(&to) != strip_slash(&r.path)
-                        && !same_file
-                        && self.vault().exists(&to).unwrap_or(false)
-                    {
-                        errors.push(err(
-                            i,
-                            Code::Conflict,
-                            format!("destination already exists: {to}"),
-                        ));
-                    }
-                    pairs.push((i, r.path.clone(), to));
-                }
-                Err(e) => errors.push(ApiError::at(i, &e)),
-            }
-        }
-        self.finish_move(
-            "rename_notes",
-            pairs,
-            errors,
-            MoveOpts {
-                dry_run,
-                prune_empty: false, // a rename stays in its parent — it can never empty a dir
-                update_links,
-            },
-            serde_json::json!({"renames": renames, "overwrite": overwrite, "update_links": update_links}),
-        )
-        .await
-    }
-
-    async fn run_relocate(
-        &self,
-        moves: &[RelocateItem],
+        moves: &[MoveItem],
         overwrite: bool,
         dry_run: bool,
         prune_empty: bool,
@@ -500,17 +401,31 @@ impl MdServer {
         let mut pairs: Vec<(usize, String, String)> = Vec::new();
 
         for (i, m) in moves.iter().enumerate() {
-            match self.compute_relocate(m) {
+            match self.compute_move(m) {
                 Ok(to) => {
+                    // "Occupied" must mean a *different* file: a destination
+                    // that resolves to the source itself is a Unicode
+                    // respelling of the same note (e.g. NFD -> NFC), not a
+                    // collision.
+                    let same_file = matches!(
+                        (
+                            self.vault().resolve_rel(strip_slash(&to)),
+                            self.vault().resolve_rel(strip_slash(&m.source)),
+                        ),
+                        (Ok(a), Ok(b)) if a == b
+                    );
                     if strip_slash(&to) == strip_slash(&m.source) {
                         // A no-op move reads as "already exists" otherwise,
-                        // suggesting a different file is in the way.
+                        // suggesting a different file is in the way. (It would
+                        // also fail at commit time with a raw un-indexed IO
+                        // error after a backup/rollback round-trip.)
                         errors.push(err(
                             i,
                             Code::Conflict,
-                            format!("source is already in dest_dir: {}", m.source),
+                            format!("source is already at the destination: {}", m.source),
                         ));
-                    } else if !overwrite && self.vault().exists(&to).unwrap_or(false) {
+                    } else if !overwrite && !same_file && self.vault().exists(&to).unwrap_or(false)
+                    {
                         errors.push(err(
                             i,
                             Code::Conflict,
@@ -523,7 +438,7 @@ impl MdServer {
             }
         }
         self.finish_move(
-            "relocate_notes",
+            "move_notes",
             pairs,
             errors,
             MoveOpts {
@@ -554,71 +469,12 @@ impl MdServer {
         pruned
     }
 
-    fn compute_rename(&self, r: &RenameItem) -> Result<String, Error> {
-        Vault::validate_rel(&r.path)?;
-        if !self.vault().exists(&r.path).unwrap_or(false) {
-            return Err(Error::not_found(format!("source not found: {}", r.path)));
-        }
-        if r.new_name.contains('/') {
-            return Err(Error::new(
-                Code::Suffix,
-                "new_name must not contain '/'; use relocate to move",
-            ));
-        }
-        let is_dir = is_dir_path(&r.path);
-        if is_dir {
-            if r.new_name.ends_with(".md") {
-                return Err(Error::new(
-                    Code::Suffix,
-                    "a directory's new_name must not end with .md",
-                ));
-            }
-        } else if !r.new_name.ends_with(".md") {
-            return Err(Error::new(
-                Code::Suffix,
-                "a note's new_name must end with .md",
-            ));
-        }
-        let to = format!(
-            "{}{}{}",
-            parent_dir(&r.path),
-            r.new_name,
-            if is_dir { "/" } else { "" }
-        );
-        Vault::validate_rel(&to)?;
-        // A no-op rename would otherwise reach the commit stage, where backing
-        // up the destination removes the source and a raw IO error leaks out.
-        // Bytewise on purpose: an NFC respelling of the same name is a
-        // legitimate rename, not a no-op.
-        if strip_slash(&to) == strip_slash(&r.path) {
-            return Err(Error::new(
-                Code::Conflict,
-                format!("new_name is already the current name: {}", r.path),
-            ));
-        }
-        Ok(to)
-    }
-
-    fn compute_relocate(&self, m: &RelocateItem) -> Result<String, Error> {
-        Vault::validate_rel(&m.source)?;
-        if !self.vault().exists(&m.source).unwrap_or(false) {
-            return Err(Error::not_found(format!("source not found: {}", m.source)));
-        }
-        // "/" is the suffix convention's spelling of the vault root — without
-        // it there is no way to relocate a note back to the top level.
-        let dest_prefix: &str = if m.dest_dir == "/" {
-            ""
-        } else if is_dir_path(&m.dest_dir) {
-            &m.dest_dir
-        } else {
-            return Err(Error::new(Code::DestNotDir, "dest_dir must end with '/'"));
-        };
-        // Reject if dest_dir, or any of its existing ancestors, is occupied by a
-        // non-directory — so the failure is an indexed validation rejection, not
-        // a late create_dir_all IO error at commit time.
-        let dest = strip_slash(dest_prefix);
+    /// Reject a destination-directory chain segment occupied by a
+    /// non-directory — so the failure is an indexed validation rejection, not
+    /// a late create_dir_all IO error at commit time.
+    fn check_dest_chain(&self, dest: &str) -> Result<(), Error> {
         let mut prefix = String::new();
-        for seg in dest.split('/').filter(|s| !s.is_empty()) {
+        for seg in strip_slash(dest).split('/').filter(|s| !s.is_empty()) {
             prefix = if prefix.is_empty() {
                 seg.to_string()
             } else {
@@ -629,21 +485,53 @@ impl MdServer {
             {
                 return Err(Error::new(
                     Code::DestNotDir,
-                    format!("dest_dir path is occupied by a non-directory: {prefix}"),
+                    format!("dest path is occupied by a non-directory: {prefix}"),
                 ));
             }
         }
+        Ok(())
+    }
 
+    /// Resolve a `MoveItem`'s destination path (ADR-0024): a `dest` ending in
+    /// `/` targets a directory keeping the source basename; otherwise it is
+    /// the full destination path including the new basename.
+    fn compute_move(&self, m: &MoveItem) -> Result<String, Error> {
+        Vault::validate_rel(&m.source)?;
+        if !self.vault().exists(&m.source).unwrap_or(false) {
+            return Err(Error::not_found(format!("source not found: {}", m.source)));
+        }
         let is_dir = is_dir_path(&m.source);
-        let to = format!(
-            "{}{}{}",
-            dest_prefix,
-            basename(&m.source),
-            if is_dir { "/" } else { "" }
-        );
+        let dir_suffix = if is_dir { "/" } else { "" };
+        let to = if m.dest == "/" || is_dir_path(&m.dest) {
+            // Directory target, keeping the source basename. "/" is the suffix
+            // convention's spelling of the vault root — without it there is no
+            // way to move a note back to the top level.
+            let dest_prefix: &str = if m.dest == "/" { "" } else { &m.dest };
+            self.check_dest_chain(dest_prefix)?;
+            format!("{dest_prefix}{}{dir_suffix}", basename(&m.source))
+        } else {
+            // Full destination path, including the new basename.
+            if is_dir {
+                if m.dest.ends_with(".md") {
+                    return Err(Error::new(
+                        Code::Suffix,
+                        "a directory's dest must not end with .md",
+                    ));
+                }
+            } else if !m.dest.ends_with(".md") {
+                return Err(Error::new(
+                    Code::Suffix,
+                    "a note's dest must end with .md (end dest with '/' to move into a directory)",
+                ));
+            }
+            self.check_dest_chain(&parent_dir(&m.dest))?;
+            format!("{}{dir_suffix}", m.dest)
+        };
         Vault::validate_rel(&to)?;
-        // A directory cannot move into its own subtree.
-        if is_dir && !dest_prefix.is_empty() && contains(&m.source, dest_prefix) {
+        // A directory cannot move into its own subtree. Strict containment on
+        // purpose: an equal key is either a no-op or a Unicode respelling of
+        // the same directory, both handled by the caller's conflict checks.
+        if is_dir && contains_strict(&m.source, &to) {
             return Err(Error::new(
                 Code::Overlap,
                 "cannot move a directory into its own subtree",
@@ -655,7 +543,7 @@ impl MdServer {
     async fn finish_move(
         &self,
         tool: &str,
-        pairs: Vec<(usize, String, String)>,
+        mut pairs: Vec<(usize, String, String)>,
         mut errors: Vec<ApiError>,
         opts: MoveOpts,
         args: serde_json::Value,
@@ -699,6 +587,11 @@ impl MdServer {
                 sync_warning: None,
             };
         }
+        // Nested destinations declare a final tree (ADR-0024): apply ancestor
+        // destinations first so the directory a child lands in exists by the
+        // time the child moves. Lexicographic dest order puts every ancestor
+        // before its descendants; the response maps back to input order below.
+        pairs.sort_by_key(|(_, _, to)| nfc_key(to));
         // Link rewrites go first, addressed at pre-move paths: the moves then
         // carry the rewritten bodies, and a move that overwrites a rewritten
         // note still wins (write-after-move would resurrect dead content).
@@ -714,19 +607,24 @@ impl MdServer {
                 let ops = EventOp::from_outcomes(&receipt.outcomes);
                 self.emit_event(tool, Some(&receipt.batch_id), &ops);
                 self.auto_commit(tool, &ops, &args).await;
-                let moved = receipt
+                let mut moved: Vec<(usize, MovedItem)> = receipt
                     .outcomes
                     .into_iter()
                     .filter(|o| matches!(o, OpOutcome::Moved { .. }))
                     .zip(&pairs)
-                    .filter_map(|(o, (_, pfrom, pto))| match o {
-                        OpOutcome::Moved { from, to } => Some(MovedItem {
-                            from: with_dir_suffix(from, pfrom),
-                            to: with_dir_suffix(to, pto),
-                        }),
+                    .filter_map(|(o, (idx, pfrom, pto))| match o {
+                        OpOutcome::Moved { from, to } => Some((
+                            *idx,
+                            MovedItem {
+                                from: with_dir_suffix(from, pfrom),
+                                to: with_dir_suffix(to, pto),
+                            },
+                        )),
                         _ => None,
                     })
                     .collect();
+                moved.sort_by_key(|(i, _)| *i);
+                let moved = moved.into_iter().map(|(_, m)| m).collect();
                 let pruned = if prune_empty {
                     self.prune_emptied_dirs(pairs.iter().map(|(_, from, _)| from.as_str()))
                 } else {
@@ -895,17 +793,40 @@ mod tests {
         assert!(!s.vault().exists("a.md").unwrap());
     }
 
+    /// Shorthand for a single-item move_notes call with default flags.
+    async fn move_one(s: &MdServer, source: &str, dest: &str) -> MoveResponse {
+        s.move_notes(Parameters(MoveNotesRequest {
+            moves: vec![MoveItem {
+                source: source.into(),
+                dest: dest.into(),
+            }],
+            overwrite: false,
+            update_links: false,
+            dry_run: false,
+            prune_empty: false,
+        }))
+        .await
+        .unwrap()
+        .0
+    }
+
     #[tokio::test]
     async fn dry_run_previews_a_valid_batch_without_writing() {
         let (_d, s) = server(&[("업무/plan.md", "x"), ("b.md", "y")]);
 
-        // relocate --dry_run: the planned destination comes back, nothing moves.
+        // move --dry_run: the planned destinations come back, nothing moves.
         let r = s
-            .relocate_notes(Parameters(RelocateNotesRequest {
-                moves: vec![RelocateItem {
-                    source: "업무/plan.md".into(),
-                    dest_dir: "02-areas/work/".into(),
-                }],
+            .move_notes(Parameters(MoveNotesRequest {
+                moves: vec![
+                    MoveItem {
+                        source: "업무/plan.md".into(),
+                        dest: "02-areas/work/".into(),
+                    },
+                    MoveItem {
+                        source: "b.md".into(),
+                        dest: "c.md".into(),
+                    },
+                ],
                 overwrite: false,
                 update_links: false,
                 dry_run: true,
@@ -917,26 +838,9 @@ mod tests {
         assert!(r.ok, "{:?}", r.errors);
         assert!(r.dry_run);
         assert_eq!(r.moved[0].to, "02-areas/work/plan.md");
+        assert_eq!(r.moved[1].to, "c.md");
         assert!(s.vault().exists("업무/plan.md").unwrap(), "not applied");
         assert!(!s.vault().exists("02-areas/work/plan.md").unwrap());
-
-        // rename --dry_run: same shape, nothing renamed.
-        let r = s
-            .rename_notes(Parameters(RenameNotesRequest {
-                renames: vec![RenameItem {
-                    path: "b.md".into(),
-                    new_name: "c.md".into(),
-                }],
-                overwrite: false,
-                update_links: false,
-                dry_run: true,
-            }))
-            .await
-            .unwrap()
-            .0;
-        assert!(r.ok, "{:?}", r.errors);
-        assert!(r.dry_run);
-        assert_eq!(r.renamed[0].to, "c.md");
         assert!(s.vault().exists("b.md").unwrap(), "not applied");
 
         // delete --dry_run: the planned trash location, note still present.
@@ -959,10 +863,10 @@ mod tests {
     async fn prune_empty_removes_only_dirs_the_batch_emptied() {
         let (_d, s) = server(&[("a/b/n.md", "x"), ("a/keep.md", "y")]);
         let r = s
-            .relocate_notes(Parameters(RelocateNotesRequest {
-                moves: vec![RelocateItem {
+            .move_notes(Parameters(MoveNotesRequest {
+                moves: vec![MoveItem {
                     source: "a/b/n.md".into(),
-                    dest_dir: "dst/".into(),
+                    dest: "dst/".into(),
                 }],
                 overwrite: false,
                 update_links: false,
@@ -983,20 +887,7 @@ mod tests {
     async fn prune_empty_ascends_and_defaults_off() {
         // Default: the emptied chain stays.
         let (_d, s) = server(&[("x/y/n.md", "v")]);
-        let r = s
-            .relocate_notes(Parameters(RelocateNotesRequest {
-                moves: vec![RelocateItem {
-                    source: "x/y/n.md".into(),
-                    dest_dir: "/".into(),
-                }],
-                overwrite: false,
-                update_links: false,
-                dry_run: false,
-                prune_empty: false,
-            }))
-            .await
-            .unwrap()
-            .0;
+        let r = move_one(&s, "x/y/n.md", "/").await;
         assert!(r.ok, "{:?}", r.errors);
         assert!(r.pruned.is_empty());
         assert!(s.vault().is_dir("x/y").unwrap(), "kept without the flag");
@@ -1022,15 +913,15 @@ mod tests {
         // The same all-or-nothing validation runs; dry_run only skips the write.
         let (_d, s) = server(&[("a.md", "x"), ("b.md", "y")]);
         let r = s
-            .relocate_notes(Parameters(RelocateNotesRequest {
+            .move_notes(Parameters(MoveNotesRequest {
                 moves: vec![
-                    RelocateItem {
+                    MoveItem {
                         source: "a.md".into(),
-                        dest_dir: "dst/".into(),
+                        dest: "dst/".into(),
                     },
-                    RelocateItem {
+                    MoveItem {
                         source: "missing.md".into(),
-                        dest_dir: "dst/".into(),
+                        dest: "dst/".into(),
                     },
                 ],
                 overwrite: false,
@@ -1048,43 +939,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relocate_to_the_vault_root_via_slash() {
+    async fn move_to_the_vault_root_via_slash() {
         let (_d, s) = server(&[("deep/n.md", "x")]);
-        let ok = s
-            .relocate_notes(Parameters(RelocateNotesRequest {
-                moves: vec![RelocateItem {
-                    source: "deep/n.md".into(),
-                    dest_dir: "/".into(),
-                }],
-                overwrite: false,
-                update_links: false,
-                dry_run: false,
-                prune_empty: false,
-            }))
-            .await
-            .unwrap()
-            .0;
+        let ok = move_one(&s, "deep/n.md", "/").await;
         assert!(ok.ok, "{:?}", ok.errors);
         assert_eq!(ok.moved[0].to, "n.md");
         assert!(s.vault().exists("n.md").unwrap());
 
-        // A directory also relocates to the root; a top-level dir is a no-op.
-        let ok = s
-            .relocate_notes(Parameters(RelocateNotesRequest {
-                moves: vec![RelocateItem {
-                    source: "deep/".into(),
-                    dest_dir: "/".into(),
-                }],
-                overwrite: false,
-                update_links: false,
-                dry_run: false,
-                prune_empty: false,
-            }))
-            .await
-            .unwrap()
-            .0;
-        assert!(!ok.ok, "top-level dir into root is a no-op");
-        assert!(ok.errors[0].message.contains("already in dest_dir"));
+        // A directory also moves to the root; a top-level dir is a no-op.
+        let bad = move_one(&s, "deep/", "/").await;
+        assert!(!bad.ok, "top-level dir into root is a no-op");
+        assert!(bad.errors[0].message.contains("already at the destination"));
     }
 
     #[tokio::test]
@@ -1109,20 +974,21 @@ mod tests {
         assert!(s.vault().exists(&file).unwrap(), "nothing deleted");
 
         let bad = s
-            .rename_notes(Parameters(RenameNotesRequest {
-                renames: vec![
-                    RenameItem {
-                        path: file.clone(),
-                        new_name: "d.md".into(),
+            .move_notes(Parameters(MoveNotesRequest {
+                moves: vec![
+                    MoveItem {
+                        source: file.clone(),
+                        dest: format!("{nfd_dir}/d.md"),
                     },
-                    RenameItem {
-                        path: "\u{d55c}/c.md".into(),
-                        new_name: "e.md".into(),
+                    MoveItem {
+                        source: "\u{d55c}/c.md".into(),
+                        dest: "\u{d55c}/e.md".into(),
                     },
                 ],
                 overwrite: false,
                 update_links: false,
                 dry_run: false,
+                prune_empty: false,
             }))
             .await
             .unwrap()
@@ -1136,28 +1002,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_fixes_unicode_spelling_of_the_same_note() {
+    async fn move_fixes_unicode_spelling_of_the_same_note() {
         // NFD -> NFC and back: same text, different bytes; must rename the
         // on-disk spelling without overwrite and without a false CONFLICT.
         let nfd = "\u{1112}\u{1161}\u{11ab}.md"; // 한.md in NFD
         let nfc = "\u{d55c}.md"; // 한.md in NFC
         let (_d, s) = server(&[(nfd, "content")]);
 
-        let ok = s
-            .rename_notes(Parameters(RenameNotesRequest {
-                renames: vec![RenameItem {
-                    path: nfd.into(),
-                    new_name: nfc.into(),
-                }],
-                overwrite: false,
-                update_links: false,
-                dry_run: false,
-            }))
-            .await
-            .unwrap()
-            .0;
+        let ok = move_one(&s, nfd, nfc).await;
         assert!(ok.ok, "{:?}", ok.errors);
-        assert_eq!(ok.renamed[0].to, nfc);
+        assert_eq!(ok.moved[0].to, nfc);
         assert_eq!(
             s.vault().resolve_rel(nfc).unwrap(),
             nfc,
@@ -1165,109 +1019,46 @@ mod tests {
         );
 
         // And back to NFD.
-        let ok = s
-            .rename_notes(Parameters(RenameNotesRequest {
-                renames: vec![RenameItem {
-                    path: nfc.into(),
-                    new_name: nfd.into(),
-                }],
-                overwrite: false,
-                update_links: false,
-                dry_run: false,
-            }))
-            .await
-            .unwrap()
-            .0;
+        let ok = move_one(&s, nfc, nfd).await;
         assert!(ok.ok, "{:?}", ok.errors);
         assert_eq!(s.vault().resolve_rel(nfc).unwrap(), nfd);
         assert_eq!(s.vault().read_note(nfc).unwrap(), "content");
     }
 
     #[tokio::test]
-    async fn noop_rename_is_an_indexed_validation_error() {
-        // Renaming to the current name used to fail at commit time with a raw
+    async fn noop_move_is_an_indexed_validation_error() {
+        // Moving to the current path used to fail at commit time with a raw
         // un-indexed IO error (after a backup/rollback round-trip).
-        let (_d, s) = server(&[("a.md", "x")]);
-        let bad = s
-            .rename_notes(Parameters(RenameNotesRequest {
-                renames: vec![RenameItem {
-                    path: "a.md".into(),
-                    new_name: "a.md".into(),
-                }],
-                overwrite: false,
-                update_links: false,
-                dry_run: false,
-            }))
-            .await
-            .unwrap()
-            .0;
+        let (_d, s) = server(&[("a.md", "x"), ("d/n.md", "y")]);
+
+        // Full-path form: dest equals the source.
+        let bad = move_one(&s, "a.md", "a.md").await;
         assert!(!bad.ok);
         assert_eq!(bad.errors[0].code, "CONFLICT");
         assert_eq!(bad.errors[0].index, Some(0));
-        assert!(bad.errors[0].message.contains("current name"));
+        assert!(bad.errors[0].message.contains("already at the destination"));
         assert!(s.vault().exists("a.md").unwrap());
-    }
 
-    #[tokio::test]
-    async fn noop_relocate_names_the_actual_problem() {
-        let (_d, s) = server(&[("d/n.md", "x")]);
-        let bad = s
-            .relocate_notes(Parameters(RelocateNotesRequest {
-                moves: vec![RelocateItem {
-                    source: "d/n.md".into(),
-                    dest_dir: "d/".into(),
-                }],
-                overwrite: false,
-                update_links: false,
-                dry_run: false,
-                prune_empty: false,
-            }))
-            .await
-            .unwrap()
-            .0;
+        // Directory-target form: the source is already in dest.
+        let bad = move_one(&s, "d/n.md", "d/").await;
         assert!(!bad.ok);
-        assert!(
-            bad.errors[0].message.contains("already in dest_dir"),
-            "message: {}",
-            bad.errors[0].message
-        );
+        assert_eq!(bad.errors[0].code, "CONFLICT");
+        assert!(bad.errors[0].message.contains("already at the destination"));
     }
 
     #[tokio::test]
     async fn dir_echoes_keep_the_trailing_slash() {
         // Echoed directory paths follow the suffix convention so they can be
-        // fed straight back into path/dest_dir arguments.
+        // fed straight back into path/dest arguments.
         let (_d, s) = server(&[("d/n.md", "x")]);
-        let ok = s
-            .rename_notes(Parameters(RenameNotesRequest {
-                renames: vec![RenameItem {
-                    path: "d/".into(),
-                    new_name: "e".into(),
-                }],
-                overwrite: false,
-                update_links: false,
-                dry_run: false,
-            }))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(ok.renamed[0].from, "d/");
-        assert_eq!(ok.renamed[0].to, "e/");
 
-        let ok = s
-            .relocate_notes(Parameters(RelocateNotesRequest {
-                moves: vec![RelocateItem {
-                    source: "e/".into(),
-                    dest_dir: "arch/".into(),
-                }],
-                overwrite: false,
-                update_links: false,
-                dry_run: false,
-                prune_empty: false,
-            }))
-            .await
-            .unwrap()
-            .0;
+        // Rename a directory via a full destination path.
+        let ok = move_one(&s, "d/", "e").await;
+        assert_eq!(ok.moved[0].from, "d/");
+        assert_eq!(ok.moved[0].to, "e/");
+
+        // Move a directory into a directory target.
+        let ok = move_one(&s, "e/", "arch/").await;
         assert_eq!(ok.moved[0].to, "arch/e/");
 
         let ok = s
@@ -1283,51 +1074,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_in_place_with_suffix_rules() {
-        let (_d, s) = server(&[("note.md", "x")]);
-        let ok = s
-            .rename_notes(Parameters(RenameNotesRequest {
-                renames: vec![RenameItem {
-                    path: "note.md".into(),
-                    new_name: "renamed.md".into(),
-                }],
-                overwrite: false,
-                update_links: false,
-                dry_run: false,
-            }))
-            .await
-            .unwrap()
-            .0;
-        assert!(ok.ok);
-        assert_eq!(ok.renamed[0].to, "renamed.md");
+    async fn rename_in_place_via_full_path_with_suffix_rules() {
+        let (_d, s) = server(&[("note.md", "x"), ("d/sub.md", "y")]);
+        let ok = move_one(&s, "note.md", "renamed.md").await;
+        assert!(ok.ok, "{:?}", ok.errors);
+        assert_eq!(ok.moved[0].to, "renamed.md");
         assert!(s.vault().exists("renamed.md").unwrap());
 
-        // A slash in new_name is rejected.
-        let bad = s
-            .rename_notes(Parameters(RenameNotesRequest {
-                renames: vec![RenameItem {
-                    path: "renamed.md".into(),
-                    new_name: "sub/x.md".into(),
-                }],
-                overwrite: false,
-                update_links: false,
-                dry_run: false,
-            }))
-            .await
-            .unwrap()
-            .0;
+        // A note's full-path dest must keep the .md extension.
+        let bad = move_one(&s, "renamed.md", "extensionless").await;
+        assert_eq!(bad.errors[0].code, "SUFFIX");
+
+        // A directory's full-path dest must not end with .md.
+        let bad = move_one(&s, "d/", "d2.md").await;
         assert_eq!(bad.errors[0].code, "SUFFIX");
     }
 
     #[tokio::test]
-    async fn relocate_into_directory() {
+    async fn move_and_rename_in_one_call() {
+        // The unified primitive's reason to exist (ADR-0024): a move that also
+        // changes the basename is one atomic item, not a relocate+rename pair.
+        let (_d, s) = server(&[("a/note.md", "x")]);
+        let ok = move_one(&s, "a/note.md", "b/new.md").await;
+        assert!(ok.ok, "{:?}", ok.errors);
+        assert_eq!(ok.moved[0].from, "a/note.md");
+        assert_eq!(ok.moved[0].to, "b/new.md");
+        assert!(s.vault().exists("b/new.md").unwrap());
+        assert!(!s.vault().exists("a/note.md").unwrap());
+
+        // Same for a directory: move it under a new parent with a new name.
+        let (_d2, s2) = server(&[("d/n.md", "x")]);
+        let ok = move_one(&s2, "d/", "arch/d2").await;
+        assert!(ok.ok, "{:?}", ok.errors);
+        assert_eq!(ok.moved[0].to, "arch/d2/");
+        assert!(s2.vault().exists("arch/d2/n.md").unwrap());
+    }
+
+    #[tokio::test]
+    async fn move_into_directory_keeps_basename() {
         let (_d, s) = server(&[("a.md", "x")]);
+        let ok = move_one(&s, "a.md", "archive/").await;
+        assert!(ok.ok);
+        assert_eq!(ok.moved[0].to, "archive/a.md");
+        assert!(s.vault().exists("archive/a.md").unwrap());
+    }
+
+    #[tokio::test]
+    async fn nested_destinations_apply_ancestor_first() {
+        // Issue #7's shape (ADR-0024): move a directory AND land another item
+        // inside its destination, in one atomic batch. Input order is child
+        // first to prove the engine orders ancestor destinations first.
+        let (_d, s) = server(&[("ak/readme.md", "r"), ("kernel/dma-buf/x.md", "x")]);
         let ok = s
-            .relocate_notes(Parameters(RelocateNotesRequest {
-                moves: vec![RelocateItem {
-                    source: "a.md".into(),
-                    dest_dir: "archive/".into(),
-                }],
+            .move_notes(Parameters(MoveNotesRequest {
+                moves: vec![
+                    MoveItem {
+                        source: "kernel/dma-buf/".into(),
+                        dest: "02-areas/ak/dma-buf".into(),
+                    },
+                    MoveItem {
+                        source: "ak/".into(),
+                        dest: "02-areas/".into(),
+                    },
+                ],
                 overwrite: false,
                 update_links: false,
                 dry_run: false,
@@ -1336,9 +1145,152 @@ mod tests {
             .await
             .unwrap()
             .0;
-        assert!(ok.ok);
-        assert_eq!(ok.moved[0].to, "archive/a.md");
-        assert!(s.vault().exists("archive/a.md").unwrap());
+        assert!(ok.ok, "{:?}", ok.errors);
+        // The response keeps the input order.
+        assert_eq!(ok.moved[0].from, "kernel/dma-buf/");
+        assert_eq!(ok.moved[0].to, "02-areas/ak/dma-buf/");
+        assert_eq!(ok.moved[1].from, "ak/");
+        assert_eq!(ok.moved[1].to, "02-areas/ak/");
+        assert!(s.vault().exists("02-areas/ak/readme.md").unwrap());
+        assert!(s.vault().exists("02-areas/ak/dma-buf/x.md").unwrap());
+        assert!(!s.vault().exists("ak").unwrap());
+        assert!(!s.vault().exists("kernel/dma-buf").unwrap());
+    }
+
+    #[tokio::test]
+    async fn dest_inside_another_items_source_is_rejected() {
+        // An item landing inside a subtree another item vacates is
+        // order-sensitive in a confusing way — rejected, not sequenced.
+        let (_d, s) = server(&[("a/keep.md", "k"), ("x.md", "x")]);
+        let bad = s
+            .move_notes(Parameters(MoveNotesRequest {
+                moves: vec![
+                    MoveItem {
+                        source: "a/".into(),
+                        dest: "z/".into(),
+                    },
+                    MoveItem {
+                        source: "x.md".into(),
+                        dest: "a/sub/x.md".into(),
+                    },
+                ],
+                overwrite: false,
+                update_links: false,
+                dry_run: false,
+                prune_empty: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!bad.ok);
+        assert!(
+            bad.errors.iter().all(|e| e.code == "BATCH_COLLISION"),
+            "{:?}",
+            bad.errors
+        );
+        assert!(s.vault().exists("a/keep.md").unwrap(), "nothing moved");
+        assert!(s.vault().exists("x.md").unwrap());
+    }
+
+    #[tokio::test]
+    async fn swaps_and_chains_are_rejected() {
+        let (_d, s) = server(&[("a.md", "x"), ("b.md", "y")]);
+        // Swap: a -> b while b -> a.
+        let bad = s
+            .move_notes(Parameters(MoveNotesRequest {
+                moves: vec![
+                    MoveItem {
+                        source: "a.md".into(),
+                        dest: "b.md".into(),
+                    },
+                    MoveItem {
+                        source: "b.md".into(),
+                        dest: "a.md".into(),
+                    },
+                ],
+                overwrite: false,
+                update_links: false,
+                dry_run: false,
+                prune_empty: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!bad.ok);
+        // The swap is a BATCH_COLLISION; each dest being an existing note
+        // also surfaces as a CONFLICT — both reject the batch.
+        assert!(
+            bad.errors.iter().any(|e| e.code == "BATCH_COLLISION"),
+            "{:?}",
+            bad.errors
+        );
+
+        // Chain: a moves to where b was while b moves away.
+        let bad = s
+            .move_notes(Parameters(MoveNotesRequest {
+                moves: vec![
+                    MoveItem {
+                        source: "a.md".into(),
+                        dest: "b.md".into(),
+                    },
+                    MoveItem {
+                        source: "b.md".into(),
+                        dest: "c.md".into(),
+                    },
+                ],
+                overwrite: false,
+                update_links: false,
+                dry_run: false,
+                prune_empty: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!bad.ok);
+        assert!(
+            bad.errors.iter().any(|e| e.code == "BATCH_COLLISION"),
+            "{:?}",
+            bad.errors
+        );
+        assert!(s.vault().exists("a.md").unwrap());
+        assert!(s.vault().exists("b.md").unwrap());
+    }
+
+    #[tokio::test]
+    async fn dir_into_own_subtree_is_rejected_in_both_forms() {
+        let (_d, s) = server(&[("d/n.md", "x")]);
+        let bad = move_one(&s, "d/", "d/sub/").await;
+        assert_eq!(bad.errors[0].code, "OVERLAP");
+        let bad = move_one(&s, "d/", "d/sub2").await;
+        assert_eq!(bad.errors[0].code, "OVERLAP");
+        assert!(s.vault().exists("d/n.md").unwrap());
+    }
+
+    #[tokio::test]
+    async fn conflict_requires_overwrite() {
+        let (_d, s) = server(&[("a.md", "new"), ("taken.md", "old")]);
+        let bad = move_one(&s, "a.md", "taken.md").await;
+        assert!(!bad.ok);
+        assert_eq!(bad.errors[0].code, "CONFLICT");
+        assert_eq!(s.vault().read_note("taken.md").unwrap(), "old");
+
+        let ok = s
+            .move_notes(Parameters(MoveNotesRequest {
+                moves: vec![MoveItem {
+                    source: "a.md".into(),
+                    dest: "taken.md".into(),
+                }],
+                overwrite: true,
+                update_links: false,
+                dry_run: false,
+                prune_empty: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(ok.ok, "{:?}", ok.errors);
+        assert_eq!(s.vault().read_note("taken.md").unwrap(), "new");
+        assert!(!s.vault().exists("a.md").unwrap());
     }
 
     #[tokio::test]
@@ -1347,15 +1299,15 @@ mod tests {
         // index — not leak a raw IO rename error from the commit stage.
         let (_d, s) = server(&[("a.md", "x")]);
         let bad = s
-            .relocate_notes(Parameters(RelocateNotesRequest {
+            .move_notes(Parameters(MoveNotesRequest {
                 moves: vec![
-                    RelocateItem {
+                    MoveItem {
                         source: "a.md".into(),
-                        dest_dir: "archive/".into(),
+                        dest: "archive/".into(),
                     },
-                    RelocateItem {
+                    MoveItem {
                         source: "ghost.md".into(),
-                        dest_dir: "archive/".into(),
+                        dest: "archive/".into(),
                     },
                 ],
                 overwrite: false,
@@ -1373,63 +1325,40 @@ mod tests {
             s.vault().exists("a.md").unwrap(),
             "all-or-nothing: a.md stays"
         );
+    }
 
-        let bad = s
-            .rename_notes(Parameters(RenameNotesRequest {
-                renames: vec![RenameItem {
-                    path: "ghost.md".into(),
-                    new_name: "still-ghost.md".into(),
-                }],
-                overwrite: false,
-                update_links: false,
-                dry_run: false,
-            }))
-            .await
-            .unwrap()
-            .0;
+    #[tokio::test]
+    async fn file_occupied_dest_is_rejected_with_index_in_both_forms() {
+        let (_d, s) = server(&[("a.md", "x"), ("b.md", "y"), ("blocker", "i am a file")]);
+        // Directory-target form: dest itself is a file.
+        let bad = move_one(&s, "a.md", "blocker/").await;
         assert!(!bad.ok);
-        assert_eq!(bad.errors[0].code, "NOT_FOUND");
+        assert_eq!(bad.errors[0].code, "DEST_NOT_DIR");
         assert_eq!(bad.errors[0].index, Some(0));
-    }
-
-    #[tokio::test]
-    async fn relocate_into_a_file_occupied_dest_is_rejected_with_index() {
-        let (_d, s) = server(&[("a.md", "x"), ("archive", "i am a file")]);
-        let resp = s
-            .relocate_notes(Parameters(RelocateNotesRequest {
-                moves: vec![RelocateItem {
-                    source: "a.md".into(),
-                    dest_dir: "archive/".into(),
-                }],
-                overwrite: false,
-                update_links: false,
-                dry_run: false,
-                prune_empty: false,
-            }))
-            .await
-            .unwrap()
-            .0;
-        assert!(!resp.ok);
-        assert_eq!(resp.errors[0].code, "DEST_NOT_DIR");
-        assert_eq!(resp.errors[0].index, Some(0));
         assert!(s.vault().exists("a.md").unwrap());
+
+        // Full-path form: an ancestor of dest is a file.
+        let bad = move_one(&s, "b.md", "blocker/sub/b.md").await;
+        assert!(!bad.ok);
+        assert_eq!(bad.errors[0].code, "DEST_NOT_DIR");
+        assert!(s.vault().exists("b.md").unwrap());
     }
 
     #[tokio::test]
-    async fn relocate_duplicate_destination_is_rejected() {
-        // Two items whose basenames collide into one directory both map to
-        // d/a.md (neither exists yet) -> an in-batch collision.
+    async fn duplicate_destination_across_forms_is_rejected() {
+        // A directory-target item and a full-path item computing the same
+        // destination (neither exists yet) -> an in-batch collision.
         let (_d, s) = server(&[("a.md", "x"), ("sub/a.md", "y")]);
         let collide = s
-            .relocate_notes(Parameters(RelocateNotesRequest {
+            .move_notes(Parameters(MoveNotesRequest {
                 moves: vec![
-                    RelocateItem {
+                    MoveItem {
                         source: "a.md".into(),
-                        dest_dir: "d/".into(),
+                        dest: "d/".into(),
                     },
-                    RelocateItem {
+                    MoveItem {
                         source: "sub/a.md".into(),
-                        dest_dir: "d/".into(),
+                        dest: "d/a.md".into(),
                     },
                 ],
                 overwrite: false,
@@ -1444,18 +1373,22 @@ mod tests {
         assert!(collide.errors.iter().all(|e| e.code == "BATCH_COLLISION"));
     }
 
+    #[tokio::test]
+    async fn dest_outside_the_vault_is_rejected() {
+        let (_d, s) = server(&[("a.md", "x")]);
+        let bad = move_one(&s, "a.md", "../escape.md").await;
+        assert!(!bad.ok);
+        assert_eq!(bad.errors[0].index, Some(0));
+        assert!(s.vault().exists("a.md").unwrap());
+    }
+
     // --- update_links (ADR-0022) -----------------------------------------
 
-    async fn relocate_linked(
-        s: &MdServer,
-        source: &str,
-        dest_dir: &str,
-        dry_run: bool,
-    ) -> MoveResponse {
-        s.relocate_notes(Parameters(RelocateNotesRequest {
-            moves: vec![RelocateItem {
+    async fn move_linked(s: &MdServer, source: &str, dest: &str, dry_run: bool) -> MoveResponse {
+        s.move_notes(Parameters(MoveNotesRequest {
+            moves: vec![MoveItem {
                 source: source.into(),
-                dest_dir: dest_dir.into(),
+                dest: dest.into(),
             }],
             overwrite: false,
             update_links: true,
@@ -1474,7 +1407,7 @@ mod tests {
             ("linker.md", "see [t](target.md#top) and [o](other.md)"),
             ("other.md", "no links to the target"),
         ]);
-        let r = relocate_linked(&s, "target.md", "sub/", false).await;
+        let r = move_linked(&s, "target.md", "sub/", false).await;
         assert!(r.ok, "{:?}", r.errors);
         assert_eq!(r.relinked, ["linker.md"]);
         assert_eq!(
@@ -1491,7 +1424,7 @@ mod tests {
     #[tokio::test]
     async fn update_links_recomputes_the_moved_notes_outbound_links() {
         let (_d, s) = server(&[("note.md", "[s](sib.md)"), ("sib.md", "y")]);
-        let r = relocate_linked(&s, "note.md", "deep/", false).await;
+        let r = move_linked(&s, "note.md", "deep/", false).await;
         assert!(r.ok, "{:?}", r.errors);
         assert_eq!(r.relinked, ["deep/note.md"]);
         assert_eq!(
@@ -1504,7 +1437,7 @@ mod tests {
     #[tokio::test]
     async fn update_links_follows_a_directory_move() {
         let (_d, s) = server(&[("dir/x.md", "# X"), ("linker.md", "[x](dir/x.md)")]);
-        let r = relocate_linked(&s, "dir/", "archive/", false).await;
+        let r = move_linked(&s, "dir/", "archive/", false).await;
         assert!(r.ok, "{:?}", r.errors);
         assert_eq!(r.relinked, ["linker.md"]);
         assert_eq!(
@@ -1516,7 +1449,7 @@ mod tests {
     #[tokio::test]
     async fn update_links_dry_run_previews_without_writing() {
         let (_d, s) = server(&[("target.md", "# T"), ("linker.md", "[t](target.md)")]);
-        let r = relocate_linked(&s, "target.md", "sub/", true).await;
+        let r = move_linked(&s, "target.md", "sub/", true).await;
         assert!(r.ok && r.dry_run);
         assert_eq!(r.relinked, ["linker.md"], "the plan names the note");
         assert_eq!(
@@ -1530,20 +1463,7 @@ mod tests {
     #[tokio::test]
     async fn update_links_off_by_default_leaves_links_alone() {
         let (_d, s) = server(&[("target.md", "# T"), ("linker.md", "[t](target.md)")]);
-        let r = s
-            .relocate_notes(Parameters(RelocateNotesRequest {
-                moves: vec![RelocateItem {
-                    source: "target.md".into(),
-                    dest_dir: "sub/".into(),
-                }],
-                overwrite: false,
-                update_links: false,
-                dry_run: false,
-                prune_empty: false,
-            }))
-            .await
-            .unwrap()
-            .0;
+        let r = move_one(&s, "target.md", "sub/").await;
         assert!(r.ok);
         assert!(r.relinked.is_empty());
         assert_eq!(s.vault().read_note("linker.md").unwrap(), "[t](target.md)");
@@ -1558,19 +1478,7 @@ mod tests {
                 "---\nurl: [f](old.md)\n---\nbody [l](old.md)\n",
             ),
         ]);
-        let r = s
-            .rename_notes(Parameters(RenameNotesRequest {
-                renames: vec![RenameItem {
-                    path: "old.md".into(),
-                    new_name: "new.md".into(),
-                }],
-                overwrite: false,
-                update_links: true,
-                dry_run: false,
-            }))
-            .await
-            .unwrap()
-            .0;
+        let r = move_linked(&s, "old.md", "new.md", false).await;
         assert!(r.ok, "{:?}", r.errors);
         assert_eq!(r.relinked, ["linker.md"]);
         assert_eq!(
@@ -1578,5 +1486,15 @@ mod tests {
             "---\nurl: [f](old.md)\n---\nbody [l](new.md)\n",
             "body link rewritten; frontmatter never touched"
         );
+    }
+
+    #[tokio::test]
+    async fn update_links_follows_a_move_and_rename_in_one() {
+        // The combined form repoints inbound links to the full new path.
+        let (_d, s) = server(&[("a/old.md", "# O"), ("linker.md", "[l](a/old.md)")]);
+        let r = move_linked(&s, "a/old.md", "b/new.md", false).await;
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(r.relinked, ["linker.md"]);
+        assert_eq!(s.vault().read_note("linker.md").unwrap(), "[l](b/new.md)");
     }
 }

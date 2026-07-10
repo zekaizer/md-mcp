@@ -103,15 +103,12 @@ _Avoid_: etag, checksum, version.
 
 ## Identity & moving
 
-**rename**:
-Changing a note's or directory's basename in place (same parent). The
-`rename_notes` tool; 1:1, no path change.
-_Avoid_: retitle, move.
-
-**relocate**:
-Moving a note or directory into a different directory, keeping its basename. The
-`relocate_notes` tool; N notes → 1 directory.
-_Avoid_: move (unqualified).
+**move**:
+Relocating and/or renaming a note or directory in one step. The `move_notes`
+tool; an item's `dest` ending in `/` targets a directory keeping the basename
+(N notes → 1 directory), otherwise it is the full destination path including
+the new basename ([ADR-0024](docs/adr/0024-unified-move-primitive.md)).
+_Avoid_: rename, relocate (as separate operations).
 
 **path suffix convention**:
 A note path ends in `.md`, a directory path ends in `/` — the suffix alone tells
@@ -121,7 +118,7 @@ note from directory, across every tool.
 
 **destructive tool**:
 A tool that removes or overwrites existing content — `edit_sections`,
-`edit_properties`, `rename_notes`, `relocate_notes`, `delete_notes`. A
+`edit_properties`, `move_notes`, `delete_notes`. A
 destructive batch is **all-or-nothing**: one rejected item rejects the whole
 batch and nothing is written. See [ADR on the transaction model](docs/adr/0007-multi-file-transaction.md).
 _Avoid_: dangerous, unsafe.

@@ -66,8 +66,8 @@ async fn http_client_lists_tools_and_calls_one() {
     let tools = client.list_all_tools().await.expect("list tools");
     assert_eq!(
         tools.len(),
-        12,
-        "expected the full 12-tool surface over HTTP"
+        11,
+        "expected the full 11-tool surface over HTTP"
     );
 
     let mut args = serde_json::Map::new();
@@ -104,7 +104,7 @@ async fn http_requires_bearer_when_token_set() {
         StreamableHttpClientTransportConfig::with_uri(url).auth_header("s3cret"),
     );
     let client = serve_client((), authed).await.expect("authed handshake");
-    assert_eq!(client.list_all_tools().await.expect("list tools").len(), 12);
+    assert_eq!(client.list_all_tools().await.expect("list tools").len(), 11);
 
     client.cancel().await.ok();
     handle.abort();
