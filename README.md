@@ -7,9 +7,9 @@ YAML frontmatter) to AI agents, with structure-aware tools — outline reads,
 section-level edits, frontmatter properties, safe batch writes — instead of
 treating the vault as a flat pile of files.
 
-**Status:** the full 12-tool surface is implemented and tested (read, search,
+**Status:** the full 11-tool surface is implemented and tested (read, search,
 section/property edits, safe batch moves and deletes) over a crash-safe
-transaction engine, plus opt-in git sync (a 13th tool, `sync_vault`, with
+transaction engine, plus opt-in git sync (a 12th tool, `sync_vault`, with
 auto-commit/push/pull automation) and an event journal for external consumers.
 Built foundations-first (path safety → parser → frontmatter → transaction →
 tools), test-driven.

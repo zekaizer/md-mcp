@@ -300,12 +300,8 @@ def _property_edit(g: Gen) -> dict:
     return _junk(g, d)
 
 
-def _rename_item(g: Gen) -> dict:
-    return _junk(g, {"path": g.path(), "new_name": g.rng.choice([g.path(), g.string()])})
-
-
-def _relocate_item(g: Gen) -> dict:
-    return _junk(g, {"source": g.path(), "dest_dir": g.rng.choice([g.path(), "", "/", "d/"])})
+def _move_item(g: Gen) -> dict:
+    return _junk(g, {"source": g.path(), "dest": g.rng.choice([g.path(), g.string(), "", "/", "d/"])})
 
 
 def make_factories(g: Gen):
@@ -352,12 +348,8 @@ def make_factories(g: Gen):
             "edits": g.small_batch(lambda: _edit_item(g))}),
         "edit_properties": lambda: _junk(g, {
             "edits": g.small_batch(lambda: _property_edit(g))}),
-        "rename_notes": lambda: _junk(g, {
-            "renames": g.small_batch(lambda: _rename_item(g)),
-            **({"overwrite": g.bool_()} if g._maybe(0.5) else {}),
-        }),
-        "relocate_notes": lambda: _junk(g, {
-            "moves": g.small_batch(lambda: _relocate_item(g)),
+        "move_notes": lambda: _junk(g, {
+            "moves": g.small_batch(lambda: _move_item(g)),
             **({"overwrite": g.bool_()} if g._maybe(0.5) else {}),
         }),
         "delete_notes": lambda: _junk(g, {"paths": g.small_batch(g.path)}),
