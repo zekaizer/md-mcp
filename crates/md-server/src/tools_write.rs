@@ -180,9 +180,9 @@ pub struct DestinationArg {
 #[schemars(crate = "rmcp::schemars")]
 pub struct EditSectionsResponse {
     pub ok: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub applied: Vec<AppliedEdit>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
     /// Present while git sync is failing (ADR-0019); see sync_vault.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -305,9 +305,9 @@ pub struct PropertyEdit {
 #[schemars(crate = "rmcp::schemars")]
 pub struct EditPropertiesResponse {
     pub ok: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub applied: Vec<PropertyApplied>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
     /// Present while git sync is failing (ADR-0019); see sync_vault.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -713,6 +713,30 @@ mod tests {
             vault.write_atomic(p, b.as_bytes()).unwrap();
         }
         (dir, MdServer::new(vault))
+    }
+
+    #[test]
+    fn condensed_write_responses_satisfy_their_schemas() {
+        use crate::envelope::assert_condensed_satisfies_schema;
+        use rmcp::schemars::schema_for;
+        assert_condensed_satisfies_schema(
+            schema_for!(EditSectionsResponse),
+            EditSectionsResponse {
+                ok: true,
+                applied: vec![],
+                errors: vec![],
+                sync_warning: None,
+            },
+        );
+        assert_condensed_satisfies_schema(
+            schema_for!(EditPropertiesResponse),
+            EditPropertiesResponse {
+                ok: true,
+                applied: vec![],
+                errors: vec![],
+                sync_warning: None,
+            },
+        );
     }
 
     #[tokio::test]

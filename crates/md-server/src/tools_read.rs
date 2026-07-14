@@ -69,7 +69,7 @@ pub struct ReadNotesResponse {
     pub notes: Vec<NoteRead>,
     /// Request indexes dropped to keep the response under the content budget;
     /// read those notes via read_outlines → read_sections instead.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub omitted: Vec<usize>,
 }
 
@@ -154,7 +154,7 @@ pub struct ReadOutlinesResponse {
     /// Request indexes dropped to keep the response under the content budget
     /// (a pathological note with thousands of headings); narrow the request
     /// or read the note via read_sections.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub omitted: Vec<usize>,
 }
 
@@ -246,7 +246,7 @@ pub struct ReadSectionsResponse {
     pub sections: Vec<SectionRead>,
     /// Request indexes dropped to keep the response under the content budget;
     /// re-read those targets with narrower sections.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub omitted: Vec<usize>,
 }
 
@@ -420,6 +420,24 @@ mod tests {
             vault.write_atomic(path, body.as_bytes()).unwrap();
         }
         (dir, vault)
+    }
+
+    #[test]
+    fn condensed_read_responses_satisfy_their_schemas() {
+        use crate::envelope::assert_condensed_satisfies_schema;
+        use rmcp::schemars::schema_for;
+        assert_condensed_satisfies_schema(
+            schema_for!(ReadNotesResponse),
+            ReadNotesResponse { notes: vec![], omitted: vec![] },
+        );
+        assert_condensed_satisfies_schema(
+            schema_for!(ReadOutlinesResponse),
+            ReadOutlinesResponse { outlines: vec![], omitted: vec![] },
+        );
+        assert_condensed_satisfies_schema(
+            schema_for!(ReadSectionsResponse),
+            ReadSectionsResponse { sections: vec![], omitted: vec![] },
+        );
     }
 
     #[test]

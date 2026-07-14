@@ -138,15 +138,15 @@ pub struct DeleteNotesRequest {
 #[schemars(crate = "rmcp::schemars")]
 pub struct DeleteNotesResponse {
     pub ok: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deleted: Vec<DeletedItem>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
     /// Directories removed because the batch emptied them (prune_empty).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pruned: Vec<String>,
     /// True when this was a dry run: nothing was written.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
     /// Present while git sync is failing (ADR-0019); see sync_vault.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -194,19 +194,19 @@ pub struct MoveItem {
 #[schemars(crate = "rmcp::schemars")]
 pub struct MoveResponse {
     pub ok: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub moved: Vec<MovedItem>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ApiError>,
     /// Directories removed because the batch emptied them (prune_empty).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pruned: Vec<String>,
     /// Notes whose links were rewritten for this batch (update_links),
     /// reported at their post-batch paths.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relinked: Vec<String>,
     /// True when this was a dry run: nothing was written.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
     /// Present while git sync is failing (ADR-0019); see sync_vault.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -761,6 +761,35 @@ mod tests {
             vault.write_atomic(p, b.as_bytes()).unwrap();
         }
         (dir, MdServer::new(vault))
+    }
+
+    #[test]
+    fn condensed_organize_responses_satisfy_their_schemas() {
+        use crate::envelope::assert_condensed_satisfies_schema;
+        use rmcp::schemars::schema_for;
+        assert_condensed_satisfies_schema(
+            schema_for!(DeleteNotesResponse),
+            DeleteNotesResponse {
+                ok: true,
+                deleted: vec![],
+                errors: vec![],
+                pruned: vec![],
+                dry_run: false,
+                sync_warning: None,
+            },
+        );
+        assert_condensed_satisfies_schema(
+            schema_for!(MoveResponse),
+            MoveResponse {
+                ok: true,
+                moved: vec![],
+                errors: vec![],
+                pruned: vec![],
+                relinked: vec![],
+                dry_run: false,
+                sync_warning: None,
+            },
+        );
     }
 
     #[tokio::test]

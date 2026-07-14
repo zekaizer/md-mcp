@@ -27,7 +27,7 @@ pub struct SyncVaultResponse {
     /// Commits pushed to the remote.
     pub pushed: u64,
     /// Conflicted paths when `status` is `conflict`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts: Vec<String>,
 }
 
@@ -171,6 +171,19 @@ mod tests {
 
     use crate::sync::GitSync;
     use crate::tools_write::{CreateNotesRequest, NoteInput};
+
+    #[test]
+    fn condensed_sync_response_satisfies_its_schema() {
+        crate::envelope::assert_condensed_satisfies_schema(
+            rmcp::schemars::schema_for!(SyncVaultResponse),
+            SyncVaultResponse {
+                status: "clean".into(),
+                pulled: 0,
+                pushed: 0,
+                conflicts: vec![],
+            },
+        );
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let out = Command::new("git")

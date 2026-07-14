@@ -82,6 +82,27 @@ pub fn write_size_error(what: &str, len: usize) -> md_core::Error {
     )
 }
 
+/// Test-only invariant behind the condensed wire format: every `required`
+/// property of a response schema must survive serialization of the most
+/// condensed value (all skippable fields empty/false) — otherwise clients
+/// validating structuredContent against outputSchema reject the response.
+#[cfg(test)]
+pub(crate) fn assert_condensed_satisfies_schema(
+    schema: impl Serialize,
+    condensed: impl Serialize,
+) {
+    let schema = serde_json::to_value(schema).unwrap();
+    let value = serde_json::to_value(condensed).unwrap();
+    for key in schema["required"].as_array().into_iter().flatten() {
+        let key = key.as_str().unwrap();
+        assert!(
+            value.get(key).is_some(),
+            "schema marks `{key}` required but the condensed response omits it \
+             (pair skip_serializing_if with #[serde(default)])"
+        );
+    }
+}
+
 /// A machine-readable error embedded in a tool response (per-item or per-batch).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
