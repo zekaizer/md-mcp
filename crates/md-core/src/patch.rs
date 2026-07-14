@@ -175,33 +175,16 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Vec<Splice>
                 footprint: (start, end),
             }])
         }
-        Operation::InsertBefore => {
+        Operation::InsertBefore | Operation::InsertAfter => {
             let content = require_content(edit)?;
             validate_inserted_levels(content, sibling_level(doc, index))?;
-            let pos = section.0;
+            let pos = if op == Operation::InsertBefore {
+                section.0
+            } else {
+                section.1
+            };
             let mut rep = content.to_string();
-            if !rep.ends_with('\n') {
-                rep.push('\n');
-            }
-            Ok(vec![Splice {
-                start: pos,
-                end: pos,
-                replacement: rep,
-                footprint: (pos, pos),
-            }])
-        }
-        Operation::InsertAfter => {
-            let content = require_content(edit)?;
-            validate_inserted_levels(content, sibling_level(doc, index))?;
-            let pos = section.1;
-            let mut rep = String::new();
-            if pos > 0 && source.as_bytes().get(pos - 1).is_some_and(|&b| b != b'\n') {
-                rep.push('\n');
-            }
-            rep.push_str(content);
-            if !rep.ends_with('\n') {
-                rep.push('\n');
-            }
+            pad_block_seams(&mut rep, source, pos);
             Ok(vec![Splice {
                 start: pos,
                 end: pos,
@@ -302,23 +285,7 @@ fn resolve_move(
     };
 
     let mut moved = src_span.of(source).to_string();
-    if !moved.ends_with('\n') {
-        moved.push('\n');
-    }
-
-    // Keep a blank line at both insertion seams (only ever adds, never
-    // removes) so the moved section is not glued to its new neighbours.
-    let bytes = source.as_bytes();
-    if dest_pos > 0 {
-        if bytes[dest_pos - 1] != b'\n' {
-            moved.insert_str(0, "\n\n");
-        } else if dest_pos >= 2 && bytes[dest_pos - 2] != b'\n' {
-            moved.insert(0, '\n');
-        }
-    }
-    if dest_pos < source.len() && !moved.ends_with("\n\n") {
-        moved.push('\n');
-    }
+    pad_block_seams(&mut moved, source, dest_pos);
 
     Ok(vec![
         Splice {
@@ -334,6 +301,28 @@ fn resolve_move(
             footprint: (dest_pos, dest_pos),
         },
     ])
+}
+
+/// Pad `block` so a blank line separates it from both neighbours of the
+/// zero-width insertion at `pos`
+/// ([ADR-0025](../../../docs/adr/0025-insertion-placement.md)): a sibling
+/// block — inserted or moved — is never glued to the sections around it.
+/// Only ever adds, never removes; nothing is added at the document edges.
+fn pad_block_seams(block: &mut String, source: &str, pos: usize) {
+    if !block.ends_with('\n') {
+        block.push('\n');
+    }
+    let bytes = source.as_bytes();
+    if pos > 0 {
+        if bytes[pos - 1] != b'\n' {
+            block.insert_str(0, "\n\n");
+        } else if pos >= 2 && bytes[pos - 2] != b'\n' {
+            block.insert(0, '\n');
+        }
+    }
+    if pos < source.len() && !block.ends_with("\n\n") {
+        block.push('\n');
+    }
 }
 
 /// Where `append` inserts ([ADR-0025](../../../docs/adr/0025-insertion-placement.md)):
@@ -661,7 +650,7 @@ mod tests {
             ..edit(&["A"], Operation::Replace)
         };
         let out = apply(src, vec![ins, rep]);
-        assert_eq!(out, "# A\nnew\n# New\nn\n# B\nb\n");
+        assert_eq!(out, "# A\nnew\n\n# New\nn\n\n# B\nb\n");
     }
 
     #[test]
@@ -686,12 +675,13 @@ mod tests {
 
     #[test]
     fn insert_before_creates_sibling() {
+        // ADR-0025: an inserted block gets a blank line at both seams.
         let src = "# B\nx\n";
         let e = Edit {
             content: Some("# A\nnew\n".into()),
             ..edit(&["B"], Operation::InsertBefore)
         };
-        assert_eq!(apply(src, vec![e]), "# A\nnew\n# B\nx\n");
+        assert_eq!(apply(src, vec![e]), "# A\nnew\n\n# B\nx\n");
     }
 
     #[test]
@@ -701,7 +691,27 @@ mod tests {
             content: Some("# B\nnew".into()),
             ..edit(&["A"], Operation::InsertAfter)
         };
-        assert_eq!(apply(src, vec![e]), "# A\nx\n# B\nnew\n");
+        assert_eq!(apply(src, vec![e]), "# A\nx\n\n# B\nnew\n");
+    }
+
+    #[test]
+    fn insert_between_sections_separates_both_seams() {
+        let src = "# A\nx\n# B\ny\n";
+        let e = Edit {
+            content: Some("# N\nn\n".into()),
+            ..edit(&["A"], Operation::InsertAfter)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\nx\n\n# N\nn\n\n# B\ny\n");
+    }
+
+    #[test]
+    fn insert_does_not_double_an_existing_blank_seam() {
+        let src = "# A\nbody\n\n# B\nx\n";
+        let e = Edit {
+            content: Some("# N\nn\n".into()),
+            ..edit(&["B"], Operation::InsertBefore)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\nbody\n\n# N\nn\n\n# B\nx\n");
     }
 
     #[test]
