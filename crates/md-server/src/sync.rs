@@ -20,18 +20,18 @@ use crate::events::EventOp;
 const EXCLUDE_LINES: &[&str] = &[".md-mcp/", ".*/"];
 
 /// Ensure the [`EXCLUDE_LINES`] are present in the vault's git repository, if
-/// one exists. Written to `.git/info/exclude` — per-machine state, unlike the
-/// user-owned, replicated `.gitignore`, which is never touched. Only the
-/// missing lines are appended, so an existing repo carrying just the legacy
-/// `.md-mcp/` line gains `.*/` without churn. A `.git` *file*
-/// (worktree/submodule gitfile) is left alone: resolving the real git dir is
-/// not worth it for a hardening step. Best-effort: failures are logged, never
-/// fatal — a missing exclusion degrades sync hygiene, not correctness.
+/// one exists. Written to the repository's `info/exclude` — per-machine state,
+/// unlike the user-owned, replicated `.gitignore`, which is never touched.
+/// Only the missing lines are appended, so an existing repo carrying just the
+/// legacy `.md-mcp/` line gains `.*/` without churn. A `.git` *file*
+/// (worktree/submodule/--separate-git-dir gitfile) is followed to the real git
+/// dir — and through `commondir` for linked worktrees — so the lines land
+/// where git reads them. Best-effort: failures are logged, never fatal — a
+/// missing exclusion degrades sync hygiene, not correctness.
 pub fn ensure_git_exclude(vault_root: &Path) {
-    let git_dir = vault_root.join(".git");
-    if !git_dir.is_dir() {
+    let Some(git_dir) = resolve_git_dir(vault_root) else {
         return;
-    }
+    };
     let exclude = git_dir.join("info").join("exclude");
     let current = std::fs::read_to_string(&exclude).unwrap_or_default();
     let missing: Vec<&str> = EXCLUDE_LINES
@@ -62,6 +62,28 @@ pub fn ensure_git_exclude(vault_root: &Path) {
     match appended {
         Ok(()) => tracing::info!(added = ?missing, "updated .git/info/exclude"),
         Err(e) => tracing::warn!(error = %e, "cannot write .git/info/exclude"),
+    }
+}
+
+/// The vault's git directory: `.git` itself when a directory, or the target of
+/// a `.git` gitfile (`gitdir: <path>`, relative to the vault root or
+/// absolute), then through a `commondir` file when present — a linked
+/// worktree's excludes live in the main repository's git dir, not the
+/// per-worktree one. `None` (not a repo, malformed gitfile, dangling target)
+/// means there is nothing to harden.
+fn resolve_git_dir(vault_root: &Path) -> Option<PathBuf> {
+    let dot_git = vault_root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let pointer = std::fs::read_to_string(&dot_git).ok()?;
+    let target = pointer.strip_prefix("gitdir:")?.trim();
+    // join() replaces the base when the target is absolute; canonicalize
+    // verifies the resolved dir actually exists.
+    let git_dir = std::fs::canonicalize(vault_root.join(target)).ok()?;
+    match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(common) => std::fs::canonicalize(git_dir.join(common.trim())).ok(),
+        Err(_) => Some(git_dir),
     }
 }
 
@@ -440,13 +462,75 @@ mod tests {
     }
 
     #[test]
-    fn gitfile_worktree_is_left_alone() {
+    fn dangling_or_malformed_gitfile_is_ignored() {
+        // Target directory does not exist: nothing to write, gitfile untouched.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".git"), "gitdir: ../elsewhere\n").unwrap();
         ensure_git_exclude(dir.path());
         assert_eq!(
             std::fs::read_to_string(dir.path().join(".git")).unwrap(),
             "gitdir: ../elsewhere\n"
+        );
+
+        // Not a gitfile at all: ignored.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".git"), "not a gitfile\n").unwrap();
+        ensure_git_exclude(dir.path());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".git")).unwrap(),
+            "not a gitfile\n"
+        );
+    }
+
+    #[test]
+    fn gitfile_lands_exclude_in_the_separate_git_dir() {
+        // `git init --separate-git-dir` layout: `.git` is a file pointing at
+        // the real git dir, absolute or relative to the vault root.
+        for target in ["absolute", "relative"] {
+            let dir = tempfile::tempdir().unwrap();
+            let git_dir = dir.path().join("meta/repo.git");
+            std::fs::create_dir_all(&git_dir).unwrap();
+            let vault = dir.path().join("vault");
+            std::fs::create_dir_all(&vault).unwrap();
+            let pointer = match target {
+                "absolute" => format!("gitdir: {}\n", git_dir.display()),
+                _ => "gitdir: ../meta/repo.git\n".to_string(),
+            };
+            std::fs::write(vault.join(".git"), pointer).unwrap();
+            ensure_git_exclude(&vault);
+            assert_eq!(
+                std::fs::read_to_string(git_dir.join("info/exclude")).unwrap(),
+                ".md-mcp/\n.*/\n",
+                "{target} gitdir"
+            );
+        }
+    }
+
+    #[test]
+    fn linked_worktree_exclude_lands_in_the_common_dir() {
+        // A linked worktree's gitdir is `<main>/.git/worktrees/<name>`, whose
+        // `commondir` file points back at the main `.git` — where git actually
+        // reads info/exclude from.
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path().join("main/.git");
+        let wt_git_dir = common.join("worktrees/wt");
+        std::fs::create_dir_all(&wt_git_dir).unwrap();
+        std::fs::write(wt_git_dir.join("commondir"), "../..\n").unwrap();
+        let vault = dir.path().join("wt");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(
+            vault.join(".git"),
+            format!("gitdir: {}\n", wt_git_dir.display()),
+        )
+        .unwrap();
+        ensure_git_exclude(&vault);
+        assert_eq!(
+            std::fs::read_to_string(common.join("info/exclude")).unwrap(),
+            ".md-mcp/\n.*/\n"
+        );
+        assert!(
+            !wt_git_dir.join("info/exclude").exists(),
+            "nothing written into the per-worktree dir"
         );
     }
 
