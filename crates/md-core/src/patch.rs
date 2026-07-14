@@ -147,7 +147,7 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Vec<Splice>
         Operation::Append => {
             let content = require_content(edit)?;
             validate_inserted_levels(content, inside_level(doc, index))?;
-            let pos = content_span.end;
+            let pos = append_pos(source, content_span.start, content_span.end);
             let mut rep = String::new();
             if pos > 0 && source.as_bytes()[pos - 1] != b'\n' {
                 rep.push('\n');
@@ -175,33 +175,16 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Vec<Splice>
                 footprint: (start, end),
             }])
         }
-        Operation::InsertBefore => {
+        Operation::InsertBefore | Operation::InsertAfter => {
             let content = require_content(edit)?;
             validate_inserted_levels(content, sibling_level(doc, index))?;
-            let pos = section.0;
+            let pos = if op == Operation::InsertBefore {
+                section.0
+            } else {
+                section.1
+            };
             let mut rep = content.to_string();
-            if !rep.ends_with('\n') {
-                rep.push('\n');
-            }
-            Ok(vec![Splice {
-                start: pos,
-                end: pos,
-                replacement: rep,
-                footprint: (pos, pos),
-            }])
-        }
-        Operation::InsertAfter => {
-            let content = require_content(edit)?;
-            validate_inserted_levels(content, sibling_level(doc, index))?;
-            let pos = section.1;
-            let mut rep = String::new();
-            if pos > 0 && source.as_bytes().get(pos - 1).is_some_and(|&b| b != b'\n') {
-                rep.push('\n');
-            }
-            rep.push_str(content);
-            if !rep.ends_with('\n') {
-                rep.push('\n');
-            }
+            pad_block_seams(&mut rep, source, pos);
             Ok(vec![Splice {
                 start: pos,
                 end: pos,
@@ -302,23 +285,7 @@ fn resolve_move(
     };
 
     let mut moved = src_span.of(source).to_string();
-    if !moved.ends_with('\n') {
-        moved.push('\n');
-    }
-
-    // Keep a blank line at both insertion seams (only ever adds, never
-    // removes) so the moved section is not glued to its new neighbours.
-    let bytes = source.as_bytes();
-    if dest_pos > 0 {
-        if bytes[dest_pos - 1] != b'\n' {
-            moved.insert_str(0, "\n\n");
-        } else if dest_pos >= 2 && bytes[dest_pos - 2] != b'\n' {
-            moved.insert(0, '\n');
-        }
-    }
-    if dest_pos < source.len() && !moved.ends_with("\n\n") {
-        moved.push('\n');
-    }
+    pad_block_seams(&mut moved, source, dest_pos);
 
     Ok(vec![
         Splice {
@@ -334,6 +301,58 @@ fn resolve_move(
             footprint: (dest_pos, dest_pos),
         },
     ])
+}
+
+/// Pad `block` so a blank line separates it from both neighbours of the
+/// zero-width insertion at `pos`
+/// ([ADR-0025](../../../docs/adr/0025-insertion-placement.md)): a sibling
+/// block — inserted or moved — is never glued to the sections around it.
+/// Only ever adds, never removes; nothing is added at the document edges.
+fn pad_block_seams(block: &mut String, source: &str, pos: usize) {
+    if !block.ends_with('\n') {
+        block.push('\n');
+    }
+    let bytes = source.as_bytes();
+    if pos > 0 {
+        if bytes[pos - 1] != b'\n' {
+            block.insert_str(0, "\n\n");
+        } else if pos >= 2 && bytes[pos - 2] != b'\n' {
+            block.insert(0, '\n');
+        }
+    }
+    if pos < source.len() && !block.ends_with("\n\n") {
+        block.push('\n');
+    }
+}
+
+/// Where `append` inserts ([ADR-0025](../../../docs/adr/0025-insertion-placement.md)):
+/// `append` continues the section's text, so when the span is followed by a
+/// heading the point backs up over the span's trailing whitespace-only lines —
+/// the separator ahead of that heading — to sit directly after the last
+/// non-blank line. A span ending at EOF keeps the literal end, matching
+/// `append_notes` at the note level.
+fn append_pos(source: &str, start: usize, end: usize) -> usize {
+    if end == source.len() {
+        return end;
+    }
+    let bytes = source.as_bytes();
+    let mut pos = end;
+    while pos > start {
+        // The line ending at `pos` (its newline is at pos - 1).
+        let line_start = bytes[start..pos - 1]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(start, |i| start + i + 1);
+        if bytes[line_start..pos]
+            .iter()
+            .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            pos = line_start;
+        } else {
+            break;
+        }
+    }
+    pos
 }
 
 /// The `(start, end)` of a target's whole section (heading line included for a
@@ -516,6 +535,65 @@ mod tests {
     }
 
     #[test]
+    fn append_body_joins_text_before_the_separator_blank() {
+        // ADR-0025: the blank line ahead of the next heading is a separator,
+        // not content — appended text continues the body and leaves it be.
+        let src = "# A\nlead\n\n## B\nsub\n";
+        let e = Edit {
+            scope: Scope::Body,
+            content: Some("more".into()),
+            ..edit(&["A"], Operation::Append)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\nlead\nmore\n\n## B\nsub\n");
+    }
+
+    #[test]
+    fn append_section_joins_text_before_the_separator_blank() {
+        let src = "# A\nlead\n## B\nsub\n\n# C\n";
+        let e = Edit {
+            scope: Scope::Section,
+            content: Some("tail".into()),
+            ..edit(&["A"], Operation::Append)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\nlead\n## B\nsub\ntail\n\n# C\n");
+    }
+
+    #[test]
+    fn append_skips_whitespace_only_lines_not_just_empty_ones() {
+        let src = "# A\nlead\n \t\n\n## B\n";
+        let e = Edit {
+            scope: Scope::Body,
+            content: Some("more".into()),
+            ..edit(&["A"], Operation::Append)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\nlead\nmore\n \t\n\n## B\n");
+    }
+
+    #[test]
+    fn append_to_blank_only_body_lands_under_the_heading() {
+        let src = "## A\n\n## B\n";
+        let e = Edit {
+            scope: Scope::Body,
+            content: Some("more".into()),
+            ..edit(&["A"], Operation::Append)
+        };
+        assert_eq!(apply(src, vec![e]), "## A\nmore\n\n## B\n");
+    }
+
+    #[test]
+    fn append_at_eof_keeps_the_literal_end() {
+        // No following heading, no separator to preserve: append stays literal,
+        // matching append_notes at the note level.
+        let src = "# A\ntext\n\n";
+        let e = Edit {
+            scope: Scope::Section,
+            content: Some("more".into()),
+            ..edit(&["A"], Operation::Append)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\ntext\n\nmore\n");
+    }
+
+    #[test]
     fn replace_empty_body_does_not_glue_to_next_heading() {
         // Regression: replacing the (empty) body of a heading that is immediately
         // followed by a subheading must not merge into it.
@@ -572,7 +650,7 @@ mod tests {
             ..edit(&["A"], Operation::Replace)
         };
         let out = apply(src, vec![ins, rep]);
-        assert_eq!(out, "# A\nnew\n# New\nn\n# B\nb\n");
+        assert_eq!(out, "# A\nnew\n\n# New\nn\n\n# B\nb\n");
     }
 
     #[test]
@@ -597,12 +675,13 @@ mod tests {
 
     #[test]
     fn insert_before_creates_sibling() {
+        // ADR-0025: an inserted block gets a blank line at both seams.
         let src = "# B\nx\n";
         let e = Edit {
             content: Some("# A\nnew\n".into()),
             ..edit(&["B"], Operation::InsertBefore)
         };
-        assert_eq!(apply(src, vec![e]), "# A\nnew\n# B\nx\n");
+        assert_eq!(apply(src, vec![e]), "# A\nnew\n\n# B\nx\n");
     }
 
     #[test]
@@ -612,7 +691,27 @@ mod tests {
             content: Some("# B\nnew".into()),
             ..edit(&["A"], Operation::InsertAfter)
         };
-        assert_eq!(apply(src, vec![e]), "# A\nx\n# B\nnew\n");
+        assert_eq!(apply(src, vec![e]), "# A\nx\n\n# B\nnew\n");
+    }
+
+    #[test]
+    fn insert_between_sections_separates_both_seams() {
+        let src = "# A\nx\n# B\ny\n";
+        let e = Edit {
+            content: Some("# N\nn\n".into()),
+            ..edit(&["A"], Operation::InsertAfter)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\nx\n\n# N\nn\n\n# B\ny\n");
+    }
+
+    #[test]
+    fn insert_does_not_double_an_existing_blank_seam() {
+        let src = "# A\nbody\n\n# B\nx\n";
+        let e = Edit {
+            content: Some("# N\nn\n".into()),
+            ..edit(&["B"], Operation::InsertBefore)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\nbody\n\n# N\nn\n\n# B\nx\n");
     }
 
     #[test]

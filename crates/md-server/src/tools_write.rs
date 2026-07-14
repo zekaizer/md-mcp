@@ -414,7 +414,7 @@ impl MdServer {
 
     /// Edit note sections by heading path (all-or-nothing).
     #[tool(
-        description = "Edit sections by heading_path: replace/append/delete (by scope body|section), insert_before/insert_after, rename (new_heading), move (to a destination section). All-or-nothing: any rejected edit (unresolved/ambiguous heading, overlap, HASH_MISMATCH, HEADING_LEVEL) rejects the whole batch and nothing is written. Pass expected_hash from read_sections for optimistic concurrency.",
+        description = "Edit sections by heading_path: replace/append/delete (by scope body|section), insert_before/insert_after, rename (new_heading), move (to a destination section). append continues the section's text (after its last non-blank line, keeping the blank lines before the next heading); to append prose to the section itself use scope:\"body\" — with scope:\"section\" plain text joins the last subsection. insert_*/move place a sibling block, blank-line-separated on both sides. All-or-nothing: any rejected edit (unresolved/ambiguous heading, overlap, HASH_MISMATCH, HEADING_LEVEL) rejects the whole batch and nothing is written. Pass expected_hash from read_sections for optimistic concurrency.",
         annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false)
     )]
     pub async fn edit_sections(

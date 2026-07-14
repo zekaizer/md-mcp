@@ -33,3 +33,4 @@ immutable; a changed decision supersedes the old one with a new ADR.
 - [0022](0022-link-rewrite-on-move.md) — Rewrite standard-Markdown links on move (full-scan, no index)
 - [0023](0023-cli-arguments-and-clap.md) — CLI arguments via clap, with env fallback
 - [0024](0024-unified-move-primitive.md) — Unified move primitive (rename + relocate; supersedes 0009)
+- [0025](0025-insertion-placement.md) — Insertion placement follows authoring intent
