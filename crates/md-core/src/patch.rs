@@ -147,7 +147,7 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Vec<Splice>
         Operation::Append => {
             let content = require_content(edit)?;
             validate_inserted_levels(content, inside_level(doc, index))?;
-            let pos = content_span.end;
+            let pos = append_pos(source, content_span.start, content_span.end);
             let mut rep = String::new();
             if pos > 0 && source.as_bytes()[pos - 1] != b'\n' {
                 rep.push('\n');
@@ -336,6 +336,36 @@ fn resolve_move(
     ])
 }
 
+/// Where `append` inserts ([ADR-0025](../../../docs/adr/0025-insertion-placement.md)):
+/// `append` continues the section's text, so when the span is followed by a
+/// heading the point backs up over the span's trailing whitespace-only lines —
+/// the separator ahead of that heading — to sit directly after the last
+/// non-blank line. A span ending at EOF keeps the literal end, matching
+/// `append_notes` at the note level.
+fn append_pos(source: &str, start: usize, end: usize) -> usize {
+    if end == source.len() {
+        return end;
+    }
+    let bytes = source.as_bytes();
+    let mut pos = end;
+    while pos > start {
+        // The line ending at `pos` (its newline is at pos - 1).
+        let line_start = bytes[start..pos - 1]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(start, |i| start + i + 1);
+        if bytes[line_start..pos]
+            .iter()
+            .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            pos = line_start;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
 /// The `(start, end)` of a target's whole section (heading line included for a
 /// heading, the whole body for the root).
 fn section_bounds(doc: &Document, index: Option<usize>) -> (usize, usize) {
@@ -513,6 +543,65 @@ mod tests {
             ..edit(&["A"], Operation::Append)
         };
         assert_eq!(apply(src, vec![e]), "# A\nlead\n## B\nsub\ntail\n# C\n");
+    }
+
+    #[test]
+    fn append_body_joins_text_before_the_separator_blank() {
+        // ADR-0025: the blank line ahead of the next heading is a separator,
+        // not content — appended text continues the body and leaves it be.
+        let src = "# A\nlead\n\n## B\nsub\n";
+        let e = Edit {
+            scope: Scope::Body,
+            content: Some("more".into()),
+            ..edit(&["A"], Operation::Append)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\nlead\nmore\n\n## B\nsub\n");
+    }
+
+    #[test]
+    fn append_section_joins_text_before_the_separator_blank() {
+        let src = "# A\nlead\n## B\nsub\n\n# C\n";
+        let e = Edit {
+            scope: Scope::Section,
+            content: Some("tail".into()),
+            ..edit(&["A"], Operation::Append)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\nlead\n## B\nsub\ntail\n\n# C\n");
+    }
+
+    #[test]
+    fn append_skips_whitespace_only_lines_not_just_empty_ones() {
+        let src = "# A\nlead\n \t\n\n## B\n";
+        let e = Edit {
+            scope: Scope::Body,
+            content: Some("more".into()),
+            ..edit(&["A"], Operation::Append)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\nlead\nmore\n \t\n\n## B\n");
+    }
+
+    #[test]
+    fn append_to_blank_only_body_lands_under_the_heading() {
+        let src = "## A\n\n## B\n";
+        let e = Edit {
+            scope: Scope::Body,
+            content: Some("more".into()),
+            ..edit(&["A"], Operation::Append)
+        };
+        assert_eq!(apply(src, vec![e]), "## A\nmore\n\n## B\n");
+    }
+
+    #[test]
+    fn append_at_eof_keeps_the_literal_end() {
+        // No following heading, no separator to preserve: append stays literal,
+        // matching append_notes at the note level.
+        let src = "# A\ntext\n\n";
+        let e = Edit {
+            scope: Scope::Section,
+            content: Some("more".into()),
+            ..edit(&["A"], Operation::Append)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\ntext\n\nmore\n");
     }
 
     #[test]
