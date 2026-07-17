@@ -2,7 +2,9 @@
 //!
 //! Both are single (non-batch) read tools. list_notes pages a sorted vault walk;
 //! search_notes scans note bodies with an aho-corasick automaton and filters
-//! frontmatter ([ADR-0010](../../../docs/adr/0010-search-strategy.md)).
+//! frontmatter ([ADR-0010](../../../docs/adr/0010-search-strategy.md)). A CJK
+//! query scans a second time over [`cjk_fold`]ed text, so spacing and inline
+//! style inside a term do not hide it.
 
 use aho_corasick::AhoCorasick;
 use md_core::frontmatter;
@@ -13,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::MdServer;
+use crate::cjk_fold;
 use crate::envelope::limit_bounds;
 
 fn default_recursive() -> bool {
@@ -170,7 +173,7 @@ impl MdServer {
 
     /// Search notes by content, filename, and/or frontmatter fields.
     #[tool(
-        description = "Search notes by content keywords (whitespace-AND), filename substring, and/or frontmatter field filters (all combined with AND). Returns path-sorted matches with a snippet and the filtered frontmatter values; pass next_cursor to page. Provide at least one of query/frontmatter/frontmatter_exists.",
+        description = "Search notes by content keywords (whitespace-AND), filename substring, and/or frontmatter field filters (all combined with AND). Returns path-sorted matches with a snippet and the filtered frontmatter values; pass next_cursor to page. Provide at least one of query/frontmatter/frontmatter_exists. CJK keywords match regardless of spacing and inline style, so 전역지침 finds 전역 지침 and **전역** 지침.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub async fn search_notes(
@@ -228,6 +231,8 @@ impl MdServer {
                     .ok()
             })
             .flatten();
+        // Gate the second, folded scan on the only queries it can help.
+        let query_has_cjk = keywords.iter().any(|k| cjk_fold::has_cjk(k));
 
         let Ok(entries) = self.vault().list_entries("", true, None, false) else {
             return SearchNotesResponse {
@@ -257,8 +262,14 @@ impl MdServer {
                 .of(&normalized)
                 .to_string();
             let body = md_core::text::nfc(&body).into_owned();
-            let (text_ok, snippet, match_count) =
-                self.match_query(req, &keywords, automaton.as_ref(), &entry.path, &body);
+            let (text_ok, snippet, match_count) = self.match_query(
+                req,
+                &keywords,
+                automaton.as_ref(),
+                query_has_cjk,
+                &entry.path,
+                &body,
+            );
             if has_query && !text_ok {
                 continue;
             }
@@ -326,6 +337,7 @@ impl MdServer {
         req: &SearchNotesRequest,
         keywords: &[String],
         automaton: Option<&AhoCorasick>,
+        query_has_cjk: bool,
         path: &str,
         body: &str,
     ) -> (bool, Option<String>, Option<usize>) {
@@ -334,37 +346,72 @@ impl MdServer {
         let query_lower =
             md_core::text::nfc(req.query.as_deref().unwrap_or_default()).to_lowercase();
 
-        let filename_hit = want_filename
-            && !query_lower.is_empty()
-            && md_core::text::nfc(path)
-                .to_lowercase()
-                .contains(&query_lower);
+        let filename_hit = want_filename && !query_lower.is_empty() && {
+            let path_lower = md_core::text::nfc(path).to_lowercase();
+            path_lower.contains(&query_lower)
+                || (query_has_cjk && folded_contains(&path_lower, &query_lower))
+        };
 
         let mut content_hit = false;
         let mut snippet = None;
         let mut match_count = None;
         if want_content && let Some(ac) = automaton {
             let mut seen = vec![false; keywords.len()];
-            let mut first: Option<usize> = None;
-            let mut hit_lines = std::collections::BTreeSet::new();
+            let mut hits = std::collections::BTreeSet::new(); // original byte offsets
             for m in ac.find_iter(body) {
                 seen[m.pattern().as_usize()] = true;
-                first.get_or_insert(m.start());
-                hit_lines.insert(body[..m.start()].bytes().filter(|&b| b == b'\n').count());
+                hits.insert(m.start());
+            }
+            // Fold only what the raw scan left unanswered. The two scans are
+            // unioned, never swapped: folding drops markers a query may itself
+            // contain, so the shadow alone would lose raw hits.
+            if query_has_cjk
+                && !seen.iter().all(|&s| s)
+                && let Some(folded) = cjk_fold::fold(body)
+            {
+                for m in ac.find_iter(folded.text()) {
+                    seen[m.pattern().as_usize()] = true;
+                    hits.insert(folded.to_original(m.start()));
+                }
             }
             if seen.iter().all(|&s| s) {
                 content_hit = true;
-                snippet = first.map(|off| build_snippet(body, off, req.context_lines));
-                match_count = Some(hit_lines.len());
+                snippet = hits
+                    .first()
+                    .map(|&off| build_snippet(body, off, req.context_lines));
+                let lines: std::collections::BTreeSet<usize> =
+                    hits.iter().map(|&off| line_of(body, off)).collect();
+                match_count = Some(lines.len());
             }
         }
         (filename_hit || content_hit, snippet, match_count)
     }
 }
 
+/// Whether `needle` occurs in `haystack` once CJK-internal gaps are folded out
+/// of both. Callers check the raw `contains` first; this only adds the hits that
+/// spacing or inline style hid.
+fn folded_contains(haystack: &str, needle: &str) -> bool {
+    let folded_hay = cjk_fold::fold(haystack);
+    let folded_needle = cjk_fold::fold(needle);
+    if folded_hay.is_none() && folded_needle.is_none() {
+        return false; // nothing to fold; the raw `contains` already decided
+    }
+    let hay = folded_hay.as_ref().map_or(haystack, cjk_fold::Folded::text);
+    let needle = folded_needle
+        .as_ref()
+        .map_or(needle, cjk_fold::Folded::text);
+    hay.contains(needle)
+}
+
+/// The 0-based line the byte offset `off` falls on.
+fn line_of(body: &str, off: usize) -> usize {
+    body[..off].bytes().filter(|&b| b == b'\n').count()
+}
+
 /// Extract `context_lines` of context around the byte offset `off`.
 fn build_snippet(body: &str, off: usize, context_lines: usize) -> String {
-    let line_no = body[..off].bytes().filter(|&b| b == b'\n').count();
+    let line_no = line_of(body, off);
     let lines: Vec<&str> = body.lines().collect();
     let start = line_no.saturating_sub(context_lines);
     let end = (line_no + context_lines + 1).min(lines.len());
@@ -630,5 +677,90 @@ mod tests {
             result.is_err(),
             "missing criterion must be a protocol error"
         );
+    }
+
+    async fn paths_for(s: &MdServer, query: &str) -> Vec<String> {
+        s.search_notes(Parameters(search_req(Some(query))))
+            .await
+            .unwrap()
+            .0
+            .items
+            .into_iter()
+            .map(|i| i.path)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn unspaced_cjk_query_matches_spacing_and_inline_style() {
+        // Korean is written with optional spacing, so "전역지침" and "전역 지침"
+        // are the same term; inline style markers split it in the source only.
+        let (_d, s) = server(&[
+            ("bold.md", "# T\n**전역** 지침을 따른다.\n"),
+            ("code.md", "# T\n`전역` 지침을 따른다.\n"),
+            ("head.md", "## 전역 지침\n본문.\n"),
+            ("plain.md", "# T\n전역 지침을 따른다.\n"),
+            ("wrap.md", "# T\n전역\n지침을 따른다.\n"),
+        ]);
+        assert_eq!(
+            paths_for(&s, "전역지침").await,
+            ["bold.md", "code.md", "head.md", "plain.md", "wrap.md"]
+        );
+    }
+
+    #[tokio::test]
+    async fn cjk_bridging_stops_at_block_structure() {
+        // Block markers sit at line starts and cell boundaries, so they must keep
+        // separating terms; only inline style is bridged.
+        let (_d, s) = server(&[
+            ("list.md", "- 전역\n- 지침\n"),
+            ("para.md", "전역\n\n지침\n"),
+            ("quote.md", "전역\n> 지침\n"),
+            ("rule.md", "전역\n\n***\n\n지침\n"),
+            ("section.md", "전역\n## 지침\n"),
+            ("sentence.md", "전역. 지침\n"),
+            ("table.md", "| 전역 | 지침 |\n"),
+            ("underscore.md", "__전역__ 지침\n"),
+        ]);
+        assert_eq!(paths_for(&s, "전역지침").await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn cjk_bridging_leaves_ascii_spacing_alone() {
+        let (_d, s) = server(&[("a.md", "hello world\n"), ("b.md", "snake_case name\n")]);
+        assert_eq!(paths_for(&s, "helloworld").await, Vec::<String>::new());
+        assert_eq!(paths_for(&s, "snakecase").await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn bridged_hit_reports_original_text() {
+        // The shadow text exists only to match; snippets and counts must address
+        // the original bytes, markers and all.
+        let (_d, s) = server(&[("a.md", "# T\nfiller\n**전역** 지침을 본다.\ntail\n")]);
+        let mut req = search_req(Some("전역지침"));
+        req.context_lines = 0;
+        let r = s.search_notes(Parameters(req)).await.unwrap().0;
+        assert_eq!(r.items[0].snippet.as_deref(), Some("**전역** 지침을 본다."));
+        assert_eq!(r.items[0].match_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn folding_never_loses_a_raw_match() {
+        // Folding drops markers a query may legitimately contain, so the raw and
+        // folded scans are unioned rather than swapped.
+        let (_d, s) = server(&[("a.md", "# T\n`전역` 지침\n")]);
+        assert_eq!(paths_for(&s, "`전역`").await, ["a.md"]);
+    }
+
+    #[tokio::test]
+    async fn filename_mode_bridges_cjk_spacing_both_ways() {
+        let (_d, s) = server(&[("로컬지침.md", "y"), ("전역 지침.md", "x")]);
+        for (query, want) in [("전역지침", "전역 지침.md"), ("로컬 지침", "로컬지침.md")]
+        {
+            let mut req = search_req(Some(query));
+            req.mode = SearchMode::Filename;
+            let r = s.search_notes(Parameters(req)).await.unwrap().0;
+            let got: Vec<&str> = r.items.iter().map(|i| i.path.as_str()).collect();
+            assert_eq!(got, [want], "filename query {query:?}");
+        }
     }
 }
