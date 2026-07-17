@@ -175,11 +175,15 @@ pub struct NoteOutline {
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct HeadingEntry {
+    /// Shortest address that resolves to this heading — pass it verbatim to
+    /// read_sections/edit_sections; a bare title whenever that is unique.
     pub heading_path: Vec<String>,
     pub level: u8,
     pub line: usize,
-    pub occurrence: usize,
-    pub ambiguous: bool,
+    /// Present only when even the full heading path is duplicated; pass it
+    /// along with heading_path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurrence: Option<usize>,
 }
 
 fn read_one_outline(vault: &Vault, path: &str) -> NoteOutline {
@@ -194,7 +198,6 @@ fn read_one_outline(vault: &Vault, path: &str) -> NoteOutline {
                     level: e.level,
                     line: e.line,
                     occurrence: e.occurrence,
-                    ambiguous: e.ambiguous,
                 })
                 .collect();
             NoteOutline {
@@ -496,7 +499,9 @@ mod tests {
         let o = read_one_outline(&v, "o.md");
         let headings = o.headings.unwrap();
         assert_eq!(headings.len(), 3);
-        assert_eq!(headings[1].heading_path, vec!["A", "B"]);
+        // Unique leaf -> bare title, no occurrence emitted.
+        assert_eq!(headings[1].heading_path, vec!["B"]);
+        assert_eq!(headings[1].occurrence, None);
     }
 
     #[test]

@@ -38,13 +38,15 @@ pub struct Document {
 /// One row of a note's outline.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutlineEntry {
+    /// Shortest suffix of the ancestor chain that `resolve_heading` maps back
+    /// to this heading; its last element is the heading's own title, and it is
+    /// a single element whenever the bare title suffices.
     pub heading_path: Vec<String>,
     pub level: u8,
     pub line: usize,
-    /// 1-based position among headings sharing the identical full path.
-    pub occurrence: usize,
-    /// Whether more than one heading shares this full path.
-    pub ambiguous: bool,
+    /// 1-based position among headings sharing the identical full path; `None`
+    /// unless even the full path is duplicated and `resolve_heading` needs it.
+    pub occurrence: Option<usize>,
 }
 
 impl Document {
@@ -261,8 +263,10 @@ impl Document {
         }
     }
 
-    /// The note's outline: every heading with its path, level, line, and
-    /// occurrence/ambiguity among identical full paths.
+    /// The note's outline: every heading with the shortest address that
+    /// `resolve_heading` maps back to it — the bare title when unique, a
+    /// longer suffix when shadowed, plus `occurrence` only for identical
+    /// full paths.
     #[must_use]
     pub fn outline(&self) -> Vec<OutlineEntry> {
         let n = self.headings.len();
@@ -279,14 +283,27 @@ impl Document {
 
         (0..n)
             .map(|i| {
-                let group = &groups[&keys[i]];
-                let occurrence = group.iter().position(|&x| x == i).unwrap_or(0) + 1;
+                let chain = &chains[i];
+                // Probing resolve_heading itself (rather than re-deriving its
+                // matching rules) keeps the emitted address correct by
+                // construction, exact-vs-suffix shadowing included.
+                let heading_path = (1..chain.len())
+                    .map(|k| chain[chain.len() - k..].to_vec())
+                    .find(|cand| self.resolve_heading(cand, None) == Ok(i));
+                let (heading_path, occurrence) = match heading_path {
+                    Some(suffix) => (suffix, None),
+                    None if self.resolve_heading(chain, None) == Ok(i) => (chain.clone(), None),
+                    None => {
+                        let group = &groups[&keys[i]];
+                        let occ = group.iter().position(|&x| x == i).unwrap_or(0) + 1;
+                        (chain.clone(), Some(occ))
+                    }
+                };
                 OutlineEntry {
-                    heading_path: chains[i].clone(),
+                    heading_path,
                     level: self.headings[i].level,
                     line: self.headings[i].line,
                     occurrence,
-                    ambiguous: group.len() > 1,
                 }
             })
             .collect()
@@ -594,24 +611,53 @@ mod tests {
     }
 
     #[test]
-    fn outline_reports_paths_and_ambiguity() {
-        let src = "# Q1\n## Status\n# Q2\n## Status\n";
+    fn outline_emits_bare_title_for_unique_leaves() {
+        let src = "# Q1\n## Status\n## Notes\n# Q2\n## Status\n";
         let doc = Document::parse(src);
         let out = doc.outline();
+        // Unique leaf titles need only themselves.
         assert_eq!(out[0].heading_path, vec!["Q1"]);
+        assert_eq!(out[2].heading_path, vec!["Notes"]);
+        assert_eq!(out[0].occurrence, None);
+        // Duplicated leaf, distinct chains -> shortest disambiguating suffix.
         assert_eq!(out[1].heading_path, vec!["Q1", "Status"]);
-        // The two "Status" headings have different full paths -> not ambiguous.
-        assert!(!out[1].ambiguous);
-        assert_eq!(out[1].occurrence, 1);
+        assert_eq!(out[4].heading_path, vec!["Q2", "Status"]);
+        assert_eq!(out[1].occurrence, None);
     }
 
     #[test]
-    fn outline_marks_identical_full_paths_ambiguous() {
-        let src = "# A\n# A\n";
+    fn outline_extends_suffix_past_exact_match_shadow() {
+        // Bare ["X"] exact-matches the top-level `# X`, so the nested `## X`
+        // must widen to ["Y", "X"] even though ["X"] has a unique suffix group.
+        let src = "# Y\n## X\n# X\n";
         let doc = Document::parse(src);
         let out = doc.outline();
-        assert!(out[0].ambiguous && out[1].ambiguous);
-        assert_eq!(out[0].occurrence, 1);
-        assert_eq!(out[1].occurrence, 2);
+        assert_eq!(out[1].heading_path, vec!["Y", "X"]);
+        assert_eq!(out[2].heading_path, vec!["X"]);
+    }
+
+    #[test]
+    fn outline_uses_occurrence_only_for_identical_full_chains() {
+        let src = "# A\n# A\n## B\n";
+        let doc = Document::parse(src);
+        let out = doc.outline();
+        assert_eq!(out[0].heading_path, vec!["A"]);
+        assert_eq!(out[0].occurrence, Some(1));
+        assert_eq!(out[1].heading_path, vec!["A"]);
+        assert_eq!(out[1].occurrence, Some(2));
+        assert_eq!(out[2].heading_path, vec!["B"]);
+        assert_eq!(out[2].occurrence, None);
+    }
+
+    #[test]
+    fn outline_addresses_resolve_back_to_their_heading() {
+        let src = "# Q1\n## Status\n# Q2\n## Status\n# Q2\n## Status\n### Status\n";
+        let doc = Document::parse(src);
+        for (i, e) in doc.outline().iter().enumerate() {
+            let j = doc
+                .resolve_heading(&e.heading_path, e.occurrence)
+                .unwrap_or_else(|err| panic!("entry {i} ({:?}): {err:?}", e.heading_path));
+            assert_eq!(j, i, "entry {i} ({:?}) resolved elsewhere", e.heading_path);
+        }
     }
 }
