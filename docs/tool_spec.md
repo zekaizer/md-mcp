@@ -82,7 +82,7 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
   "required": ["paths"]
 }
 ```
-출력: 각 노트별 `{ path, exists, headings }`. `headings`는 `[{ heading_path, level, line, occurrence, ambiguous }]` 평면 리스트(문서 순서)이며, 트리는 `heading_path` 길이와 `level`로 복원한다. 존재하지 않는 path는 `exists:false`로 개별 보고. **순수 구조 스캔** — 편집 전제가 아니므로 `content_hash`는 주지 않는다. 큰 노트를 전체 read하지 않고 구조만 파악 → 편집할 섹션의 `heading_path`·`occurrence` 확정용. 콜·토큰 절감의 핵심. `ambiguous:true`(동일 heading_path 2개 이상)인 heading만 `occurrence`(문서 순서 1-based)를 신경 쓰면 된다 — 나머지는 생략 가능. 같은 정규화 기준을 `read_sections`·`edit_sections`와 공유한다(§4).
+출력: 각 노트별 `{ path, exists, outline }`. `outline`은 heading당 한 행의 텍스트 블록(문서 순서): `<줄번호(노트 내 최대 자릿수 우측 정렬)> <'#'×level> <제목 원문>`. 트리는 `#` 개수(=level)와 문서 순서로 복원한다. bare 제목으로 해소되지 않는 heading에만 다음 행에 `↳ heading_path: [최소 유일 접미사]`(full chain까지 중복이면 ` occurrence: n` 추가)가 붙는다 — 이 행이 있으면 그 값을 `read_sections`/`edit_sections`에 그대로, 없으면 `[제목]`을 전달한다(ADR-0026). 문법은 무모호: 제목에 개행이 못 들어가므로(LF 정규화) 행 시작은 전부 서버 통제이고, heading 행은 숫자로·`↳` 행은 `↳`로 시작해 접두사가 서로소다 — 제목은 행 끝까지 원문 그대로, 이스케이프 없음. 존재하지 않는 path는 `exists:false`로 개별 보고. **순수 구조 스캔** — 편집 전제가 아니므로 `content_hash`는 주지 않는다. 큰 노트를 전체 read하지 않고 구조만 파악 → 편집할 섹션 주소 확정용. 콜·토큰 절감의 핵심. 같은 정규화 기준을 `read_sections`·`edit_sections`와 공유한다(§4).
 
 ### read_sections
 ```json

@@ -302,8 +302,10 @@ impl ServerHandler for MdServer {
             "md-mcp v",
             env!("CARGO_PKG_VERSION"),
             " manages a single vault of pure-Markdown notes (.md + YAML frontmatter). \
-             Address notes by vault-relative path; read large notes via read_outlines \
-             then read_sections. Destructive batches are all-or-nothing."
+             Address notes by vault-relative path. Notes over ~10 KB (size_bytes in \
+             list_notes) are cheaper section-wise: read_outlines first, then \
+             read_sections for the sections you need; read smaller notes whole via \
+             read_notes. Destructive batches are all-or-nothing."
         )
         .to_string();
         if let Some(intro) = &self.intro_note {

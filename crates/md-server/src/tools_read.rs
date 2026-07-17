@@ -166,54 +166,72 @@ pub struct NoteOutline {
     /// other than absence, where existence is unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exists: Option<bool>,
+    /// One text row per heading, in document order: `<line> <#×level> <title>`.
+    /// A following `↳ heading_path: [...]` row (plus `occurrence` when even
+    /// the full path repeats) carries the address to pass to
+    /// read_sections/edit_sections; without one, the address is `[title]`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub headings: Option<Vec<HeadingEntry>>,
+    pub outline: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ApiError>,
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-pub struct HeadingEntry {
-    pub heading_path: Vec<String>,
-    pub level: u8,
-    pub line: usize,
-    pub occurrence: usize,
-    pub ambiguous: bool,
+/// Render outline entries as text rows. Titles cannot contain newlines
+/// (the source is LF-normalized before parsing), so row starts are fully
+/// emitter-controlled: heading rows begin with a digit, address rows with
+/// `↳` — disjoint prefixes, titles verbatim to end of line, no escaping.
+fn render_outline(entries: &[md_core::OutlineEntry]) -> String {
+    let width = entries
+        .iter()
+        .map(|e| e.line)
+        .max()
+        .map_or(0, |m| m.to_string().len());
+    let mut rows = Vec::with_capacity(entries.len());
+    for e in entries {
+        let title = e.heading_path.last().map_or("", String::as_str);
+        rows.push(format!(
+            "{:>width$} {} {}",
+            e.line,
+            "#".repeat(usize::from(e.level)),
+            title
+        ));
+        if e.heading_path.len() > 1 || e.occurrence.is_some() {
+            let mut marker = format!(
+                "{:>width$} \u{21b3} heading_path: {}",
+                "",
+                serde_json::to_string(&e.heading_path).unwrap_or_default()
+            );
+            if let Some(occ) = e.occurrence {
+                marker.push_str(&format!(" occurrence: {occ}"));
+            }
+            rows.push(marker);
+        }
+    }
+    rows.join("\n")
 }
 
 fn read_one_outline(vault: &Vault, path: &str) -> NoteOutline {
     match vault.read_note(path) {
         Ok(raw) => {
             let normalized = md_core::text::normalize_newlines(&raw).into_owned();
-            let headings = Document::parse(&normalized)
-                .outline()
-                .into_iter()
-                .map(|e| HeadingEntry {
-                    heading_path: e.heading_path,
-                    level: e.level,
-                    line: e.line,
-                    occurrence: e.occurrence,
-                    ambiguous: e.ambiguous,
-                })
-                .collect();
+            let outline = render_outline(&Document::parse(&normalized).outline());
             NoteOutline {
                 path: path.to_string(),
                 exists: Some(true),
-                headings: Some(headings),
+                outline: Some(outline),
                 error: None,
             }
         }
         Err(e) if e.code == md_core::Code::NotFound => NoteOutline {
             path: path.to_string(),
             exists: Some(false),
-            headings: None,
+            outline: None,
             error: None,
         },
         Err(e) => NoteOutline {
             path: path.to_string(),
             exists: None,
-            headings: None,
+            outline: None,
             error: Some(ApiError::from_core(&e)),
         },
     }
@@ -363,7 +381,7 @@ impl MdServer {
 
     /// Read the heading outline (table of contents) of one or more notes.
     #[tool(
-        description = "Read the heading outline of one or more notes without their bodies. Use this on a large note to find the heading_path/occurrence of a section before reading or editing it.",
+        description = "Read the heading outline of one or more notes without their bodies. Each heading is one text row `<line> <#×level> <title>`; its address for read_sections/edit_sections is [title], unless a `↳ heading_path: [...]` row follows — then pass that array (and occurrence, if given) verbatim. Use this on a large note to pick sections before reading or editing.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub async fn read_outlines(
@@ -377,13 +395,9 @@ impl MdServer {
             .iter()
             .map(|p| read_one_outline(self.vault(), p))
             .collect();
-        // An outline's cost is its serialized headings, not note content.
-        let omitted = enforce_content_budget(&mut outlines, |o| {
-            o.headings
-                .as_ref()
-                .and_then(|h| serde_json::to_string(h).ok())
-                .map_or(0, |s| s.len())
-        });
+        // An outline's cost is its rendered rows, not note content.
+        let omitted =
+            enforce_content_budget(&mut outlines, |o| o.outline.as_ref().map_or(0, String::len));
         Ok(Json(ReadOutlinesResponse { outlines, omitted }))
     }
 
@@ -491,12 +505,52 @@ mod tests {
     }
 
     #[test]
-    fn outline_lists_headings() {
+    fn outline_renders_one_text_row_per_heading() {
         let (_d, v) = vault_with(&[("o.md", "# A\n## B\n# C\n")]);
         let o = read_one_outline(&v, "o.md");
-        let headings = o.headings.unwrap();
-        assert_eq!(headings.len(), 3);
-        assert_eq!(headings[1].heading_path, vec!["A", "B"]);
+        assert_eq!(o.outline.as_deref(), Some("1 # A\n2 ## B\n3 # C"));
+    }
+
+    #[test]
+    fn outline_right_aligns_line_numbers() {
+        let (_d, v) = vault_with(&[("o.md", &format!("# A\n{}## B\n", "x\n".repeat(10)))]);
+        let o = read_one_outline(&v, "o.md");
+        assert_eq!(o.outline.as_deref(), Some(" 1 # A\n12 ## B"));
+    }
+
+    #[test]
+    fn outline_marks_shadowed_titles_with_address_row() {
+        let (_d, v) = vault_with(&[("o.md", "# Q1\n## Status\n# Q2\n## Status\n")]);
+        let o = read_one_outline(&v, "o.md");
+        assert_eq!(
+            o.outline.as_deref(),
+            Some(
+                "1 # Q1\n\
+                 2 ## Status\n  \u{21b3} heading_path: [\"Q1\",\"Status\"]\n\
+                 3 # Q2\n\
+                 4 ## Status\n  \u{21b3} heading_path: [\"Q2\",\"Status\"]"
+            )
+        );
+    }
+
+    #[test]
+    fn outline_appends_occurrence_for_identical_chains() {
+        let (_d, v) = vault_with(&[("o.md", "# A\n# A\n")]);
+        let o = read_one_outline(&v, "o.md");
+        assert_eq!(
+            o.outline.as_deref(),
+            Some(
+                "1 # A\n  \u{21b3} heading_path: [\"A\"] occurrence: 1\n\
+                 2 # A\n  \u{21b3} heading_path: [\"A\"] occurrence: 2"
+            )
+        );
+    }
+
+    #[test]
+    fn outline_of_headingless_note_is_empty_string() {
+        let (_d, v) = vault_with(&[("o.md", "just text\n")]);
+        let o = read_one_outline(&v, "o.md");
+        assert_eq!(o.outline.as_deref(), Some(""));
     }
 
     #[test]
@@ -578,8 +632,8 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_outline_is_dropped_and_reported_omitted() {
-        // ~3500 headings serialize past the content budget.
-        let big: String = (0..3500)
+        // ~6000 heading rows render past the content budget.
+        let big: String = (0..6000)
             .map(|i| format!("# Heading number {i} with some padding\nx\n"))
             .collect();
         let (_d, v) = vault_with(&[("many.md", &big), ("small.md", "# S\nok\n")]);
