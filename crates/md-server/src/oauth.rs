@@ -10,8 +10,7 @@
 
 use std::collections::HashMap;
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,7 +45,8 @@ const STATE_VERSION: u32 = 1;
 const MAX_CLIENTS: usize = 50;
 const MAX_REDIRECT_URIS: usize = 8;
 
-/// On-disk, persisted across restarts. Bearer material at rest — written `0600`.
+/// On-disk, persisted across restarts. Bearer material at rest — see [`create_private`]
+/// for how the file is kept owner-only.
 #[derive(Serialize, Deserialize)]
 struct Persisted {
     #[serde(default)]
@@ -144,7 +144,7 @@ impl OAuthState {
             .is_some_and(|rec| rec.expires_at > now_secs())
     }
 
-    /// Atomically persist the store (`0600`, temp + rename, creating the state dir).
+    /// Atomically persist the store (owner-only, temp + rename, creating the state dir).
     /// Best-effort; logs on failure.
     fn persist(&self) {
         let bytes = {
@@ -170,12 +170,7 @@ impl OAuthState {
         let tmp = self
             .state_file
             .with_extension(format!("tmp.{}.{seq}", std::process::id()));
-        let write = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
+        let write = create_private(&tmp)
             .and_then(|mut f| f.write_all(&bytes))
             .and_then(|()| std::fs::rename(&tmp, &self.state_file));
         if let Err(error) = write {
@@ -583,6 +578,24 @@ async fn token(State(oauth): State<Arc<OAuthState>>, Form(req): Form<TokenReques
 
 // --- helpers -----------------------------------------------------------------
 
+/// Create `path` for writing, kept as private as the platform allows — it holds bearer
+/// material at rest.
+///
+/// Unix creates it `0600`. Windows has no mode bits, so the file inherits the state
+/// directory's ACL: keep `MD_STATE_DIR` under a per-user location (the default
+/// `%LOCALAPPDATA%`-style profile paths already deny other users) rather than a shared
+/// root.
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 fn oauth_error(status: StatusCode, error: &str) -> Response {
     (status, Json(serde_json::json!({ "error": error }))).into_response()
 }
@@ -781,6 +794,22 @@ mod tests {
             registered,
             "http://localhost:9/other"
         ));
+    }
+
+    /// Bearer material at rest: the store must never be readable beyond its owner.
+    #[cfg(unix)]
+    #[test]
+    fn persisted_state_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = dir.path().join("nested/oauth-state.json");
+        let oauth = OAuthState::load("gate-token".to_string(), state_file.clone());
+        // Any store mutation persists; this one also creates the state dir.
+        oauth.register_client(vec!["https://claude.ai/cb".to_string()]);
+
+        let mode = std::fs::metadata(&state_file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "state file must be owner-only");
     }
 
     #[test]
