@@ -228,7 +228,7 @@ impl Document {
                         Code::Ambiguous,
                         format!(
                             "occurrence requires the full heading_path; {path:?} matches only \
-                             by suffix — use the exact chain from read_outlines"
+                             by suffix — use the ↳ address from read_outlines"
                         ),
                     ));
                 }
@@ -254,8 +254,9 @@ impl Document {
                 many => Err(Error::new(
                     Code::Ambiguous,
                     format!(
-                        "{path:?} suffix-matches {} headings; give the full heading_path \
-                         from read_outlines (plus occurrence if it is marked ambiguous)",
+                        "{path:?} suffix-matches {} headings; pass the heading_path from \
+                         the ↳ row under that heading in read_outlines (plus occurrence \
+                         when the row gives one)",
                         many.len()
                     ),
                 )),
