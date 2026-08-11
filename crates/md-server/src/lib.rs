@@ -383,6 +383,7 @@ mod tests {
         let destructive = [
             "edit_sections",
             "edit_properties",
+            "replace_text",
             "delete_notes",
             "move_notes",
             "sync_vault",

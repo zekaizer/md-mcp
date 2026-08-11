@@ -24,6 +24,7 @@ stay pure Markdown; Obsidian-specific syntax like wikilinks is left untouched).
 | `create_notes` | Create notes (frontmatter as structured data) |
 | `append_notes` | Append to notes |
 | `edit_sections` | Replace/append/insert/delete/rename/move sections by heading path |
+| `replace_text` | Replace literal text in place — a typo fix without reading or resending the note |
 | `edit_properties` | Set or remove individual frontmatter keys |
 | `move_notes` | Move and/or rename notes and directories in one step — optionally rewriting Markdown links vault-wide so nothing breaks |
 | `delete_notes` | Delete to a recoverable trash, never permanently |

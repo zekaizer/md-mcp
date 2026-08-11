@@ -21,7 +21,7 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
 
 **설계 우선순위 (이 spec의 축)**
 1. **콜 수 최소화**: MCP를 쓰는 에이전트가 적은 tool call로 작업을 끝내야 한다. → 가능한 모든 도구를 batch화.
-2. **섹션 단위 편집 통일**: 부분 편집은 heading path로 지정하는 섹션 편집 하나로 모은다. 통째 교체·text-match·block 편집을 따로 두지 않는다.
+2. **섹션 단위 편집 통일**: 구조 편집(섹션 추가·삭제·이동·이름 변경)은 heading path로 지정하는 섹션 편집 하나로 모은다. 통째 교체·block 편집을 따로 두지 않는다. **리터럴 text-match 치환만 예외** — 섹션 재작성 비용이 실제 변경량(오타 한 글자)에 비해 지나치게 큰 경우를 위해 `replace_text`를 둔다([ADR-0027](adr/0027-literal-text-replacement.md)).
 3. **왕복(round-trip) 제거**: read→write, write→재read 왕복을 줄이도록 outline/section 읽기와 충분한 write 출력을 제공한다.
 
 ---
@@ -38,6 +38,7 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
 | `create_notes` | 신규 노트 생성 (덮어쓰기 거부) | ✓ | **부분 성공** |
 | `append_notes` | 노트 말미 append | ✓ | **부분 성공** |
 | `edit_sections` | heading path 기준 섹션 편집 (replace/append/delete/insert/rename/move) | ✓ | **all-or-nothing** |
+| `replace_text` | 노트 body 내 리터럴 문자열 치환 (읽기 없이 오타·용어 수정) | ✓ | **all-or-nothing** |
 | `edit_properties` | frontmatter key:value 단위 set/remove | ✓ | **all-or-nothing** |
 | `move_notes` | 이동·이름 변경 통합 (dest가 `/`로 끝나면 디렉토리로, 아니면 최종 경로로) | ✓ | **all-or-nothing** |
 | `delete_notes` | 노트 삭제 | ✓ | **all-or-nothing** |
@@ -45,7 +46,7 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
 
 **실패 의미론 원칙**: 비파괴 도구(create/append)는 부분 성공 — 한 item의 실패가 형제 item을 가라앉히지 않는다. 파괴적 도구(edit/properties/move/delete)는 all-or-nothing — batch 내 한 item이라도 거부되면 전체를 쓰지 않는다. 데이터 손실 위험이 있는 작업에서 "절반만 적용된 모호한 상태"를 만들지 않기 위함이다. **다중 파일에 걸친 batch도 서버가 원자성을 보장한다** — 원본 백업/저널 후 일괄 적용, 어느 파일이라도 write 실패하면 전부 롤백해 무적용으로 되돌린다(§4).
 
-**출력 envelope**: 거부 시 `{ ok:false, errors:[{ index, item, operation, code, message }] }` — **어느 item(`index`·`item`)이, 어떤 명령(`operation`)에서, 왜(`code`·`message`) 막혔는지** 검출된 위반을 **전부** 보고하고 적용 결과는 비운다(아무것도 안 쓰임). 일부만 보고하면 에이전트가 고쳐 재시도→또 실패하는 왕복이 생기므로 전수 보고. `code`는 기계 판독용 사유(`NOT_FOUND`/`CONFLICT`/`HASH_MISMATCH`/`AMBIGUOUS`/`OVERLAP`/`HEADING_LEVEL`/`SUFFIX`/`DEST_NOT_DIR`/`BATCH_COLLISION`/`MISSING_CONTENT`/`TRAVERSAL`/`FRONTMATTER_PARSE`/`TOO_LARGE` 등). `required`·`enum`·타입 같은 schema 위반은 MCP 프레임워크가 envelope 이전 단계에서 거른다(서버 로직 사유와 분리). 단 `maxItems`(배치 상한)는 inputSchema에 노출되더라도 프레임워크가 검증하지 않으므로, 서버가 `batch_limit`으로 같은 단계에서 `invalid_params`로 거른다. 성공 시 각 도구가 per-item 적용 결과를 반환(도구별 출력 참조). 비파괴 도구의 부분 성공도 실패 item은 동일한 `{ index, item, code, message }` 형태로 사유를 단다(성공 item과 나란히). 검증은 통과했으나 write 도중 I/O 실패하면 서버가 롤백하므로 결과는 무적용 — 다른 거부와 똑같이 `errors`로 보고(부분 적용 상태는 남지 않는다).
+**출력 envelope**: 거부 시 `{ ok:false, errors:[{ index, item, operation, code, message }] }` — **어느 item(`index`·`item`)이, 어떤 명령(`operation`)에서, 왜(`code`·`message`) 막혔는지** 검출된 위반을 **전부** 보고하고 적용 결과는 비운다(아무것도 안 쓰임). 일부만 보고하면 에이전트가 고쳐 재시도→또 실패하는 왕복이 생기므로 전수 보고. `code`는 기계 판독용 사유(`NOT_FOUND`/`CONFLICT`/`HASH_MISMATCH`/`AMBIGUOUS`/`OVERLAP`/`COUNT_MISMATCH`/`HEADING_LEVEL`/`SUFFIX`/`DEST_NOT_DIR`/`BATCH_COLLISION`/`MISSING_CONTENT`/`TRAVERSAL`/`FRONTMATTER_PARSE`/`TOO_LARGE` 등). `required`·`enum`·타입 같은 schema 위반은 MCP 프레임워크가 envelope 이전 단계에서 거른다(서버 로직 사유와 분리). 단 `maxItems`(배치 상한)는 inputSchema에 노출되더라도 프레임워크가 검증하지 않으므로, 서버가 `batch_limit`으로 같은 단계에서 `invalid_params`로 거른다. 성공 시 각 도구가 per-item 적용 결과를 반환(도구별 출력 참조). 비파괴 도구의 부분 성공도 실패 item은 동일한 `{ index, item, code, message }` 형태로 사유를 단다(성공 item과 나란히). 검증은 통과했으나 write 도중 I/O 실패하면 서버가 롤백하므로 결과는 무적용 — 다른 거부와 똑같이 `errors`로 보고(부분 적용 상태는 남지 않는다).
 
 **표기 규약**: 아래 스키마는 지면을 위해 root `"type": "object"`를 생략한다(모든 inputSchema는 object). 객체 배열 파라미터는 도구 의미명(`notes`/`appends`/`edits`/`moves`/`targets`), 문자열 path 배열은 `paths`로 통일. 모든 batch 배열(읽기·쓰기)은 `maxItems: 100`(서버 강제) — 과대 batch의 토큰·메모리 통제.
 
@@ -263,6 +264,48 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
 - **content heading 계층 검증 (replace/append/insert/move 공통)**: `content`에 heading이 들어가는 operation은 그 content가 놓이는 위치에서 주변(anchor/인접) 섹션보다 얕은 level이거나 level을 건너뛰거나(h2→h4) 블록 내부 nesting이 어긋나면 거부(`HEADING_LEVEL`). `move`도 이동된 섹션 top heading level이 destination 위치에 안 맞으면 거부. create/`append_notes`는 노트 구조를 정의·확장하므로 제외(기존 구조에 끼워넣는 edit_sections operation만 대상).
 
 출력: 편집된 **섹션별** 적용 결과 + 새 `content_hash`(편집 후 그 섹션을 같은 `scope`로 해석한 해시; read_sections와 함께 hash의 두 생산처). 이 hash를 다음 편집의 `expected_hash`로 재사용해 write 후 재read 왕복을 없앤다. `rename`/`move`는 대상의 heading_path가 바뀌므로 `new_heading_path`도 echo(이후 그 섹션 작업에 사용).
+
+### replace_text (파괴적 · all-or-nothing)
+```json
+{
+  "properties": {
+    "replaces": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": { "type": "string" },
+          "find": { "type": "string",
+            "description": "찾을 문자열. **리터럴 바이트 일치** — 정규식·대소문자 폴딩·CJK 공백 폴딩 없음" },
+          "replace": { "type": "string", "description": "치환 결과. 빈 문자열이면 매치 삭제" },
+          "heading_path": { "type": "array", "items": { "type": "string" },
+            "description": "탐색 범위를 한 섹션으로 제한. 생략/빈 배열이면 노트 body 전체" },
+          "occurrence": { "type": "integer", "description": "heading_path 다수 매칭 시 1-based 선택" },
+          "scope": { "type": "string", "enum": ["body","section"], "default": "section",
+            "description": "heading_path의 탐색 범위. edit_sections와 동일 의미" },
+          "replace_all": { "type": "boolean", "default": false,
+            "description": "true면 매치 전부 치환(1회 유일성 요구 해제)" },
+          "expected_count": { "type": "integer",
+            "description": "매치 수 단언. 다르면 batch 전체 거부(COUNT_MISMATCH). 성립하면 전부 치환" },
+          "expected_hash": { "type": "string",
+            "description": "Optional. 탐색 대상 섹션을 이 item의 scope로 해석한 content_hash" }
+        },
+        "required": ["path","find","replace"]
+      }
+    },
+    "dry_run": { "type": "boolean", "default": false, "description": "검증·매치 보고만 하고 쓰지 않음" }
+  },
+  "required": ["replaces"]
+}
+```
+오타·용어 변경 전용 최소 비용 경로([ADR-0027](adr/0027-literal-text-replacement.md)). **item 하나 = (노트, find) 하나.** 의미:
+- **탐색 범위는 노트 body** — frontmatter는 절대 매칭 대상이 아니다(`edit_properties` 담당). `heading_path`(+`scope`)로 한 섹션에 가둘 수 있고, 이때 `expected_hash`는 그 섹션 기준(`edit_sections`와 동일 규칙).
+- **매치 수 계약** — `expected_count` 있으면 그 수와 정확히 같아야 하고 전부 치환. 없고 `replace_all:true`면 전부 치환(0건은 `NOT_FOUND`). 둘 다 없으면 **정확히 1건**이어야 하며 2건 이상은 `AMBIGUOUS`로 거부(짧은 needle이 노트를 통째로 갈아엎는 사고를 구조적으로 차단).
+- **리터럴 일치** — `search_notes`는 NFC 정규화 + CJK 공백/인라인 마크업 폴딩으로 매칭하지만 `replace_text`는 폴딩하지 않는다. 검색 히트가 그대로 치환되지 않을 수 있고(`전역지침` 히트 vs 본문 `전역 지침`), 이는 "무엇을 무엇으로 바꿨는지"를 요청만으로 확정하기 위한 의도된 비대칭이다.
+- **같은 노트 다중 item**: 모든 매치를 **원본 스냅샷 기준**으로 산출한 뒤 일괄 적용 — 앞 item의 결과를 뒤 item이 보지 않으므로 배열 순서가 결과를 바꾸지 않는다. **매치 span이 겹치면 거부**(`OVERLAP`, §4 대상 겹침 금지의 텍스트 레벨 적용).
+- 구조 변경(섹션 추가·삭제·이동·rename)은 여기서 하지 않는다 — `edit_sections`가 담당(heading level 검증이 그쪽에만 있다).
+
+출력: item별 `{ index, path, replaced, hits[] }` — `replaced`는 치환 횟수, `hits`는 **치환 후 노트 기준** 줄 번호와 그 줄 텍스트를 앞쪽 몇 건만(길면 절단). 본문 전체는 돌려주지 않는다 — 그 페이로드를 없애려고 만든 도구다. `dry_run:true`면 같은 내용을 쓰지 않고 보고한다.
 
 ### edit_properties (파괴적 · all-or-nothing)
 ```json

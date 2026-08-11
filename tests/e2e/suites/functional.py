@@ -74,10 +74,10 @@ def run(c: MCPClient, t: Runner, vault: str) -> None:
     names = sorted(tt["name"] for tt in c.tools())
     expected = sorted([
         "read_notes", "read_outlines", "read_sections", "list_notes", "search_notes",
-        "create_notes", "append_notes", "edit_sections", "edit_properties",
+        "create_notes", "append_notes", "edit_sections", "replace_text", "edit_properties",
         "move_notes", "delete_notes",
     ])
-    t.check("all 11 tools advertised", names == expected, str(names))
+    t.check("all 12 tools advertised", names == expected, str(names))
     t.check("serverInfo identifies md-mcp", c.server_info.get("serverInfo", {}).get("name") == "md-mcp",
             json.dumps(c.server_info.get("serverInfo")))
 
@@ -360,6 +360,50 @@ def run(c: MCPClient, t: Runner, vault: str) -> None:
     t.check("broken-fm note editable", r["ok"])
     r = sc(c.call("edit_sections", {"edits": [{"path": "structured.md", "heading_path": ["Status", "Q1"], "operation": "replace", "content": "x\n"}]}))
     t.check("ambiguous no occ rejected", not r["ok"] and r["errors"][0]["code"] == "AMBIGUOUS")
+
+    # -- replace_text ------------------------------------------------------
+    t.section("replace_text")
+    reset_edit()
+    rt = lambda items, **kw: sc(c.call("replace_text", {"replaces": items, **kw}))
+    r = rt([{"path": "edit.md", "find": "A1 body.", "replace": "A1 fixed."}])
+    t.check("unique replace applies", r["ok"] and r["applied"][0]["replaced"] == 1 and "A1 fixed." in body())
+    t.check("hit addresses the new line", r["applied"][0]["hits"] == [{"line": 7, "text": "A1 fixed."}], str(r["applied"]))
+    reset_edit()
+    r = rt([{"path": "edit.md", "find": "body.", "replace": "text."}])
+    t.check("multi-match AMBIGUOUS", not r["ok"] and r["errors"][0]["code"] == "AMBIGUOUS" and "A1 body." in body())
+    r = rt([{"path": "edit.md", "find": "body.", "replace": "text.", "replace_all": True}])
+    t.check("replace_all takes every match", r["ok"] and r["applied"][0]["replaced"] == 3 and "body." not in body())
+    reset_edit()
+    r = rt([{"path": "edit.md", "find": "body.", "replace": "text.", "expected_count": 2}])
+    t.check("wrong expected_count -> COUNT_MISMATCH", not r["ok"] and r["errors"][0]["code"] == "COUNT_MISMATCH")
+    r = rt([{"path": "edit.md", "find": "body.", "replace": "text.", "heading_path": ["A", "A1"]}])
+    t.check("heading_path narrows the search", r["ok"] and "A1 text." in body() and "A2 body." in body())
+    r = rt([{"path": "edit.md", "find": "absent-string", "replace": "x"}])
+    t.check("no match NOT_FOUND", not r["ok"] and r["errors"][0]["code"] == "NOT_FOUND")
+    reset_edit()
+    r = rt([{"path": "edit.md", "find": "A lead.", "replace": "A NEW."}], dry_run=True)
+    t.check("dry_run reports without writing", r["ok"] and r["dry_run"] and r["applied"][0]["replaced"] == 1 and "A lead." in body())
+    r = rt([{"path": "structured.md", "find": "draft", "replace": "final"}])
+    t.check("frontmatter never searched", not r["ok"] and r["errors"][0]["code"] == "NOT_FOUND")
+    r = rt([
+        {"path": "edit.md", "find": "A1 body.", "replace": "x"},
+        {"path": "edit.md", "find": "A1 bod", "replace": "y"},
+    ])
+    t.check("overlapping items rejected", not r["ok"] and all(e["code"] == "OVERLAP" for e in r["errors"]))
+    r = rt([
+        {"path": "edit.md", "find": "A lead.", "replace": "NOPE"},
+        {"path": "simple.md", "find": "absent-string", "replace": "x"},
+    ])
+    t.check("multi-file all-or-nothing", not r["ok"] and "NOPE" not in body())
+    h = sc(c.call("read_sections", {"targets": [{"path": "edit.md", "heading_path": ["A"], "scope": "body"}]}))["sections"][0]["content_hash"]
+    r = rt([{"path": "edit.md", "find": "A lead.", "replace": "A V2.", "heading_path": ["A"], "scope": "body", "expected_hash": h}])
+    t.check("matching expected_hash applies", r["ok"] and "A V2." in body())
+    r = rt([{"path": "edit.md", "find": "A V2.", "replace": "A V3.", "heading_path": ["A"], "scope": "body", "expected_hash": h}])
+    t.check("stale expected_hash -> HASH_MISMATCH", not r["ok"] and r["errors"][0]["code"] == "HASH_MISMATCH")
+    r = rt([{"path": "ghost.md", "find": "x", "replace": "y"}])
+    t.check("missing note NOT_FOUND", not r["ok"] and r["errors"][0]["code"] == "NOT_FOUND")
+    t.check("empty batch ok", rt([])["ok"])
+    reset_edit()
 
     # -- edit_properties ---------------------------------------------------
     t.section("edit_properties")
