@@ -87,10 +87,7 @@ pub fn write_size_error(what: &str, len: usize) -> md_core::Error {
 /// condensed value (all skippable fields empty/false) — otherwise clients
 /// validating structuredContent against outputSchema reject the response.
 #[cfg(test)]
-pub(crate) fn assert_condensed_satisfies_schema(
-    schema: impl Serialize,
-    condensed: impl Serialize,
-) {
+pub(crate) fn assert_condensed_satisfies_schema(schema: impl Serialize, condensed: impl Serialize) {
     let schema = serde_json::to_value(schema).unwrap();
     let value = serde_json::to_value(condensed).unwrap();
     for key in schema["required"].as_array().into_iter().flatten() {

@@ -442,15 +442,24 @@ mod tests {
         use rmcp::schemars::schema_for;
         assert_condensed_satisfies_schema(
             schema_for!(ReadNotesResponse),
-            ReadNotesResponse { notes: vec![], omitted: vec![] },
+            ReadNotesResponse {
+                notes: vec![],
+                omitted: vec![],
+            },
         );
         assert_condensed_satisfies_schema(
             schema_for!(ReadOutlinesResponse),
-            ReadOutlinesResponse { outlines: vec![], omitted: vec![] },
+            ReadOutlinesResponse {
+                outlines: vec![],
+                omitted: vec![],
+            },
         );
         assert_condensed_satisfies_schema(
             schema_for!(ReadSectionsResponse),
-            ReadSectionsResponse { sections: vec![], omitted: vec![] },
+            ReadSectionsResponse {
+                sections: vec![],
+                omitted: vec![],
+            },
         );
     }
 
