@@ -1,8 +1,9 @@
-//! Content-write tools: create_notes, append_notes, edit_sections, edit_properties.
+//! Content-write tools: create_notes, append_notes, edit_sections, replace_text,
+//! edit_properties.
 //!
-//! create/append are partial-success (independent items). edit_sections and
-//! edit_properties are all-or-nothing: the whole batch is validated, then applied
-//! through the transaction engine
+//! create/append are partial-success (independent items). edit_sections,
+//! replace_text and edit_properties are all-or-nothing: the whole batch is
+//! validated, then applied through the transaction engine
 //! ([ADR-0011](../../../docs/adr/0011-error-envelope-and-structured-output.md)).
 
 use std::collections::BTreeMap;
@@ -276,6 +277,108 @@ fn edit_outcome(new_source: &str, item: &EditItem) -> (Option<Vec<String>>, Opti
     )
 }
 
+// --- replace_text -----------------------------------------------------------
+
+/// How many changed lines one item reports: enough to see where the edit
+/// landed, never enough to re-send the note
+/// ([ADR-0027](../../../docs/adr/0027-literal-text-replacement.md)).
+const MAX_HITS: usize = 5;
+/// Byte budget for one reported line, cut on a char boundary and marked.
+const MAX_HIT_BYTES: usize = 160;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ReplaceTextRequest {
+    #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
+    pub replaces: Vec<ReplaceItem>,
+    /// Report what would change without writing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ReplaceItem {
+    pub path: String,
+    /// The text to find, matched literally (byte-for-byte), never as a pattern.
+    pub find: String,
+    /// What each match becomes; empty deletes the match.
+    pub replace: String,
+    /// Restrict the search to one section; empty searches the whole note body.
+    #[serde(default)]
+    pub heading_path: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence: Option<usize>,
+    #[serde(default)]
+    pub scope: ScopeArg,
+    /// Replace every match instead of requiring exactly one.
+    #[serde(default)]
+    pub replace_all: bool,
+    /// Assert the number of matches; the batch is rejected unless it holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_hash: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ReplaceTextResponse {
+    pub ok: bool,
+    pub applied: Vec<AppliedReplace>,
+    pub errors: Vec<ApiError>,
+    /// Echoes the request: `true` means nothing was written.
+    pub dry_run: bool,
+    /// Present while git sync is failing (ADR-0019); see sync_vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_warning: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct AppliedReplace {
+    pub index: usize,
+    pub path: String,
+    /// How many matches were replaced — may exceed the reported `hits`.
+    pub replaced: usize,
+    /// The first few changed lines, addressed in the resulting note.
+    pub hits: Vec<ReplaceHit>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ReplaceHit {
+    /// 1-based line number in the note as it now reads.
+    pub line: usize,
+    /// That line after the replacement, truncated with `…` when long.
+    pub text: String,
+}
+
+fn to_core_replacement(item: &ReplaceItem) -> md_core::Replacement {
+    md_core::Replacement {
+        heading_path: item.heading_path.clone(),
+        occurrence: item.occurrence,
+        scope: item.scope.into(),
+        find: item.find.clone(),
+        replace: item.replace.clone(),
+        replace_all: item.replace_all,
+        expected_count: item.expected_count,
+        expected_hash: item.expected_hash.clone(),
+    }
+}
+
+/// Bound one reported line to [`MAX_HIT_BYTES`], cutting on a char boundary.
+fn truncate_hit(line: &str) -> String {
+    if line.len() <= MAX_HIT_BYTES {
+        return line.to_string();
+    }
+    let mut end = MAX_HIT_BYTES;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &line[..end])
+}
+
 // --- edit_properties --------------------------------------------------------
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -327,7 +430,11 @@ impl MdServer {
     /// Create new notes (refusing to overwrite unless `overwrite` is set).
     #[tool(
         description = "Create one or more notes. content is the body only; pass frontmatter as a separate object (a leading --- block in content is rejected). Partial success: a failing note does not block the others. overwrite:false refuses an existing note.",
-        annotations(read_only_hint = false, destructive_hint = false, open_world_hint = false)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     pub async fn create_notes(
         &self,
@@ -384,7 +491,11 @@ impl MdServer {
     /// Append raw content to the end of notes (no separator inserted).
     #[tool(
         description = "Append raw content to the end of each note (no separator is inserted; include your own newline). Partial success. create_if_missing creates an absent note. For section-internal edits use edit_sections.",
-        annotations(read_only_hint = false, destructive_hint = false, open_world_hint = false)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     pub async fn append_notes(
         &self,
@@ -415,7 +526,11 @@ impl MdServer {
     /// Edit note sections by heading path (all-or-nothing).
     #[tool(
         description = "Edit sections by heading_path: replace/append/delete (by scope body|section), insert_before/insert_after, rename (new_heading), move (to a destination section). append continues the section's text (after its last non-blank line, keeping the blank lines before the next heading); to append prose to the section itself use scope:\"body\" — with scope:\"section\" plain text joins the last subsection. insert_*/move place a sibling block, blank-line-separated on both sides. All-or-nothing: any rejected edit (unresolved/ambiguous heading, overlap, HASH_MISMATCH, HEADING_LEVEL) rejects the whole batch and nothing is written. Pass expected_hash from read_sections for optimistic concurrency.",
-        annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn edit_sections(
         &self,
@@ -428,10 +543,34 @@ impl MdServer {
         Ok(Json(r))
     }
 
+    /// Replace literal text inside note bodies (all-or-nothing).
+    #[tool(
+        description = "Change literal text in place — the cheap path for typos, renamed terms, and corrected links: no reading the note first, no resending the surrounding text. One item = one (note, find) substitution inside the note body; frontmatter is never searched (use edit_properties). find is matched byte-for-byte — no regex, no case folding, and no CJK spacing/markup folding, so a search_notes hit for 전역지침 will not match the note's '전역 지침'. By default find must occur exactly once: 0 matches reject NOT_FOUND, 2+ reject AMBIGUOUS — narrow it with a longer find or a heading_path (+scope body|section, with optional expected_hash), or pass replace_all:true / expected_count:<n> to take every match. All-or-nothing: any rejected item (NOT_FOUND, AMBIGUOUS, COUNT_MISMATCH, HASH_MISMATCH, OVERLAP with another item) rejects the whole batch and nothing is written. Returns per item the replacement count plus the first few changed lines, numbered in the resulting note — never the note body. dry_run:true reports exactly that without writing. Structural change (adding, deleting, moving, renaming sections) belongs to edit_sections.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn replace_text(
+        &self,
+        Parameters(req): Parameters<ReplaceTextRequest>,
+    ) -> Result<Json<ReplaceTextResponse>, ErrorData> {
+        batch_limit(req.replaces.len())?;
+        let _guard = self.lock().write().await;
+        let mut r = self.run_replace_text(&req.replaces, req.dry_run).await;
+        r.sync_warning = self.sync_warning();
+        Ok(Json(r))
+    }
+
     /// Set or remove frontmatter properties (all-or-nothing).
     #[tool(
         description = "Set or remove top-level frontmatter properties. One item = one (note, key): value present (even null) sets it, value omitted removes it. All-or-nothing: removing an absent key or editing over broken YAML rejects the whole batch.",
-        annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn edit_properties(
         &self,
@@ -599,6 +738,113 @@ impl MdServer {
         }
     }
 
+    async fn run_replace_text(&self, items: &[ReplaceItem], dry_run: bool) -> ReplaceTextResponse {
+        // Group by path, keeping each item's global index: one note is read,
+        // rewritten, and written once however many items target it.
+        let mut by_path: BTreeMap<&str, Vec<(usize, &ReplaceItem)>> = BTreeMap::new();
+        for (i, it) in items.iter().enumerate() {
+            by_path.entry(&it.path).or_default().push((i, it));
+        }
+
+        let mut errors: Vec<ApiError> = Vec::new();
+        let mut writes: Vec<Op> = Vec::new();
+        let mut applied: Vec<AppliedReplace> = Vec::new();
+
+        for (path, group) in &by_path {
+            let source = match self.vault().read_note(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    errors.push(ApiError::at(group[0].0, &e));
+                    continue;
+                }
+            };
+            let core: Vec<md_core::Replacement> = group
+                .iter()
+                .map(|(_, it)| to_core_replacement(it))
+                .collect();
+            match md_core::replace_text(&source, &core) {
+                Ok((new_source, _)) if new_source.len() > MAX_WRITE_BYTES => {
+                    // The replacement would grow the note past the write limit;
+                    // reject the whole batch (all-or-nothing) at the first item.
+                    errors.push(ApiError::at(
+                        group[0].0,
+                        &write_size_error("replaced note", new_source.len()),
+                    ));
+                }
+                Ok((new_source, hits)) => {
+                    for (li, (gi, _)) in group.iter().enumerate() {
+                        applied.push(AppliedReplace {
+                            index: *gi,
+                            path: (*path).to_string(),
+                            replaced: hits[li].len(),
+                            hits: hits[li]
+                                .iter()
+                                .take(MAX_HITS)
+                                .map(|h| ReplaceHit {
+                                    line: h.line,
+                                    text: truncate_hit(&h.text),
+                                })
+                                .collect(),
+                        });
+                    }
+                    writes.push(Op::Write {
+                        path: (*path).to_string(),
+                        content: new_source.into_bytes(),
+                    });
+                }
+                Err(batch_errors) => {
+                    for be in batch_errors {
+                        errors.push(ApiError::at(group[be.index].0, &be.error));
+                    }
+                }
+            }
+        }
+
+        if !errors.is_empty() {
+            errors.sort_by_key(|e| e.index);
+            return ReplaceTextResponse {
+                ok: false,
+                applied: vec![],
+                errors,
+                dry_run,
+                sync_warning: None,
+            };
+        }
+        applied.sort_by_key(|a| a.index);
+        if dry_run {
+            return ReplaceTextResponse {
+                ok: true,
+                applied,
+                errors: vec![],
+                dry_run: true,
+                sync_warning: None,
+            };
+        }
+        match self.vault().commit_batch(&writes) {
+            Ok(receipt) => {
+                let ops = EventOp::from_outcomes(&receipt.outcomes);
+                self.emit_event("replace_text", Some(&receipt.batch_id), &ops);
+                self.auto_commit("replace_text", &ops, &items).await;
+            }
+            Err(e) => {
+                return ReplaceTextResponse {
+                    ok: false,
+                    applied: vec![],
+                    errors: vec![ApiError::from_core(&e)],
+                    dry_run: false,
+                    sync_warning: None,
+                };
+            }
+        }
+        ReplaceTextResponse {
+            ok: true,
+            applied,
+            errors: vec![],
+            dry_run: false,
+            sync_warning: None,
+        }
+    }
+
     async fn run_edit_properties(&self, edits: &[PropertyEdit]) -> EditPropertiesResponse {
         // Apply per path in order, accumulating into one new content per path.
         let mut by_path: BTreeMap<&str, Vec<(usize, &PropertyEdit)>> = BTreeMap::new();
@@ -734,6 +980,16 @@ mod tests {
                 ok: true,
                 applied: vec![],
                 errors: vec![],
+                sync_warning: None,
+            },
+        );
+        assert_condensed_satisfies_schema(
+            schema_for!(ReplaceTextResponse),
+            ReplaceTextResponse {
+                ok: true,
+                applied: vec![],
+                errors: vec![],
+                dry_run: false,
                 sync_warning: None,
             },
         );
@@ -1051,5 +1307,111 @@ mod tests {
             .0;
         assert!(!bad.ok);
         assert_eq!(bad.errors[0].code, "NOT_FOUND");
+    }
+
+    fn replace_item(path: &str, find: &str, replace: &str) -> ReplaceItem {
+        ReplaceItem {
+            path: path.into(),
+            find: find.into(),
+            replace: replace.into(),
+            heading_path: vec![],
+            occurrence: None,
+            scope: ScopeArg::Section,
+            replace_all: false,
+            expected_count: None,
+            expected_hash: None,
+        }
+    }
+
+    async fn run_replace(
+        s: &MdServer,
+        replaces: Vec<ReplaceItem>,
+        dry_run: bool,
+    ) -> ReplaceTextResponse {
+        s.replace_text(Parameters(ReplaceTextRequest { replaces, dry_run }))
+            .await
+            .unwrap()
+            .0
+    }
+
+    #[tokio::test]
+    async fn replace_text_fixes_a_typo_and_reports_the_new_line() {
+        let (_d, s) = server(&[("n.md", "# A\nthe qiuck fox\n")]);
+        let r = run_replace(&s, vec![replace_item("n.md", "qiuck", "quick")], false).await;
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(r.applied[0].replaced, 1);
+        assert_eq!(r.applied[0].hits[0].line, 2);
+        assert_eq!(r.applied[0].hits[0].text, "the quick fox");
+        assert_eq!(s.vault().read_note("n.md").unwrap(), "# A\nthe quick fox\n");
+    }
+
+    #[tokio::test]
+    async fn replace_text_rejects_the_whole_batch_on_one_bad_item() {
+        let (_d, s) = server(&[("a.md", "one\n"), ("b.md", "two two\n")]);
+        let r = run_replace(
+            &s,
+            vec![
+                replace_item("a.md", "one", "ONE"),
+                replace_item("b.md", "two", "TWO"),
+            ],
+            false,
+        )
+        .await;
+        assert!(!r.ok);
+        assert_eq!(r.errors[0].code, "AMBIGUOUS");
+        assert_eq!(r.errors[0].index, Some(1));
+        // The healthy item's note is untouched too.
+        assert_eq!(s.vault().read_note("a.md").unwrap(), "one\n");
+    }
+
+    #[tokio::test]
+    async fn replace_text_dry_run_reports_without_writing() {
+        let (_d, s) = server(&[("n.md", "cat\ncat\n")]);
+        let item = ReplaceItem {
+            replace_all: true,
+            ..replace_item("n.md", "cat", "dog")
+        };
+        let r = run_replace(&s, vec![item], true).await;
+        assert!(r.ok, "{:?}", r.errors);
+        assert!(r.dry_run);
+        assert_eq!(r.applied[0].replaced, 2);
+        assert_eq!(s.vault().read_note("n.md").unwrap(), "cat\ncat\n");
+    }
+
+    #[tokio::test]
+    async fn replace_text_caps_and_truncates_the_reported_hits() {
+        let long = "y".repeat(MAX_HIT_BYTES + 50);
+        let body = format!("tpyo {long}\n").repeat(MAX_HITS + 3);
+        let (_d, s) = server(&[("n.md", &body)]);
+        let item = ReplaceItem {
+            replace_all: true,
+            ..replace_item("n.md", "tpyo", "typo")
+        };
+        let r = run_replace(&s, vec![item], false).await;
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(r.applied[0].replaced, MAX_HITS + 3);
+        assert_eq!(r.applied[0].hits.len(), MAX_HITS);
+        let text = &r.applied[0].hits[0].text;
+        assert!(
+            text.len() <= MAX_HIT_BYTES + 3,
+            "hit text not truncated: {}",
+            text.len()
+        );
+        assert!(text.ends_with('…'), "truncated hit must be marked: {text}");
+    }
+
+    #[tokio::test]
+    async fn replace_text_scoped_to_a_section_leaves_the_rest_alone() {
+        let (_d, s) = server(&[("n.md", "# A\nterm\n# B\nterm\n")]);
+        let item = ReplaceItem {
+            heading_path: vec!["B".into()],
+            ..replace_item("n.md", "term", "TERM")
+        };
+        let r = run_replace(&s, vec![item], false).await;
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(
+            s.vault().read_note("n.md").unwrap(),
+            "# A\nterm\n# B\nTERM\n"
+        );
     }
 }

@@ -383,6 +383,7 @@ mod tests {
         let destructive = [
             "edit_sections",
             "edit_properties",
+            "replace_text",
             "delete_notes",
             "move_notes",
             "sync_vault",
@@ -421,6 +422,18 @@ mod tests {
                 a.open_world_hint,
                 Some(open_world.contains(name)),
                 "{name} open_world_hint"
+            );
+        }
+
+        // The loop above only checks the names it is given, so the classes are
+        // the contract only if every registered tool appears in one of them.
+        for t in &tools {
+            let name = t.name.as_ref();
+            assert!(
+                read_only.contains(&name)
+                    || additive.contains(&name)
+                    || destructive.contains(&name),
+                "tool {name} is not classified above; add it to a class"
             );
         }
     }

@@ -34,3 +34,4 @@ immutable; a changed decision supersedes the old one with a new ADR.
 - [0023](0023-cli-arguments-and-clap.md) — CLI arguments via clap, with env fallback
 - [0024](0024-unified-move-primitive.md) — Unified move primitive (rename + relocate; supersedes 0009)
 - [0025](0025-insertion-placement.md) — Insertion placement follows authoring intent
+- [0026](0026-outline-addressing-and-text-encoding.md) — Outline addressing and text encoding

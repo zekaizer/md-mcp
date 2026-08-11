@@ -188,7 +188,7 @@ async fn full_oauth_flow_then_mcp_call() {
     let mcp = serve_client((), transport)
         .await
         .expect("oauth-token handshake");
-    assert_eq!(mcp.list_all_tools().await.expect("list tools").len(), 11);
+    assert_eq!(mcp.list_all_tools().await.expect("list tools").len(), 12);
 
     mcp.cancel().await.ok();
     handle.abort();

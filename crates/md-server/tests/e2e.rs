@@ -27,10 +27,10 @@ async fn client_lists_all_tools_and_calls_one() {
         .await
         .expect("client handshake");
 
-    // tools/list advertises the full 11-tool surface.
+    // tools/list advertises the full 12-tool surface.
     let tools = client.list_all_tools().await.expect("list tools");
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-    assert_eq!(tools.len(), 11, "tools: {names:?}");
+    assert_eq!(tools.len(), 12, "tools: {names:?}");
     for expected in [
         "read_notes",
         "read_outlines",
@@ -41,6 +41,7 @@ async fn client_lists_all_tools_and_calls_one() {
         "append_notes",
         "edit_sections",
         "edit_properties",
+        "replace_text",
         "move_notes",
         "delete_notes",
     ] {
@@ -108,6 +109,7 @@ async fn tool_schemas_expose_spec_constraints() {
         ("append_notes", "appends"),
         ("edit_sections", "edits"),
         ("edit_properties", "edits"),
+        ("replace_text", "replaces"),
         ("delete_notes", "paths"),
         ("move_notes", "moves"),
     ] {

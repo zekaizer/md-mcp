@@ -19,6 +19,8 @@ pub enum Code {
     Ambiguous,
     /// Two batch items target the same or nested content.
     Overlap,
+    /// A literal replacement's match count did not equal its `expected_count`.
+    CountMismatch,
     /// Inserted/moved heading content does not fit the destination heading level.
     HeadingLevel,
     /// A path suffix convention was violated (`.md` for notes, `/` for directories).
@@ -52,6 +54,7 @@ impl Code {
             Code::HashMismatch => "HASH_MISMATCH",
             Code::Ambiguous => "AMBIGUOUS",
             Code::Overlap => "OVERLAP",
+            Code::CountMismatch => "COUNT_MISMATCH",
             Code::HeadingLevel => "HEADING_LEVEL",
             Code::Suffix => "SUFFIX",
             Code::DestNotDir => "DEST_NOT_DIR",

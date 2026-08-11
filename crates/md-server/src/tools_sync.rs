@@ -36,7 +36,11 @@ impl MdServer {
     /// Synchronize the vault with its git remote.
     #[tool(
         description = "Synchronize the vault with its git remote: commit local changes, rebase onto the fetched upstream, and push. Returns {status, pulled, pushed, conflicts}. status:\"conflict\" means the rebase was aborted and the vault left unchanged — the listed paths need manual/agent resolution. Errors are reserved for git execution failures. Commit model: when auto-commit is enabled each write batch is already committed as `mcp(<tool>)` the moment it lands, so the sweep here picks up only edits made outside mcp — status:\"clean\" with pushed:0 right after your writes means they were committed (and possibly auto-pushed) earlier, not lost.",
-        annotations(read_only_hint = false, destructive_hint = true, open_world_hint = true)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
     )]
     pub async fn sync_vault(&self) -> Result<Json<SyncVaultResponse>, ErrorData> {
         self.run_sync()
