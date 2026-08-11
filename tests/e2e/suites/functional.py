@@ -107,18 +107,22 @@ def run(c: MCPClient, t: Runner, vault: str) -> None:
 
     # -- read_outlines -----------------------------------------------------
     t.section("read_outlines")
-    o = sc(c.call("read_outlines", {"paths": ["structured.md"]}))["outlines"][0]["headings"]
-    q1 = [h for h in o if h["heading_path"] == ["Status", "Q1"]]
-    t.check("dup marked ambiguous occ 1,2", len(q1) == 2 and all(h["ambiguous"] for h in q1) and [h["occurrence"] for h in q1] == [1, 2])
-    t.check("nesting path", any(h["heading_path"] == ["Design", "Schema", "Details"] and h["level"] == 3 for h in o))
-    o = sc(c.call("read_outlines", {"paths": ["codefence.md"]}))["outlines"][0]["headings"]
-    t.check("codefence/indent/setext ignored", [h["heading_path"][-1] for h in o] == ["Real Heading", "Sub"])
-    o = sc(c.call("read_outlines", {"paths": ["empty.md", "gone.md"]}))["outlines"]
-    t.check("empty=[] / missing exists:false", o[0]["headings"] == [] and o[1]["exists"] is False)
-    o = sc(c.call("read_outlines", {"paths": ["crlf.md"]}))["outlines"][0]["headings"]
-    t.check("crlf parsed", [h["heading_path"][-1] for h in o] == ["Top", "Child"])
-    o = sc(c.call("read_outlines", {"paths": ["norm.md"]}))["outlines"][0]["headings"]
-    t.check("trailing ## stripped, inline md literal", o[0]["heading_path"] == ["Title"] and o[1]["heading_path"][-1] == "**Bold** `code` heading")
+    outline = lambda p: sc(c.call("read_outlines", {"paths": [p]}))["outlines"][0]
+    titles = lambda o: [l.strip().split(" ", 1)[1].lstrip("#").strip()
+                        for l in o.splitlines() if l.strip() and not l.strip().startswith("\u21b3")]
+    o = outline("structured.md")["outline"]
+    t.check("dup heading gets address rows with occurrence 1,2",
+            o.count('\u21b3 heading_path: ["Status","Q1"] occurrence: 1') == 1
+            and o.count('\u21b3 heading_path: ["Status","Q1"] occurrence: 2') == 1, o)
+    t.check("unique headings carry no address row", o.count("\u21b3") == 2, o)
+    t.check("nesting encoded by # count", "### Details" in o and "## Schema" in o, o)
+    t.check("rows are line-numbered", o.splitlines()[0].split(" ")[0].isdigit() and titles(o)[0] == "Design", o)
+    t.check("codefence/indent/setext ignored", titles(outline("codefence.md")["outline"]) == ["Real Heading", "Sub"])
+    outs = sc(c.call("read_outlines", {"paths": ["empty.md", "gone.md"]}))["outlines"]
+    t.check("empty outline / missing exists:false", outs[0]["outline"] == "" and outs[1]["exists"] is False)
+    t.check("crlf parsed", titles(outline("crlf.md")["outline"]) == ["Top", "Child"])
+    t.check("trailing ## stripped, inline md literal",
+            titles(outline("norm.md")["outline"]) == ["Title", "**Bold** `code` heading"])
 
     # -- read_sections -----------------------------------------------------
     t.section("read_sections")
