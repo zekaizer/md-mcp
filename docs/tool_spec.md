@@ -257,6 +257,10 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
 - `insert_before`/`insert_after`: 대상 섹션 앞/뒤에 `content` 삽입. `content`에 새 heading을 넣어 신규 섹션 생성. `scope` 무시. 빈 `heading_path`(root)면 `insert_before`=노트 맨 앞(frontmatter 직후) prepend, `insert_after`=노트 맨 끝 append(텍스트 결과는 `append_notes`와 같으나 이쪽은 파괴적 all-or-nothing). (`content`에 heading이 있으면 아래 **content heading 계층 검증** 공통 규칙 적용.)
 - `rename`: 대상 heading 텍스트만 `new_heading`으로 교체(level·body·subsection 유지). `content`/`scope` 불필요 — 섹션 식별자 변경용(`edit_properties`의 key rename에 대응).
 - `move`: 대상 섹션을 subtree째 `destination`(heading_path[+occurrence])의 `position`(before/after)으로 이동. `content`/`scope` 불필요. **destination이 대상 자신의 하위면 거부**(self-move), 이동 후 위치에서 heading 계층 검증 적용.
+- **빈 줄 seam (replace/append/insert_*/move 공통)** ([ADR-0025](adr/0025-insertion-placement.md)): heading 주변 빈 줄은 본문이 아니라 섹션 사이 separator다. operation은 그 spacing을 임의로 바꾸지 않는다.
+  - `append`: 대상 span이 heading으로 이어지면 삽입 지점이 span 끝의 공백 전용 줄들을 거슬러 올라 **마지막 non-blank 줄 직후**에 놓인다 — 다음 heading 앞 separator는 그대로 두고 그 앞에 이어 붙는다. span이 노트 끝(EOF)에서 끝나면 보존할 경계가 없으므로 리터럴 끝에 붙인다(`append_notes`와 동일). 빈 줄을 더하지도 지우지도 않는다.
+  - `insert_before`/`insert_after`/`move`: 섹션 사이에 **블록**을 놓는 operation이므로 양쪽 seam에 빈 줄 하나를 보장한다. 추가만 하고 제거하지 않으며, 노트 시작·끝에는 붙이지 않는다.
+  - `replace`: 교체 대상 span이 감싸고 있던 선행·후행 공백 전용 줄(heading 아래 빈 줄, 다음 heading 앞 separator)을 결과에 복원한다. `content`가 이미 그 빈 줄을 달고 있으면(읽은 내용을 그대로 되돌려 보내는 경우) 중복 적용하지 않는다 — 편집할 때마다 빈 줄이 늘지 않는다. span 전체가 공백뿐이면(본문 없는 heading) 양쪽에 한 줄씩. **원본에 없던 빈 줄은 만들지 않는다** — heading을 붙여 쓰는 노트는 그대로 유지된다.
 - `heading_path` 다수 매칭 시 `occurrence`(1-based)로 선택. **`occurrence` 생략 + 다수 매칭이면 error** (모호한 silent 편집 금지).
 - `heading_path` **미발견 시 error**. silent no-op이 아니라 명시적 실패로 보고해야 LLM이 잘못된 성공으로 오판하지 않는다.
 - 파괴적이므로 한 edit이라도 위 사유로 거부되면 batch 전체 미적용.
