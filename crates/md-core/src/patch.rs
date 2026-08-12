@@ -120,6 +120,13 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Vec<Splice>
             let bytes = source.as_bytes();
             let mut rep = content.to_string();
             if !rep.is_empty() {
+                let (lead, trail) = span_seams(source, content_span.start, content_span.end);
+                // The blank lines the span began with are the seam under the
+                // heading, not body text — put them back unless the content
+                // already carries its own (e.g. echoed straight from a read).
+                if !lead.is_empty() && !starts_with_blank_line(&rep) {
+                    rep.insert_str(0, lead);
+                }
                 // Separate the body from the heading line above it (e.g. replacing
                 // the empty body of a heading with no trailing newline).
                 if content_span.start > 0 && bytes[content_span.start - 1] != b'\n' {
@@ -135,6 +142,10 @@ fn resolve_edit(doc: &Document, source: &str, edit: &Edit) -> Result<Vec<Splice>
                     content_span.end > content_span.start && bytes[content_span.end - 1] == b'\n';
                 if !rep.ends_with('\n') && (following_is_content || span_ended_nl) {
                     rep.push('\n');
+                }
+                // Same for the seam ahead of whatever followed the span.
+                if !trail.is_empty() && !ends_with_blank_line(&rep) {
+                    rep.push_str(trail);
                 }
             }
             Ok(vec![Splice {
@@ -323,6 +334,82 @@ fn pad_block_seams(block: &mut String, source: &str, pos: usize) {
     if pos < source.len() && !block.ends_with("\n\n") {
         block.push('\n');
     }
+}
+
+/// The separator blank lines at each end of the span `start..end`: the runs of
+/// whitespace-only lines it opens and closes with. `replace` restores these so
+/// an edit keeps the note's own spacing around a heading
+/// ([ADR-0025](../../../docs/adr/0025-insertion-placement.md) seams, applied to
+/// an existing span instead of a new block). A span that is *only* separator
+/// yields one line for each side rather than duplicating the whole run.
+fn span_seams(source: &str, start: usize, end: usize) -> (&str, &str) {
+    let lead_end = blank_run_end(source, start, end);
+    if lead_end == end {
+        let one = &source[start..first_line_end(source, start, end)];
+        return (one, one);
+    }
+    (
+        &source[start..lead_end],
+        &source[blank_run_start(source, lead_end, end)..end],
+    )
+}
+
+/// End of the run of whole whitespace-only lines starting at `start`.
+fn blank_run_end(source: &str, start: usize, end: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut pos = start;
+    while let Some(nl) = memchr_nl(bytes, pos, end) {
+        if !is_blank(&bytes[pos..nl]) {
+            break;
+        }
+        pos = nl + 1;
+    }
+    pos
+}
+
+/// Start of the run of whole whitespace-only lines ending at `end`.
+fn blank_run_start(source: &str, start: usize, end: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut pos = end;
+    while pos > start && bytes[pos - 1] == b'\n' {
+        let line_start = bytes[start..pos - 1]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(start, |i| start + i + 1);
+        if !is_blank(&bytes[line_start..pos - 1]) {
+            break;
+        }
+        pos = line_start;
+    }
+    pos
+}
+
+/// End of the first line in `start..end`, newline included; `end` if unterminated.
+fn first_line_end(source: &str, start: usize, end: usize) -> usize {
+    memchr_nl(source.as_bytes(), start, end).map_or(end, |nl| nl + 1)
+}
+
+fn memchr_nl(bytes: &[u8], from: usize, to: usize) -> Option<usize> {
+    bytes[from..to]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| from + i)
+}
+
+fn is_blank(line: &[u8]) -> bool {
+    line.iter().all(|b| matches!(b, b' ' | b'\t' | b'\r'))
+}
+
+fn starts_with_blank_line(s: &str) -> bool {
+    s.split_once('\n')
+        .is_some_and(|(first, _)| is_blank(first.as_bytes()))
+}
+
+fn ends_with_blank_line(s: &str) -> bool {
+    s.strip_suffix('\n').is_some_and(|body| {
+        let last = body.rsplit_once('\n').map_or(body, |(_, l)| l);
+        is_blank(last.as_bytes())
+    })
 }
 
 /// Where `append` inserts ([ADR-0025](../../../docs/adr/0025-insertion-placement.md)):
@@ -616,6 +703,68 @@ mod tests {
             ..edit(&["A"], Operation::Replace)
         };
         assert_eq!(apply(src, vec![e]), "# A\nX");
+    }
+
+    #[test]
+    fn replace_body_preserves_the_blank_seams_around_it() {
+        // The blank line under a heading and the one ahead of the next heading
+        // are separators, not body content: replacing the body keeps both.
+        let src = "# A\n\nold lead\n\n## B\nsub\n";
+        let e = Edit {
+            scope: Scope::Body,
+            content: Some("new lead".into()),
+            ..edit(&["A"], Operation::Replace)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\n\nnew lead\n\n## B\nsub\n");
+    }
+
+    #[test]
+    fn replace_section_preserves_the_blank_seams_around_it() {
+        let src = "# A\n\nold\n\n# B\nb\n";
+        let e = Edit {
+            scope: Scope::Section,
+            content: Some("new".into()),
+            ..edit(&["A"], Operation::Replace)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\n\nnew\n\n# B\nb\n");
+    }
+
+    #[test]
+    fn replace_does_not_double_seams_the_content_already_carries() {
+        // Content echoed back from a read already starts and ends with the
+        // separators; restoring them again would grow the note on every edit.
+        let src = "# A\n\nold\n\n## B\nsub\n";
+        let e = Edit {
+            scope: Scope::Body,
+            content: Some("\nnew\n\n".into()),
+            ..edit(&["A"], Operation::Replace)
+        };
+        assert_eq!(apply(src, vec![e]), "# A\n\nnew\n\n## B\nsub\n");
+    }
+
+    #[test]
+    fn replace_blank_only_body_keeps_the_blank_on_both_seams() {
+        let src = "## A\n\n## B\n";
+        let e = Edit {
+            scope: Scope::Body,
+            content: Some("X".into()),
+            ..edit(&["A"], Operation::Replace)
+        };
+        assert_eq!(apply(src, vec![e]), "## A\n\nX\n\n## B\n");
+    }
+
+    #[test]
+    fn replace_root_body_preserves_the_blank_after_frontmatter() {
+        let src = "---\nt: x\n---\n\nintro\n\n# A\na\n";
+        let e = Edit {
+            scope: Scope::Body,
+            content: Some("new intro".into()),
+            ..edit(&[], Operation::Replace)
+        };
+        assert_eq!(
+            apply(src, vec![e]),
+            "---\nt: x\n---\n\nnew intro\n\n# A\na\n"
+        );
     }
 
     #[test]
