@@ -14,6 +14,7 @@
 //! no `Origin` header and pass the Origin guard unaffected.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -29,6 +30,25 @@ use tokio::net::TcpListener;
 use crate::MdServer;
 use crate::config::HttpConfig;
 use crate::oauth::{self, OAuthState};
+
+/// How long an idle MCP session is kept before rmcp reaps it. rmcp's own default
+/// is 5 minutes, which a conversational client outlives all the time: the session
+/// worker quits on `IdleTimeout`, the session manager drops the entry, and the
+/// client's next tool call — still carrying the old `Mcp-Session-Id` — gets the
+/// spec-mandated 404, surfacing to the caller as a failed tool rather than as an
+/// expired session. An hour covers a normal think-and-type pause; the timeout
+/// stays a safety net for sessions whose HTTP connection dropped silently.
+const SESSION_KEEP_ALIVE: Duration = Duration::from_secs(3600);
+
+/// The session manager backing `/mcp`, with the idle timeout raised to
+/// [`SESSION_KEEP_ALIVE`]. Sessions hold no vault state of their own — each is a
+/// cheap `MdServer::clone()` over the shared vault — so a longer-lived one costs
+/// only its worker task.
+fn session_manager() -> LocalSessionManager {
+    let mut manager = LocalSessionManager::default();
+    manager.session_config.keep_alive = Some(SESSION_KEEP_ALIVE);
+    manager
+}
 
 /// Build the axum router serving the MCP endpoint at `/mcp`, wiring the Host and
 /// Origin guards and (when a token is configured) bearer auth.
@@ -54,7 +74,7 @@ pub fn router(server: MdServer, cfg: &HttpConfig) -> Router {
 
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
-        Arc::new(LocalSessionManager::default()),
+        Arc::new(session_manager()),
         sh_config,
     );
 
@@ -411,7 +431,8 @@ pub(crate) fn token_matches(provided: &str, expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_allowed_hosts, loopback_origins, normalize_host, parse_bearer, token_matches,
+        SESSION_KEEP_ALIVE, effective_allowed_hosts, loopback_origins, normalize_host,
+        parse_bearer, token_matches,
     };
 
     #[test]
@@ -474,5 +495,17 @@ mod tests {
         assert!(o.contains(&"http://127.0.0.1:7654".to_string()));
         assert!(o.contains(&"http://localhost:7654".to_string()));
         assert!(o.contains(&"http://[::1]:7654".to_string()));
+    }
+
+    #[test]
+    fn idle_session_outlives_the_rmcp_default() {
+        use rmcp::transport::streamable_http_server::session::local::SessionConfig;
+
+        // The session manager must raise rmcp's idle timeout, not inherit it:
+        // at the 5-minute default a client that pauses mid-conversation has its
+        // session reaped, and its next tool call 404s.
+        let manager = super::session_manager();
+        assert_eq!(manager.session_config.keep_alive, Some(SESSION_KEEP_ALIVE));
+        assert!(SESSION_KEEP_ALIVE > SessionConfig::DEFAULT_KEEP_ALIVE);
     }
 }
