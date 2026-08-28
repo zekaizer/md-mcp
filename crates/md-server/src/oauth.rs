@@ -837,6 +837,34 @@ mod tests {
         assert_eq!(oauth.validate_bearer(&token), None);
     }
 
+    /// The shape a running deployment actually restarts from: access records
+    /// long expired, refresh records alive, none of them carrying scopes.
+    #[test]
+    fn a_stored_refresh_without_scopes_still_refreshes_into_full_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("oauth-state.json");
+        let expired = now_secs() - 1;
+        let live = now_secs() + 3600;
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"v":1,"clients":{{}},                   "access":{{"stale":{{"expires_at":{expired}}}}},                   "refresh":{{"live-refresh":{{"expires_at":{live}}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let oauth = OAuthState::load("static-token".to_string(), file);
+        let refreshed = oauth
+            .refresh("live-refresh")
+            .expect("a live refresh token predating scopes must still be redeemable");
+
+        assert_eq!(
+            oauth.validate_bearer(&refreshed.access_token),
+            Some(Scopes::full()),
+            "the connector holds a refresh token, not an access token, across a restart"
+        );
+    }
+
     #[test]
     fn the_static_token_holds_full_authority() {
         let dir = tempfile::tempdir().unwrap();
