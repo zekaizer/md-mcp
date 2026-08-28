@@ -478,3 +478,57 @@ async fn a_posted_tar_cannot_escape_the_vault() {
         "one refused entry must not abandon the rest of the push"
     );
 }
+
+#[tokio::test]
+async fn an_unknown_prefix_is_not_an_empty_result() {
+    let addr = spawn_with_tree().await;
+
+    // The vault holds `inbox`, not `00-inbox` — the shape of a real mistype.
+    let tar = reqwest::get(format!("http://{addr}/api/notes?prefix=00-inbox"))
+        .await
+        .unwrap();
+    assert_eq!(
+        tar.status(),
+        404,
+        "a mistyped prefix must not come back as a silently empty archive"
+    );
+
+    let index = reqwest::get(format!(
+        "http://{addr}/api/notes?format=index&prefix=00-inbox"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(index.status(), 404);
+}
+
+#[tokio::test]
+async fn a_directory_holding_no_notes_is_an_empty_archive() {
+    let (addr, root) = spawn_with_root(None).await;
+    std::fs::create_dir(root.join("drafts")).unwrap();
+
+    let response = reqwest::get(format!("http://{addr}/api/notes?prefix=drafts"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        200,
+        "a real directory that happens to hold nothing is not an error"
+    );
+    assert_eq!(response.headers()["note-count"], "0");
+}
+
+#[tokio::test]
+async fn an_archive_says_how_many_notes_it_carries() {
+    let addr = spawn_with_tree().await;
+    let response = reqwest::get(format!("http://{addr}/api/notes?prefix=inbox/"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["note-count"],
+        "2",
+        "a caller should not have to parse the archive to know it got anything"
+    );
+}

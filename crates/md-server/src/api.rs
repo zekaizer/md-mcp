@@ -37,6 +37,10 @@ const TAR: &str = "application/x-tar";
 /// guards every other route would refuse an ordinary bulk import.
 const MAX_TAR_BYTES: usize = 32 * 1024 * 1024;
 
+/// How many notes an archive carries, so a caller can tell "got nothing" from
+/// "got something" without unpacking it.
+const NOTE_COUNT: axum::http::HeaderName = axum::http::HeaderName::from_static("note-count");
+
 /// `/api/notes/...`, mounted beside `/mcp` and behind the same bearer guard.
 pub(crate) fn routes(server: MdServer) -> Router {
     Router::new()
@@ -231,6 +235,7 @@ async fn tar_of_subtree(server: &MdServer, prefix: Option<&str>) -> Response {
         Err(error) => return core_error(&error),
     };
 
+    let count = entries.len();
     let mut builder = tar::Builder::new(Vec::new());
     for entry in entries {
         // A transfer that silently drops a note it could not read would read as
@@ -248,7 +253,16 @@ async fn tar_of_subtree(server: &MdServer, prefix: Option<&str>) -> Response {
         }
     }
     match builder.into_inner() {
-        Ok(bytes) => ([(header::CONTENT_TYPE, TAR.to_string())], bytes).into_response(),
+        // A tar of nothing is 1024 bytes of padding and looks exactly like a tar
+        // of something, so the count is stated rather than left to be parsed.
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, TAR.to_string()),
+                (NOTE_COUNT, count.to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
         Err(error) => export_failed("", &error.to_string()),
     }
 }
@@ -278,6 +292,11 @@ async fn get_collection(
     if !authority(scopes).read {
         return forbidden("notes:read");
     }
+    // An empty archive and a mistyped prefix look identical to a caller, and
+    // one of them means the command they ran did nothing.
+    if let Some(missing) = unknown_prefix(&server, query.prefix.as_deref()).await {
+        return missing;
+    }
     match query.format.as_deref() {
         Some("index") => index(&server, query.prefix.as_deref()).await,
         None | Some("tar") => tar_of_subtree(&server, query.prefix.as_deref()).await,
@@ -286,6 +305,26 @@ async fn get_collection(
             format!("unsupported format {other:?}; use tar or index\n"),
         )
             .into_response(),
+    }
+}
+
+/// `Some(404)` when `prefix` names nothing in the vault. A directory that
+/// exists and holds no notes is a real, empty answer and passes.
+async fn unknown_prefix(server: &MdServer, prefix: Option<&str>) -> Option<Response> {
+    let prefix = prefix?.trim_matches('/');
+    if prefix.is_empty() {
+        return None;
+    }
+    let _guard = server.lock().read().await;
+    match server.vault().is_dir(prefix) {
+        Ok(true) => None,
+        _ => Some(
+            (
+                StatusCode::NOT_FOUND,
+                format!("no directory {prefix:?} in this vault\n"),
+            )
+                .into_response(),
+        ),
     }
 }
 
