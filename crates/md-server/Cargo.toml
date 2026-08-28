@@ -33,6 +33,8 @@ clap.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Derives the decomposed-name fixture for the transfer API's NFC test.
+unicode-normalization.workspace = true
 # Client side for the in-process e2e test; the reqwest streamable-http client +
 # `tokio` time drive the HTTP transport e2e test (ADR-0013).
 rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest"] }

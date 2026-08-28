@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
 use md_core::Code;
+use md_core::text::nfc;
 
 use crate::MdServer;
 use crate::envelope::MAX_WRITE_BYTES;
@@ -37,6 +38,7 @@ async fn get_note(
     if !authority(scopes).read {
         return forbidden("notes:read");
     }
+    let path = nfc(&path);
     let _guard = server.lock().read().await;
     let note = match server.vault().read_note(&path) {
         Ok(note) => note,
@@ -83,6 +85,10 @@ async fn put_note(
         )
             .into_response();
     }
+
+    // A client filesystem may spell a name decomposed; the vault stores one
+    // composed spelling so the same note never lands under two paths (ADR-0028).
+    let path = nfc(&path).into_owned();
 
     // Held across the read-check-write so a concurrent writer in this process
     // cannot slip between the precondition and the write (ADR-0008).

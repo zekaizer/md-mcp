@@ -10,7 +10,14 @@ const NOTE: &str = "---\ntitle: Hi\n---\n# Heading\nbody\n";
 
 /// Serve on an ephemeral loopback port with a vault holding `hello.md`.
 async fn spawn(token: Option<&str>) -> SocketAddr {
+    spawn_with_root(token).await.0
+}
+
+/// As [`spawn`], also handing back the vault root for tests that care what
+/// landed on disk rather than what the API answered.
+async fn spawn_with_root(token: Option<&str>) -> (SocketAddr, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
     let vault = Vault::open(dir.path()).unwrap();
     vault.write_atomic("hello.md", NOTE.as_bytes()).unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -30,7 +37,7 @@ async fn spawn(token: Option<&str>) -> SocketAddr {
     tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    addr
+    (addr, root)
 }
 
 #[tokio::test]
@@ -223,5 +230,26 @@ async fn a_wildcard_precondition_on_an_absent_note_is_refused() {
         response.status(),
         412,
         "`*` asserts the note exists; it must not quietly create one"
+    );
+}
+
+#[tokio::test]
+async fn a_decomposed_name_is_stored_composed() {
+    use unicode_normalization::UnicodeNormalization;
+
+    let (addr, root) = spawn_with_root(None).await;
+    let decomposed: String = "오픽.md".nfd().collect();
+    assert_ne!(decomposed, "오픽.md", "the fixture must actually differ");
+
+    assert_eq!(put(addr, &decomposed, "# x\n", None).await.status(), 201);
+
+    let names: Vec<String> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.contains(&"오픽.md".to_string()),
+        "a client filesystem hands over decomposed names; storing one verbatim \
+         leaves the vault holding two spellings of one note. got: {names:?}"
     );
 }
