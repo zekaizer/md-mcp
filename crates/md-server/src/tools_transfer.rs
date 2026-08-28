@@ -76,13 +76,27 @@ impl MdServer {
         let base = base_url(&parts);
 
         Ok(Json(ProvisionTransferResponse {
-            recipe: recipe(&base, &token, req.write),
+            recipe: recipe(&base, &token, req.write, example_dir(self).await.as_deref()),
             base,
             token,
             expires_in_seconds: TRANSFER_TTL_SECS,
             scopes: scope_names(scopes),
         }))
     }
+}
+
+/// A directory this vault actually has, to fill the examples with. A recipe
+/// naming a directory that is not there unpacks nothing on a pull and creates a
+/// stray one on a push, and reports success either way.
+async fn example_dir(server: &MdServer) -> Option<String> {
+    let _guard = server.lock().read().await;
+    server
+        .vault()
+        .list_entries("", false, None, true)
+        .ok()?
+        .into_iter()
+        .find(|entry| entry.is_dir)
+        .map(|entry| entry.path.trim_end_matches('/').to_string())
 }
 
 /// The public base this request arrived on. The tunnel terminates TLS, so the
@@ -109,24 +123,73 @@ fn scope_names(scopes: Scopes) -> Vec<String> {
 
 /// Commands with the values already substituted: a model should run a line,
 /// not assemble one.
-fn recipe(base: &str, token: &str, write: bool) -> Vec<String> {
+fn recipe(base: &str, token: &str, write: bool, example_dir: Option<&str>) -> Vec<String> {
     let auth = format!("-H \"authorization: Bearer {token}\"");
+    // With no directory to name, every example takes the whole vault rather than
+    // inventing a path that would unpack nothing and push into the wrong place.
+    let scope = example_dir.map_or_else(String::new, |dir| format!("?prefix={dir}"));
+    let note = example_dir.map_or_else(|| "note.md".to_string(), |dir| format!("{dir}/note.md"));
+
     let mut recipe = vec![
         format!(
-            "# pull a subtree into ./vault\ncurl -sS {auth} \"{base}?prefix=inbox\" | tar -xf - -C ./vault"
+            "# pull into ./vault (note-count in the response headers says how many arrived)\ncurl -sS {auth} \"{base}{scope}\" | tar -xf - -C ./vault"
         ),
         format!(
-            "# what exists, with tags and sizes, without the content\ncurl -sS {auth} \"{base}?format=index\""
+            "# what exists, with each note's hash and size, without the content\ncurl -sS {auth} \"{base}?format=index\""
         ),
-        format!("# one note\ncurl -sS {auth} -o note.md \"{base}/inbox/note.md\""),
+        format!("# one note\ncurl -sS {auth} -o note.md \"{base}/{note}\""),
     ];
     if write {
+        let destination = example_dir.map_or_else(String::new, |dir| format!("?to={dir}"));
+        let separator = if destination.is_empty() { "?" } else { "&" };
         recipe.push(format!(
-            "# push a directory (add &overwrite=true to replace existing notes)\ntar -C ./vault -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}?to=inbox\""
+            "# push a directory (add {separator}overwrite=true to replace existing notes)\ntar -C ./vault -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}\""
         ));
         recipe.push(format!(
-            "# replace one note, only if it has not changed since you read it\ncurl -sS {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/inbox/note.md\""
+            "# replace one note, only if it has not changed since you read it\ncurl -sS {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{note}\""
         ));
     }
     recipe
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recipe;
+
+    #[test]
+    fn the_examples_name_a_directory_this_vault_actually_has() {
+        let lines = recipe("https://host/api/notes", "T0KEN", true, Some("00-inbox"));
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("prefix=00-inbox"),
+            "the pull example must be runnable as printed: {joined}"
+        );
+        assert!(
+            joined.contains("to=00-inbox"),
+            "a push to a directory that is not there quietly creates a stray one: {joined}"
+        );
+        assert!(
+            !joined.contains("/inbox/") && !joined.contains("=inbox"),
+            "no invented directory may survive in the recipe: {joined}"
+        );
+    }
+
+    #[test]
+    fn an_empty_vault_gets_examples_without_a_prefix() {
+        let joined = recipe("https://host/api/notes", "T0KEN", true, None).join("\n");
+        assert!(
+            !joined.contains("prefix=") && !joined.contains("to="),
+            "with no directory to name, the examples take the whole vault: {joined}"
+        );
+    }
+
+    #[test]
+    fn the_index_example_does_not_promise_note_tags() {
+        let joined = recipe("https://host/api/notes", "T0KEN", false, None).join("\n");
+        assert!(
+            !joined.contains("tags"),
+            "in a notes vault `tags` means frontmatter tags, which this does not \
+             return: {joined}"
+        );
+    }
 }
