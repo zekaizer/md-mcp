@@ -83,10 +83,16 @@ We will attach **scopes** (`notes:read`, `notes:write`) to issued tokens and che
 them per operation. A stored token record without scopes predates this decision
 and means full authority, so sessions that are live at deployment keep working.
 
-We will surface the API to models through **one MCP tool** that mints a
-short-lived, scope-reduced token and returns commands with the token and endpoint
-already substituted. The tool's authority is the caller's: a request that passed
-the bearer guard is the consent, so no second human approval is required. One line
+We will surface the API to models through **one MCP tool**, which answers not
+with a credential but with a one-time ticket and the commands that trade it for
+one. A token named in a tool's answer sits in the conversation for as long as
+the conversation is kept, long after it has stopped working; a spent ticket is
+dead text. The commands collect the token into a file and read it back from
+there, so it reaches no command line, shell history, or process listing either.
+Tickets are single-use and lapse in a couple of minutes.
+
+The tool's authority is the caller's: a request that passed the bearer guard is
+the consent, so no second human approval is required. One line
 in the server `instructions` names the situation that should trigger it, and a 401
 body names the call that mints a fresh token.
 
