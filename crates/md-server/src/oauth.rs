@@ -34,6 +34,9 @@ const ACCESS_TTL_SECS: u64 = 60 * 60;
 const REFRESH_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 /// Authorization codes are single-use and short-lived.
 const CODE_TTL_SECS: u64 = 5 * 60;
+/// A transfer code is redeemed in the same turn it is handed out, so it lapses
+/// fast: what it leaves behind in a conversation transcript is dead text.
+const TRANSFER_CODE_TTL_SECS: u64 = 120;
 
 /// State schema version. Bump on a breaking change; an unreadable/old file starts empty,
 /// which forces a one-time re-auth.
@@ -112,6 +115,15 @@ struct ClientRec {
     created_at: u64,
 }
 
+/// A one-time ticket for a transfer token. In-memory only: a restart should
+/// invalidate every outstanding ticket, and it holds the grant rather than the
+/// credential, so the token's own clock starts when it is actually collected.
+struct TransferCode {
+    scopes: Scopes,
+    token_ttl_secs: u64,
+    expires_at: u64,
+}
+
 /// In-memory only (one-time, short-lived).
 struct CodeRec {
     client_id: String,
@@ -128,6 +140,7 @@ pub struct OAuthState {
     state_file: PathBuf,
     store: Mutex<Persisted>,
     codes: Mutex<HashMap<String, CodeRec>>,
+    transfer_codes: Mutex<HashMap<String, TransferCode>>,
 }
 
 impl OAuthState {
@@ -149,6 +162,7 @@ impl OAuthState {
             state_file,
             store: Mutex::new(store),
             codes: Mutex::new(HashMap::new()),
+            transfer_codes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -290,6 +304,42 @@ impl OAuthState {
         Some(self.issue_tokens(client_id))
     }
 
+    /// A one-time ticket that trades for a transfer token, so the credential
+    /// itself never has to be spoken aloud where it would be written down.
+    pub fn issue_transfer_code(&self, scopes: Scopes, token_ttl_secs: u64) -> String {
+        let code = random_token();
+        let now = now_secs();
+        let mut codes = self.transfer_codes.lock().unwrap();
+        codes.retain(|_, rec| rec.expires_at > now);
+        codes.insert(
+            code.clone(),
+            TransferCode {
+                scopes,
+                token_ttl_secs,
+                expires_at: now + TRANSFER_CODE_TTL_SECS,
+            },
+        );
+        code
+    }
+
+    /// Trade a ticket for the token it stands for. Consumes it either way: a
+    /// ticket that has been offered once is spent, redeemed or not.
+    pub fn redeem_transfer_code(&self, code: &str) -> Option<String> {
+        // Removed before it is examined, so two callers racing the same ticket
+        // cannot both walk away with a token.
+        let rec = self.transfer_codes.lock().unwrap().remove(code)?;
+        if rec.expires_at <= now_secs() {
+            return None;
+        }
+        Some(self.mint(rec.scopes, rec.token_ttl_secs))
+    }
+
+    /// How long a ticket stays redeemable.
+    #[must_use]
+    pub fn transfer_code_ttl_secs() -> u64 {
+        TRANSFER_CODE_TTL_SECS
+    }
+
     /// Mint a standalone access token holding no more than `scopes`, valid for
     /// `ttl_secs`. It has no refresh token: a credential handed to a sandbox is
     /// meant to lapse, not to renew itself.
@@ -361,6 +411,7 @@ pub fn routes(state: Arc<OAuthState>) -> Router {
         .route("/register", post(register))
         .route("/authorize", get(authorize_get).post(authorize_post))
         .route("/token", post(token))
+        .route("/transfer/redeem", post(redeem))
         .with_state(state)
 }
 
@@ -558,6 +609,40 @@ fn validate_authorize(oauth: &OAuthState, q: &AuthorizeQuery) -> Result<(), &'st
         return Err("unknown client_id or unregistered redirect_uri");
     }
     Ok(())
+}
+
+// --- transfer ticket ---------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RedeemRequest {
+    code: String,
+}
+
+/// Trade a one-time ticket for a transfer token.
+///
+/// The body is the bare token so a caller can `-o` it straight into a file: the
+/// credential then never appears on a command line, in shell history, or in the
+/// conversation that arranged it. Unauthenticated by necessity — the ticket is
+/// the only thing the holder has.
+async fn redeem(State(oauth): State<Arc<OAuthState>>, Form(req): Form<RedeemRequest>) -> Response {
+    match oauth.redeem_transfer_code(&req.code) {
+        Some(token) => {
+            tracing::info!("transfer: ticket redeemed");
+            (
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                format!("{token}\n"),
+            )
+                .into_response()
+        }
+        None => {
+            tracing::warn!("transfer: ticket rejected (unknown, spent, or lapsed)");
+            (
+                StatusCode::BAD_REQUEST,
+                "this ticket is spent or lapsed; call provision_transfer again for a fresh one\n",
+            )
+                .into_response()
+        }
+    }
 }
 
 // --- token -------------------------------------------------------------------
@@ -863,6 +948,49 @@ mod tests {
             Some(Scopes::full()),
             "the connector holds a refresh token, not an access token, across a restart"
         );
+    }
+
+    #[test]
+    fn a_transfer_code_trades_for_a_token_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
+        let granted = Scopes {
+            read: true,
+            write: false,
+        };
+
+        let code = oauth.issue_transfer_code(granted, 600);
+        assert_ne!(code, "", "a ticket has to be something");
+
+        let token = oauth
+            .redeem_transfer_code(&code)
+            .expect("the first redemption yields the token");
+        assert_eq!(oauth.validate_bearer(&token), Some(granted));
+        assert_ne!(token, code, "the ticket is not the credential");
+
+        assert_eq!(
+            oauth.redeem_transfer_code(&code),
+            None,
+            "a ticket left in a transcript must be worthless the moment it is used"
+        );
+    }
+
+    #[test]
+    fn a_lapsed_transfer_code_trades_for_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
+
+        let code = oauth.issue_transfer_code(Scopes::full(), 600);
+        // Reach in and age it past its window rather than sleeping two minutes.
+        oauth
+            .transfer_codes
+            .lock()
+            .unwrap()
+            .get_mut(&code)
+            .unwrap()
+            .expires_at = now_secs() - 1;
+
+        assert_eq!(oauth.redeem_transfer_code(&code), None);
     }
 
     #[test]

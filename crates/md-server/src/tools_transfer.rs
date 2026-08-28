@@ -17,9 +17,14 @@ use serde::{Deserialize, Serialize};
 use crate::MdServer;
 use crate::oauth::{OAuthState, Scopes};
 
-/// Long enough for a bulk import, short enough that the copy left in a
-/// conversation transcript is stale before anyone could read it back.
+/// Long enough for a bulk import; a token that outlives its errand is only a
+/// liability, and one that lapses mid-push is only an interruption.
 const TRANSFER_TTL_SECS: u64 = 10 * 60;
+
+/// Where the recipe parks the collected token. Never interpolated into a
+/// command, only read back through `$(cat …)`, so it stays out of shell history
+/// and out of `ps`.
+const TOKEN_FILE: &str = "/tmp/md-token";
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -35,8 +40,16 @@ pub struct ProvisionTransferRequest {
 pub struct ProvisionTransferResponse {
     /// Base URL of the transfer API.
     pub base: String,
-    pub token: String,
-    pub expires_in_seconds: u64,
+    /// Where to trade the ticket for the token.
+    pub redeem: String,
+    /// A one-time ticket, not a credential: it is spent by the first redemption
+    /// and is worthless afterwards, so what it leaves in this conversation is
+    /// dead text.
+    pub code: String,
+    pub code_expires_in_seconds: u64,
+    pub token_expires_in_seconds: u64,
+    /// Where the recipe leaves the collected token.
+    pub token_file: String,
     pub scopes: Vec<String>,
     /// Runnable as printed, in a shell that has `curl` and `tar`.
     pub recipe: Vec<String>,
@@ -72,14 +85,25 @@ impl MdServer {
             read: true,
             write: req.write,
         };
-        let token = oauth.mint(scopes, TRANSFER_TTL_SECS);
-        let base = base_url(&parts);
+        let code = oauth.issue_transfer_code(scopes, TRANSFER_TTL_SECS);
+        let root = origin(&parts);
+        let base = format!("{root}/api/notes");
+        let redeem = format!("{root}/transfer/redeem");
 
         Ok(Json(ProvisionTransferResponse {
-            recipe: recipe(&base, &token, req.write, example_dir(self).await.as_deref()),
+            recipe: recipe(
+                &base,
+                &redeem,
+                &code,
+                req.write,
+                example_dir(self).await.as_deref(),
+            ),
             base,
-            token,
-            expires_in_seconds: TRANSFER_TTL_SECS,
+            redeem,
+            code,
+            code_expires_in_seconds: OAuthState::transfer_code_ttl_secs(),
+            token_expires_in_seconds: TRANSFER_TTL_SECS,
+            token_file: TOKEN_FILE.to_string(),
             scopes: scope_names(scopes),
         }))
     }
@@ -99,15 +123,15 @@ async fn example_dir(server: &MdServer) -> Option<String> {
         .map(|entry| entry.path.trim_end_matches('/').to_string())
 }
 
-/// The public base this request arrived on. The tunnel terminates TLS, so the
+/// The public origin this request arrived on. The tunnel terminates TLS, so the
 /// forwarded `Host` is the only thing that names the server a client can reach.
-fn base_url(parts: &Parts) -> String {
+fn origin(parts: &Parts) -> String {
     let host = parts
         .headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("localhost");
-    format!("https://{host}/api/notes")
+    format!("https://{host}")
 }
 
 fn scope_names(scopes: Scopes) -> Vec<String> {
@@ -123,8 +147,16 @@ fn scope_names(scopes: Scopes) -> Vec<String> {
 
 /// Commands with the values already substituted: a model should run a line,
 /// not assemble one.
-fn recipe(base: &str, token: &str, write: bool, example_dir: Option<&str>) -> Vec<String> {
-    let auth = format!("-H \"authorization: Bearer {token}\"");
+fn recipe(
+    base: &str,
+    redeem: &str,
+    code: &str,
+    write: bool,
+    example_dir: Option<&str>,
+) -> Vec<String> {
+    // Read back from the file rather than interpolated: the token then never
+    // reaches a command line, shell history, or this conversation.
+    let auth = format!("-H \"authorization: Bearer $(cat {TOKEN_FILE})\"");
     // With no directory to name, every example takes the whole vault rather than
     // inventing a path that would unpack nothing and push into the wrong place.
     let scope = example_dir.map_or_else(String::new, |dir| format!("?prefix={dir}"));
@@ -132,7 +164,10 @@ fn recipe(base: &str, token: &str, write: bool, example_dir: Option<&str>) -> Ve
 
     let mut recipe = vec![
         format!(
-            "# pull into ./vault (note-count in the response headers says how many arrived)\ncurl -sS {auth} \"{base}{scope}\" | tar -xf - -C ./vault"
+            "# 1. run this first: trade the one-time ticket for the token (single use)\ncurl -sSf -X POST -d \"code={code}\" \"{redeem}\" -o {TOKEN_FILE}"
+        ),
+        format!(
+            "# pull into ./vault (the note-count response header says how many arrived)\ncurl -sS {auth} \"{base}{scope}\" | tar -xf - -C ./vault"
         ),
         format!(
             "# what exists, with each note's hash and size, without the content\ncurl -sS {auth} \"{base}?format=index\""
@@ -158,7 +193,13 @@ mod tests {
 
     #[test]
     fn the_examples_name_a_directory_this_vault_actually_has() {
-        let lines = recipe("https://host/api/notes", "T0KEN", true, Some("00-inbox"));
+        let lines = recipe(
+            "https://host/api/notes",
+            "https://host/transfer/redeem",
+            "TICKET",
+            true,
+            Some("00-inbox"),
+        );
         let joined = lines.join("\n");
         assert!(
             joined.contains("prefix=00-inbox"),
@@ -176,7 +217,14 @@ mod tests {
 
     #[test]
     fn an_empty_vault_gets_examples_without_a_prefix() {
-        let joined = recipe("https://host/api/notes", "T0KEN", true, None).join("\n");
+        let joined = recipe(
+            "https://host/api/notes",
+            "https://host/transfer/redeem",
+            "TICKET",
+            true,
+            None,
+        )
+        .join("\n");
         assert!(
             !joined.contains("prefix=") && !joined.contains("to="),
             "with no directory to name, the examples take the whole vault: {joined}"
@@ -185,7 +233,14 @@ mod tests {
 
     #[test]
     fn the_index_example_does_not_promise_note_tags() {
-        let joined = recipe("https://host/api/notes", "T0KEN", false, None).join("\n");
+        let joined = recipe(
+            "https://host/api/notes",
+            "https://host/transfer/redeem",
+            "TICKET",
+            false,
+            None,
+        )
+        .join("\n");
         assert!(
             !joined.contains("tags"),
             "in a notes vault `tags` means frontmatter tags, which this does not \

@@ -186,8 +186,8 @@ async fn concurrent_sessions_share_one_vault_and_serialize_writes() {
     handle.abort();
 }
 
-/// Provision a transfer credential over MCP and return `(token, scopes)`.
-async fn provision(addr: SocketAddr, write: bool) -> (String, Value) {
+/// Ask for a transfer grant over MCP and return the raw MCP answer.
+async fn grant(addr: SocketAddr, write: bool) -> Value {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
             .auth_header("s3cret"),
@@ -199,11 +199,67 @@ async fn provision(addr: SocketAddr, write: bool) -> (String, Value) {
         .call_tool(CallToolRequestParams::new("provision_transfer").with_arguments(args))
         .await
         .expect("call provision_transfer");
-    let grant: Value = result.structured_content.expect("structured content");
-    (
-        grant["token"].as_str().expect("a token").to_string(),
-        grant["scopes"].clone(),
-    )
+    result.structured_content.expect("structured content")
+}
+
+/// Trade a ticket for the token it stands for, as the recipe's first line does.
+async fn redeem(addr: SocketAddr, code: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{addr}/transfer/redeem"))
+        .form(&[("code", code)])
+        .send()
+        .await
+        .unwrap()
+}
+
+/// The whole first step of the recipe: provision, then collect.
+async fn provision(addr: SocketAddr, write: bool) -> (String, Value) {
+    let grant = grant(addr, write).await;
+    let code = grant["code"].as_str().expect("a ticket").to_string();
+    let token = redeem(addr, &code)
+        .await
+        .text()
+        .await
+        .unwrap()
+        .trim()
+        .to_string();
+    (token, grant["scopes"].clone())
+}
+
+#[tokio::test]
+async fn the_grant_itself_carries_no_credential() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let grant = grant(addr, true).await;
+
+    assert!(
+        grant.get("token").is_none(),
+        "a credential in the answer would sit in the conversation for good: {grant}"
+    );
+    assert!(grant["code"].as_str().is_some_and(|c| c.len() > 20));
+}
+
+#[tokio::test]
+async fn a_ticket_is_spent_by_its_first_use() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let grant = grant(addr, false).await;
+    let code = grant["code"].as_str().unwrap().to_string();
+
+    let first = redeem(addr, &code).await;
+    assert_eq!(first.status(), 200);
+    assert!(!first.text().await.unwrap().trim().is_empty());
+
+    let second = redeem(addr, &code).await;
+    assert_eq!(
+        second.status(),
+        400,
+        "a ticket left behind in a transcript has to be worthless"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_ticket_buys_nothing() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    assert_eq!(redeem(addr, "not-a-ticket").await.status(), 400);
 }
 
 #[tokio::test]
