@@ -17,10 +17,6 @@ use serde::{Deserialize, Serialize};
 use crate::MdServer;
 use crate::oauth::{OAuthState, Scopes};
 
-/// Long enough for a bulk import; a token that outlives its errand is only a
-/// liability, and one that lapses mid-push is only an interruption.
-const TRANSFER_TTL_SECS: u64 = 10 * 60;
-
 /// Where the recipe parks the collected token. Never interpolated into a
 /// command, only read back through `$(cat …)`, so it stays out of shell history
 /// and out of `ps`.
@@ -42,12 +38,16 @@ pub struct ProvisionTransferResponse {
     pub base: String,
     /// Where to trade the ticket for the token.
     pub redeem: String,
+    /// Where to trade a live token for a fresh one, before it lapses.
+    pub renew: String,
     /// A one-time ticket, not a credential: it is spent by the first redemption
     /// and is worthless afterwards, so what it leaves in this conversation is
     /// dead text.
     pub code: String,
     pub code_expires_in_seconds: u64,
     pub token_expires_in_seconds: u64,
+    /// A renewal chain cannot pass this, counted from the first token.
+    pub token_max_lifetime_seconds: u64,
     /// Where the recipe leaves the collected token.
     pub token_file: String,
     pub scopes: Vec<String>,
@@ -85,24 +85,28 @@ impl MdServer {
             read: true,
             write: req.write,
         };
-        let code = oauth.issue_transfer_code(scopes, TRANSFER_TTL_SECS);
+        let code = oauth.issue_transfer_code(scopes);
         let root = origin(&parts);
         let base = format!("{root}/api/notes");
         let redeem = format!("{root}/transfer/redeem");
+        let renew = format!("{root}/transfer/renew");
 
         Ok(Json(ProvisionTransferResponse {
             recipe: recipe(
                 &base,
                 &redeem,
+                &renew,
                 &code,
                 req.write,
                 example_dir(self).await.as_deref(),
             ),
             base,
             redeem,
+            renew,
             code,
             code_expires_in_seconds: OAuthState::transfer_code_ttl_secs(),
-            token_expires_in_seconds: TRANSFER_TTL_SECS,
+            token_expires_in_seconds: OAuthState::transfer_token_ttl_secs(),
+            token_max_lifetime_seconds: OAuthState::transfer_max_lifetime_secs(),
             token_file: TOKEN_FILE.to_string(),
             scopes: scope_names(scopes),
         }))
@@ -150,6 +154,7 @@ fn scope_names(scopes: Scopes) -> Vec<String> {
 fn recipe(
     base: &str,
     redeem: &str,
+    renew: &str,
     code: &str,
     write: bool,
     example_dir: Option<&str>,
@@ -184,6 +189,9 @@ fn recipe(
             "# replace one note, only if it has not changed since you read it\ncurl -sS {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{note}\""
         ));
     }
+    recipe.push(format!(
+        "# renew before it lapses; writing to a temp file first so a failed renewal cannot destroy a live token\ncurl -sSf -X POST {auth} \"{renew}\" -o {TOKEN_FILE}.new && mv {TOKEN_FILE}.new {TOKEN_FILE}"
+    ));
     recipe
 }
 
@@ -196,6 +204,7 @@ mod tests {
         let lines = recipe(
             "https://host/api/notes",
             "https://host/transfer/redeem",
+            "https://host/transfer/renew",
             "TICKET",
             true,
             Some("00-inbox"),
@@ -220,6 +229,7 @@ mod tests {
         let joined = recipe(
             "https://host/api/notes",
             "https://host/transfer/redeem",
+            "https://host/transfer/renew",
             "TICKET",
             true,
             None,
@@ -236,6 +246,7 @@ mod tests {
         let joined = recipe(
             "https://host/api/notes",
             "https://host/transfer/redeem",
+            "https://host/transfer/renew",
             "TICKET",
             false,
             None,

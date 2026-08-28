@@ -433,7 +433,7 @@ fn unauthorized(request: &Request) -> Response {
 /// Extract the credential from an `Authorization` value. Per RFC 7235/6750 the
 /// scheme is case-insensitive and the separator is `1*SP`, so `Bearer`, `bearer`,
 /// and extra spaces all parse.
-fn parse_bearer(value: &str) -> Option<&str> {
+pub(crate) fn parse_bearer(value: &str) -> Option<&str> {
     let (scheme, credential) = value.split_once(char::is_whitespace)?;
     scheme
         .eq_ignore_ascii_case("bearer")

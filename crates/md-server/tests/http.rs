@@ -316,3 +316,60 @@ async fn the_static_token_is_not_what_gets_handed_out() {
         "handing back the parent bearer would defeat the whole grant"
     );
 }
+
+#[tokio::test]
+async fn a_collected_token_renews_itself_and_the_old_one_stops_working() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let (token, _) = provision(addr, false).await;
+    let http = reqwest::Client::new();
+    let note = format!("http://{addr}/api/notes/hello.md");
+
+    let response = http
+        .post(format!("http://{addr}/transfer/renew"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let fresh = response.text().await.unwrap().trim().to_string();
+    assert_ne!(fresh, token);
+
+    assert_eq!(
+        http.get(&note)
+            .bearer_auth(&fresh)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "a long job renews rather than dying halfway"
+    );
+    assert_eq!(
+        http.get(&note)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "renewal replaces a credential; it must not multiply them"
+    );
+}
+
+#[tokio::test]
+async fn the_connector_bearer_cannot_renew_through_the_transfer_path() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/transfer/renew"))
+        .bearer_auth("s3cret")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        401,
+        "letting the parent bearer in here would launder it into an endless chain"
+    );
+}
