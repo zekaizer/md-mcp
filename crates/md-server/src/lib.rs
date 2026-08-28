@@ -4,6 +4,7 @@
 //! exclusive with reads by an in-process readers-writer lock; reads run
 //! concurrently.
 
+mod api;
 mod cjk_fold;
 pub mod config;
 pub mod envelope;

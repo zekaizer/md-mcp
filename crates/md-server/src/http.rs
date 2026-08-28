@@ -72,13 +72,14 @@ pub fn router(server: MdServer, cfg: &HttpConfig) -> Router {
         Some(origins) => sh_config = sh_config.with_allowed_origins(origins.clone()),
     }
 
+    let api = crate::api::routes(server.clone());
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(session_manager()),
         sh_config,
     );
 
-    let mcp = Router::new().route_service("/mcp", service);
+    let mcp = Router::new().route_service("/mcp", service).merge(api);
 
     // OAuth is enabled exactly when a static token is set (ADR-0014): the token is the
     // `/authorize` ownership gate and the Claude Code (CLI) bearer. Without it, the
@@ -379,7 +380,7 @@ fn parse_rpc_call(bytes: &[u8]) -> Option<(String, Option<String>)> {
 /// so the claude.ai connector can start the OAuth flow (ADR-0014).
 async fn require_bearer(
     State(oauth): State<Arc<OAuthState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let token = request
@@ -388,9 +389,17 @@ async fn require_bearer(
         .and_then(|v| v.to_str().ok())
         .and_then(parse_bearer)
         .map(str::to_owned);
-    match token {
-        Some(token) if oauth.validate_bearer(&token).is_some() => next.run(request).await,
-        _ => unauthorized(&request),
+    match token
+        .as_deref()
+        .and_then(|token| oauth.validate_bearer(token))
+    {
+        // Downstream handlers read the caller's authority from here; `/mcp` tools
+        // do not consult it yet, and every token they see still holds it all.
+        Some(scopes) => {
+            request.extensions_mut().insert(scopes);
+            next.run(request).await
+        }
+        None => unauthorized(&request),
     }
 }
 
