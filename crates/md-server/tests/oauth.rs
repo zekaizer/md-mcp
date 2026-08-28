@@ -188,7 +188,11 @@ async fn full_oauth_flow_then_mcp_call() {
     let mcp = serve_client((), transport)
         .await
         .expect("oauth-token handshake");
-    assert_eq!(mcp.list_all_tools().await.expect("list tools").len(), 12);
+    assert_eq!(
+        mcp.list_all_tools().await.expect("list tools").len(),
+        13,
+        "a guarded server has a bearer to delegate, so provision_transfer is offered"
+    );
 
     mcp.cancel().await.ok();
     handle.abort();

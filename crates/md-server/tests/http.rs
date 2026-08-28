@@ -67,7 +67,7 @@ async fn http_client_lists_tools_and_calls_one() {
     assert_eq!(
         tools.len(),
         12,
-        "expected the full 12-tool surface over HTTP"
+        "an unguarded server has no bearer to delegate, so no provision_transfer"
     );
 
     let mut args = serde_json::Map::new();
@@ -104,7 +104,7 @@ async fn http_requires_bearer_when_token_set() {
         StreamableHttpClientTransportConfig::with_uri(url).auth_header("s3cret"),
     );
     let client = serve_client((), authed).await.expect("authed handshake");
-    assert_eq!(client.list_all_tools().await.expect("list tools").len(), 12);
+    assert_eq!(client.list_all_tools().await.expect("list tools").len(), 13);
 
     client.cancel().await.ok();
     handle.abort();
@@ -184,4 +184,79 @@ async fn concurrent_sessions_share_one_vault_and_serialize_writes() {
     s1.cancel().await.ok();
     s2.cancel().await.ok();
     handle.abort();
+}
+
+/// Provision a transfer credential over MCP and return `(token, scopes)`.
+async fn provision(addr: SocketAddr, write: bool) -> (String, Value) {
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header("s3cret"),
+    );
+    let client = serve_client((), transport).await.expect("client handshake");
+    let mut args = serde_json::Map::new();
+    args.insert("write".into(), json!(write));
+    let result = client
+        .call_tool(CallToolRequestParams::new("provision_transfer").with_arguments(args))
+        .await
+        .expect("call provision_transfer");
+    let grant: Value = result.structured_content.expect("structured content");
+    (
+        grant["token"].as_str().expect("a token").to_string(),
+        grant["scopes"].clone(),
+    )
+}
+
+#[tokio::test]
+async fn a_provisioned_credential_reads_but_cannot_write() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let (token, scopes) = provision(addr, false).await;
+    assert_eq!(scopes, json!(["notes:read"]), "writing is opt-in");
+
+    let http = reqwest::Client::new();
+    let read = http
+        .get(format!("http://{addr}/api/notes/hello.md"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 200);
+
+    let write = http
+        .put(format!("http://{addr}/api/notes/new.md"))
+        .bearer_auth(&token)
+        .body("# New\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        write.status(),
+        403,
+        "a token minted weaker than its parent has to actually be weaker"
+    );
+}
+
+#[tokio::test]
+async fn a_provisioned_credential_writes_when_asked_to() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let (token, scopes) = provision(addr, true).await;
+    assert_eq!(scopes, json!(["notes:read", "notes:write"]));
+
+    let write = reqwest::Client::new()
+        .put(format!("http://{addr}/api/notes/new.md"))
+        .bearer_auth(&token)
+        .body("# New\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(write.status(), 201);
+}
+
+#[tokio::test]
+async fn the_static_token_is_not_what_gets_handed_out() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let (token, _) = provision(addr, true).await;
+    assert_ne!(
+        token, "s3cret",
+        "handing back the parent bearer would defeat the whole grant"
+    );
 }

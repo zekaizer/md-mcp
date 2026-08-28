@@ -72,6 +72,13 @@ pub fn router(server: MdServer, cfg: &HttpConfig) -> Router {
         Some(origins) => sh_config = sh_config.with_allowed_origins(origins.clone()),
     }
 
+    // `provision_transfer` delegates from a bearer, so it exists only where one
+    // is required.
+    let server = if cfg.token.is_some() {
+        server.with_transfer()
+    } else {
+        server
+    };
     let api = crate::api::routes(server.clone());
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
@@ -397,6 +404,9 @@ async fn require_bearer(
         // do not consult it yet, and every token they see still holds it all.
         Some(scopes) => {
             request.extensions_mut().insert(scopes);
+            // `provision_transfer` delegates from here; a tool sees this through
+            // the HTTP parts rmcp hands it.
+            request.extensions_mut().insert(oauth.clone());
             next.run(request).await
         }
         None => unauthorized(&request),

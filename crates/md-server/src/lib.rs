@@ -16,6 +16,7 @@ pub mod tools_organize;
 pub mod tools_read;
 pub mod tools_search;
 pub mod tools_sync;
+pub mod tools_transfer;
 pub mod tools_write;
 
 use std::sync::Arc;
@@ -120,6 +121,15 @@ impl MdServer {
     #[must_use]
     pub fn with_sync_interval(self, every: std::time::Duration) -> Self {
         tokio::spawn(sync::interval_sync_task(self.clone(), every));
+        self
+    }
+
+    /// Expose `provision_transfer`. It delegates from the caller's own bearer,
+    /// so it is advertised only where there is one: over stdio, or on an
+    /// unguarded loopback server, it could never do anything but fail.
+    #[must_use]
+    pub fn with_transfer(mut self) -> Self {
+        self.tool_router = self.tool_router.clone() + Self::transfer_router();
         self
     }
 
@@ -306,7 +316,10 @@ impl ServerHandler for MdServer {
              Address notes by vault-relative path. Notes over ~10 KB (size_bytes in \
              list_notes) are cheaper section-wise: read_outlines first, then \
              read_sections for the sections you need; read smaller notes whole via \
-             read_notes. Destructive batches are all-or-nothing."
+             read_notes. Destructive batches are all-or-nothing. To move many \
+             notes at once, or to process notes with scripts instead of pulling \
+             their content into context, call provision_transfer rather than \
+             reading and writing them one at a time."
         )
         .to_string();
         if let Some(intro) = &self.intro_note {
@@ -380,6 +393,8 @@ mod tests {
             "read_outlines",
             "read_sections",
         ];
+        // provision_transfer adds to the token store rather than the vault, but
+        // the classification is the same shape: it creates, and destroys nothing.
         let additive = ["create_notes", "append_notes"];
         let destructive = [
             "edit_sections",

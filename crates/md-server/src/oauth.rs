@@ -290,6 +290,26 @@ impl OAuthState {
         Some(self.issue_tokens(client_id))
     }
 
+    /// Mint a standalone access token holding no more than `scopes`, valid for
+    /// `ttl_secs`. It has no refresh token: a credential handed to a sandbox is
+    /// meant to lapse, not to renew itself.
+    pub fn mint(&self, scopes: Scopes, ttl_secs: u64) -> String {
+        let token = random_token();
+        {
+            let mut store = self.store.lock().unwrap();
+            store.access.insert(
+                token.clone(),
+                TokenRec {
+                    expires_at: now_secs() + ttl_secs,
+                    scopes,
+                    client_id: None,
+                },
+            );
+        }
+        self.persist();
+        token
+    }
+
     fn issue_tokens(&self, client_id: Option<String>) -> TokenResponse {
         let access = random_token();
         let refresh = random_token();
@@ -786,6 +806,35 @@ mod tests {
             "a record written before scopes existed must not lose authority on upgrade: \
              every connected session would 401 at once"
         );
+    }
+
+    #[test]
+    fn a_minted_token_carries_only_the_authority_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
+        let reduced = Scopes {
+            read: true,
+            write: false,
+        };
+
+        let token = oauth.mint(reduced, 600);
+
+        assert_ne!(token, "static-token", "a child must not be its parent");
+        assert_eq!(
+            oauth.validate_bearer(&token),
+            Some(reduced),
+            "a token handed to a sandbox has to be weaker than the one that minted it"
+        );
+    }
+
+    #[test]
+    fn a_minted_token_lapses() {
+        let dir = tempfile::tempdir().unwrap();
+        let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
+
+        let token = oauth.mint(Scopes::full(), 0);
+
+        assert_eq!(oauth.validate_bearer(&token), None);
     }
 
     #[test]
