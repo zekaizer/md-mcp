@@ -50,8 +50,12 @@ rather than an envelope:
 - `PUT /api/notes/{path}` — one note, request body verbatim.
 - `POST /api/notes` — a tar stream, for writing many notes in one round trip.
 
-We will carry [ADR-0005](0005-content-hash.md)'s `content_hash` as the HTTP
-`ETag`, honouring `If-None-Match` on reads (304). A write that creates a note
+We will compute the HTTP `ETag` with [ADR-0005](0005-content-hash.md)'s hash
+function over the exact bytes an endpoint serves, honouring `If-None-Match` on
+reads (304). It is deliberately *not* that ADR's `content_hash`, which spans a
+section's body and is LF-normalized: an entity tag has to change whenever the
+served bytes change, frontmatter and line endings included, or a conditional
+write would accept a replacement built from a stale copy. A write that creates a note
 needs no condition; a write that would replace one requires an explicit
 `If-Match` — the hash the caller read, or `*` to overwrite knowingly — and answers
 412 otherwise. Concurrent editing from a conversation is the normal case here, so
