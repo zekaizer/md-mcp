@@ -57,8 +57,11 @@ section's body and is LF-normalized: an entity tag has to change whenever the
 served bytes change, frontmatter and line endings included, or a conditional
 write would accept a replacement built from a stale copy. A write that creates a note
 needs no condition; a write that would replace one requires an explicit
-`If-Match` — the hash the caller read, or `*` to overwrite knowingly — and answers
-412 otherwise. Concurrent editing from a conversation is the normal case here, so
+`If-Match` — the hash the caller read, or `*` to overwrite knowingly — answering
+428 when no condition was given and 412 when the one given does not hold. Those
+are different mistakes with different repairs — attach a condition, versus
+re-read and retry — and a caller that cannot tell them apart spends a round trip
+finding out. Concurrent editing from a conversation is the normal case here, so
 replacing a note is never the silent default, while the common push of new notes
 stays a single unconditional request. A caller that just read a note already holds
 its hash, so the guard costs it no extra round trip.
