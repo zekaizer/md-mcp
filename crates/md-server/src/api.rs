@@ -4,8 +4,10 @@
 //! move a vault around without any of it crossing a model's context. MCP stays
 //! the surface a model reads and writes through.
 
+use std::io::Read as _;
+
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -26,10 +28,24 @@ const MARKDOWN: &str = "text/markdown; charset=utf-8";
 /// costs one line rather than the whole listing.
 const NDJSON: &str = "application/x-ndjson";
 
+/// `tar` the command exists on every client, so a bulk transfer is a pipe on
+/// both ends rather than anything a caller has to build.
+const TAR: &str = "application/x-tar";
+
+/// A pushed tar is buffered whole to be parsed, so it is capped well above a
+/// vault of notes and well below memory pressure. The default 2 MiB limit that
+/// guards every other route would refuse an ordinary bulk import.
+const MAX_TAR_BYTES: usize = 32 * 1024 * 1024;
+
 /// `/api/notes/...`, mounted beside `/mcp` and behind the same bearer guard.
 pub(crate) fn routes(server: MdServer) -> Router {
     Router::new()
-        .route("/api/notes", get(get_collection))
+        .route(
+            "/api/notes",
+            get(get_collection)
+                .post(post_collection)
+                .layer(DefaultBodyLimit::max(MAX_TAR_BYTES)),
+        )
         .route("/api/notes/{*path}", get(get_note).put(put_note))
         .with_state(server)
 }
@@ -65,6 +81,186 @@ async fn get_note(
         .into_response()
 }
 
+/// Where a pushed tar lands, and whether it may replace what is there.
+#[derive(serde::Deserialize)]
+struct PushQuery {
+    #[serde(default)]
+    to: Option<String>,
+    /// Off by default: a bulk push cannot express a per-note precondition, so
+    /// replacing has to be said out loud the way `If-Match: *` says it.
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// Write every note in a tar, reporting one line per entry.
+///
+/// Unlike an MCP batch (ADR-0007) this is not all-or-nothing: a bulk push is
+/// re-runnable, and one rejected note should not undo the rest.
+async fn post_collection(
+    State(server): State<MdServer>,
+    scopes: Option<Extension<Scopes>>,
+    Query(query): Query<PushQuery>,
+    body: Bytes,
+) -> Response {
+    if !authority(scopes).write {
+        return forbidden("notes:write");
+    }
+
+    let _guard = server.lock().write().await;
+    let mut archive = tar::Archive::new(body.as_ref());
+    let entries = match archive.entries() {
+        Ok(entries) => entries,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("not a tar stream: {error}\n"),
+            )
+                .into_response();
+        }
+    };
+
+    let mut report = String::new();
+    let mut ops = Vec::new();
+    for entry in entries {
+        let mut entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                report.push_str(&line(serde_json::json!({ "error": error.to_string() })));
+                continue;
+            }
+        };
+        // Directories are structure, not content. Anything else that is not a
+        // regular file — a link, a device node — has no meaning in a vault and
+        // is refused rather than followed.
+        let kind = entry.header().entry_type();
+        if kind.is_dir() {
+            continue;
+        }
+        if !kind.is_file() {
+            report.push_str(&line(serde_json::json!({ "error": "not a regular file" })));
+            continue;
+        }
+
+        let Ok(name) = entry.path().map(|p| p.to_string_lossy().into_owned()) else {
+            report.push_str(&line(
+                serde_json::json!({ "error": "unreadable entry path" }),
+            ));
+            continue;
+        };
+        // `tar -C dir -cf - .` names every entry `./…`.
+        let path = prefixed(query.to.as_deref(), name.trim_start_matches("./"));
+
+        let mut bytes = Vec::new();
+        if let Err(error) = entry.read_to_end(&mut bytes) {
+            report.push_str(&line(
+                serde_json::json!({ "path": path, "error": error.to_string() }),
+            ));
+            continue;
+        }
+        if bytes.len() > MAX_WRITE_BYTES {
+            report.push_str(&line(serde_json::json!({
+                "path": path,
+                "error": format!("note is {} bytes, over the {MAX_WRITE_BYTES} limit", bytes.len()),
+            })));
+            continue;
+        }
+
+        let existed = server.vault().exists(&path).unwrap_or(false);
+        if existed && !query.overwrite {
+            report.push_str(&line(serde_json::json!({
+                "path": path,
+                "error": "note exists; pass overwrite=true to replace it",
+            })));
+            continue;
+        }
+        // Containment is the vault jail's job (ADR-0006): a `..` or an absolute
+        // name in the tar is rejected there, not by string inspection here.
+        match server.vault().create_note(&path, &bytes, true) {
+            Ok(()) => {
+                ops.push(if existed {
+                    EventOp::Write { path: path.clone() }
+                } else {
+                    EventOp::Create { path: path.clone() }
+                });
+                report.push_str(&line(serde_json::json!({
+                    "path": path,
+                    "written": true,
+                    "replaced": existed,
+                })));
+            }
+            Err(error) => report.push_str(&line(
+                serde_json::json!({ "path": path, "error": error.message }),
+            )),
+        }
+    }
+
+    server.emit_event("post_notes", None, &ops);
+    server
+        .auto_commit(
+            "post_notes",
+            &ops,
+            &serde_json::json!({ "to": query.to, "overwrite": query.overwrite }),
+        )
+        .await;
+    ([(header::CONTENT_TYPE, NDJSON.to_string())], report).into_response()
+}
+
+/// Join a pushed entry's name onto the destination prefix.
+fn prefixed(to: Option<&str>, name: &str) -> String {
+    let joined = match to {
+        Some(to) if !to.trim_matches('/').is_empty() => {
+            format!("{}/{name}", to.trim_matches('/'))
+        }
+        _ => name.to_string(),
+    };
+    nfc(&joined).into_owned()
+}
+
+fn line(value: serde_json::Value) -> String {
+    format!("{value}\n")
+}
+
+/// A subtree as one tar, so a whole vault crosses the wire in one round trip.
+async fn tar_of_subtree(server: &MdServer, prefix: Option<&str>) -> Response {
+    let _guard = server.lock().read().await;
+    let entries = match server
+        .vault()
+        .list_entries(prefix.unwrap_or(""), true, None, false)
+    {
+        Ok(entries) => entries,
+        Err(error) => return core_error(&error),
+    };
+
+    let mut builder = tar::Builder::new(Vec::new());
+    for entry in entries {
+        // A transfer that silently drops a note it could not read would read as
+        // a deletion on the far side, so one failure fails the export.
+        let note = match server.vault().read_note(&entry.path) {
+            Ok(note) => note,
+            Err(error) => return export_failed(&entry.path, &error.message),
+        };
+        let mut header = tar::Header::new_gnu();
+        header.set_size(note.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        if let Err(error) = builder.append_data(&mut header, &entry.path, note.as_bytes()) {
+            return export_failed(&entry.path, &error.to_string());
+        }
+    }
+    match builder.into_inner() {
+        Ok(bytes) => ([(header::CONTENT_TYPE, TAR.to_string())], bytes).into_response(),
+        Err(error) => export_failed("", &error.to_string()),
+    }
+}
+
+fn export_failed(path: &str, why: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("export aborted at {path:?}: {why}\n"),
+    )
+        .into_response()
+}
+
 /// What the collection endpoint should answer with, and over what subtree.
 #[derive(serde::Deserialize)]
 struct CollectionQuery {
@@ -84,12 +280,10 @@ async fn get_collection(
     }
     match query.format.as_deref() {
         Some("index") => index(&server, query.prefix.as_deref()).await,
-        other => (
+        None | Some("tar") => tar_of_subtree(&server, query.prefix.as_deref()).await,
+        Some(other) => (
             StatusCode::BAD_REQUEST,
-            format!(
-                "unsupported format {:?}; use format=index\n",
-                other.unwrap_or("")
-            ),
+            format!("unsupported format {other:?}; use tar or index\n"),
         )
             .into_response(),
     }

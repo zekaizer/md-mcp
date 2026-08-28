@@ -334,3 +334,147 @@ async fn an_unsupported_collection_format_is_refused() {
         .unwrap();
     assert_eq!(response.status(), 400);
 }
+
+/// Build a tar holding `(path, body)` pairs, as `tar -cf -` would.
+fn tar_of(files: &[(&str, &str)]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (path, body) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, body.as_bytes())
+            .unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+/// Every regular file in a tar, as `(path, body)`.
+fn untar(bytes: &[u8]) -> Vec<(String, String)> {
+    let mut archive = tar::Archive::new(bytes);
+    archive
+        .entries()
+        .unwrap()
+        .map(|entry| {
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut body = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut body).unwrap();
+            (path, body)
+        })
+        .collect()
+}
+
+async fn post_tar(addr: SocketAddr, query: &str, body: Vec<u8>) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{addr}/api/notes?{query}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_subtree_is_served_as_one_tar() {
+    let addr = spawn_with_tree().await;
+    let response = reqwest::get(format!("http://{addr}/api/notes?prefix=inbox"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/x-tar",
+        "a client pipes this straight into `tar -xf -`"
+    );
+    let files = untar(&response.bytes().await.unwrap());
+    assert_eq!(
+        files,
+        vec![
+            ("inbox/one.md".to_string(), "# One\n".to_string()),
+            ("inbox/two.md".to_string(), "# Two\n".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_posted_tar_creates_every_note_in_one_round_trip() {
+    let addr = spawn(None).await;
+    let body = tar_of(&[("a.md", "# A\n"), ("b.md", "# B\n")]);
+
+    let response = post_tar(addr, "to=imported", body).await;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(read_back(addr, "imported/a.md").await, "# A\n");
+    assert_eq!(read_back(addr, "imported/b.md").await, "# B\n");
+}
+
+#[tokio::test]
+async fn a_posted_tar_does_not_clobber_by_default() {
+    let addr = spawn(None).await;
+    let body = tar_of(&[("hello.md", "clobbered\n")]);
+
+    let response = post_tar(addr, "", body).await;
+
+    assert_eq!(response.status(), 200);
+    let report = response.text().await.unwrap();
+    assert!(
+        report.contains("hello.md") && report.contains("error"),
+        "the untouched note has to be reported, not silently skipped: {report}"
+    );
+    assert_eq!(read_back(addr, "hello.md").await, NOTE);
+}
+
+#[tokio::test]
+async fn a_posted_tar_replaces_when_told_to() {
+    let addr = spawn(None).await;
+    let body = tar_of(&[("hello.md", "# Deliberate\n")]);
+
+    let response = post_tar(addr, "overwrite=true", body).await;
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(read_back(addr, "hello.md").await, "# Deliberate\n");
+}
+
+/// A tar whose entry names bypass `Builder`'s own refusal to write `..`, so the
+/// server is tested against what a hostile client can actually send rather than
+/// against what the writing library permits.
+fn hostile_tar(files: &[(&str, &str)]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, body) in files {
+        let mut header = tar::Header::new_old();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        let raw = header.as_old_mut();
+        raw.name[..name.len()].copy_from_slice(name.as_bytes());
+        header.set_cksum();
+        builder.append(&header, body.as_bytes()).unwrap();
+    }
+    builder.into_inner().unwrap()
+}
+
+#[tokio::test]
+async fn a_posted_tar_cannot_escape_the_vault() {
+    let (addr, root) = spawn_with_root(None).await;
+    let body = hostile_tar(&[("../escaped.md", "# Nope\n"), ("ok.md", "# Ok\n")]);
+
+    let response = post_tar(addr, "", body).await;
+
+    assert_eq!(response.status(), 200);
+    let report = response.text().await.unwrap();
+    assert!(
+        report.contains("error"),
+        "a traversing entry must be refused: {report}"
+    );
+    assert!(
+        !root.parent().unwrap().join("escaped.md").exists(),
+        "a tar entry wrote outside the vault root"
+    );
+    assert_eq!(
+        read_back(addr, "ok.md").await,
+        "# Ok\n",
+        "one refused entry must not abandon the rest of the push"
+    );
+}

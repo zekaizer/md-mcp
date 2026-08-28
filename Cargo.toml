@@ -51,6 +51,11 @@ cap-tempfile = "4"
 # Glob filter for list_notes
 globset = "0.4"
 
+# Bulk note transfer as a tar stream (ADR-0028). `tar` the command exists on
+# every client, which is why the format was chosen; parsing one by hand is not
+# — path escapes, links and PAX extensions are where the bugs live.
+tar = "0.4"
+
 # Search: linear scan with a multi-keyword automaton (ADR-0010)
 aho-corasick = "1"
 memchr = "2"
