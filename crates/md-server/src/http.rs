@@ -389,7 +389,7 @@ async fn require_bearer(
         .and_then(parse_bearer)
         .map(str::to_owned);
     match token {
-        Some(token) if oauth.validate_bearer(&token) => next.run(request).await,
+        Some(token) if oauth.validate_bearer(&token).is_some() => next.run(request).await,
         _ => unauthorized(&request),
     }
 }

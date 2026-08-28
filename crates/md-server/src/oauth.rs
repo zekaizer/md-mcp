@@ -70,11 +70,36 @@ impl Default for Persisted {
     }
 }
 
-/// An issued token: its expiry and the client it was issued to.
+/// What a credential is allowed to do. A token may hold less than the authority
+/// that issued it, never more.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scopes {
+    #[serde(default)]
+    pub read: bool,
+    #[serde(default)]
+    pub write: bool,
+}
+
+impl Scopes {
+    /// Everything the static token can do.
+    pub fn full() -> Self {
+        Self {
+            read: true,
+            write: true,
+        }
+    }
+}
+
+/// An issued token: its expiry, its authority, and the client it was issued to.
 #[derive(Clone, Serialize, Deserialize)]
 struct TokenRec {
     /// Unix-seconds expiry.
     expires_at: u64,
+    /// Absent on disk means the record predates scopes, when every issued token
+    /// held the static token's full authority. Reading it as "no authority"
+    /// would 401 every live session the moment this version is deployed.
+    #[serde(default = "Scopes::full")]
+    scopes: Scopes,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_id: Option<String>,
 }
@@ -132,16 +157,17 @@ impl OAuthState {
         &self.static_token
     }
 
-    /// True if `token` is the static token or a live issued access token.
-    pub fn validate_bearer(&self, token: &str) -> bool {
+    /// The authority behind `token`, or `None` when it is not a live credential.
+    pub fn validate_bearer(&self, token: &str) -> Option<Scopes> {
         if token_matches(token, &self.static_token) {
-            return true;
+            return Some(Scopes::full());
         }
         let store = self.store.lock().unwrap();
         store
             .access
             .get(token)
-            .is_some_and(|rec| rec.expires_at > now_secs())
+            .filter(|rec| rec.expires_at > now_secs())
+            .map(|rec| rec.scopes)
     }
 
     /// Atomically persist the store (owner-only, temp + rename, creating the state dir).
@@ -274,6 +300,7 @@ impl OAuthState {
                 access.clone(),
                 TokenRec {
                     expires_at: now + ACCESS_TTL_SECS,
+                    scopes: Scopes::full(),
                     client_id: client_id.clone(),
                 },
             );
@@ -281,6 +308,7 @@ impl OAuthState {
                 refresh.clone(),
                 TokenRec {
                     expires_at: now + REFRESH_TTL_SECS,
+                    scopes: Scopes::full(),
                     client_id,
                 },
             );
@@ -732,6 +760,81 @@ fn authorize_form(q: &AuthorizeQuery, error: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A state file as the server wrote it before scopes existed.
+    fn write_legacy_state(path: &std::path::Path, token: &str, expires_at: u64) {
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"v":1,"clients":{{}},"access":{{"{token}":{{"expires_at":{expires_at}}}}},"refresh":{{}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_stored_token_without_scopes_keeps_full_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("oauth-state.json");
+        write_legacy_state(&file, "live-token", now_secs() + 3600);
+
+        let oauth = OAuthState::load("static-token".to_string(), file);
+
+        assert_eq!(
+            oauth.validate_bearer("live-token"),
+            Some(Scopes::full()),
+            "a record written before scopes existed must not lose authority on upgrade: \
+             every connected session would 401 at once"
+        );
+    }
+
+    #[test]
+    fn the_static_token_holds_full_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
+        assert_eq!(oauth.validate_bearer("static-token"), Some(Scopes::full()));
+    }
+
+    #[test]
+    fn an_unknown_or_expired_token_holds_no_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("oauth-state.json");
+        write_legacy_state(&file, "stale-token", now_secs() - 1);
+
+        let oauth = OAuthState::load("static-token".to_string(), file);
+
+        assert_eq!(oauth.validate_bearer("never-issued"), None);
+        assert_eq!(oauth.validate_bearer("stale-token"), None);
+    }
+
+    #[test]
+    fn a_reduced_scope_survives_a_persist_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("oauth-state.json");
+        let reduced = Scopes {
+            read: false,
+            write: true,
+        };
+
+        let oauth = OAuthState::load("static-token".to_string(), file.clone());
+        oauth.store.lock().unwrap().access.insert(
+            "child-token".to_string(),
+            TokenRec {
+                expires_at: now_secs() + 3600,
+                scopes: reduced,
+                client_id: None,
+            },
+        );
+        oauth.persist();
+        drop(oauth);
+
+        let reloaded = OAuthState::load("static-token".to_string(), file);
+        assert_eq!(
+            reloaded.validate_bearer("child-token"),
+            Some(reduced),
+            "a token minted weaker than its parent must not widen across a restart"
+        );
+    }
 
     #[test]
     fn pkce_s256_roundtrip() {
