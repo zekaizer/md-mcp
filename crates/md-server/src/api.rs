@@ -5,7 +5,7 @@
 //! the surface a model reads and writes through.
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -22,9 +22,14 @@ use crate::oauth::Scopes;
 /// a client does not have to guess at non-ASCII note bodies.
 const MARKDOWN: &str = "text/markdown; charset=utf-8";
 
+/// One JSON object per line: a client can stream it, and one unreadable note
+/// costs one line rather than the whole listing.
+const NDJSON: &str = "application/x-ndjson";
+
 /// `/api/notes/...`, mounted beside `/mcp` and behind the same bearer guard.
 pub(crate) fn routes(server: MdServer) -> Router {
     Router::new()
+        .route("/api/notes", get(get_collection))
         .route("/api/notes/{*path}", get(get_note).put(put_note))
         .with_state(server)
 }
@@ -58,6 +63,70 @@ async fn get_note(
         note,
     )
         .into_response()
+}
+
+/// What the collection endpoint should answer with, and over what subtree.
+#[derive(serde::Deserialize)]
+struct CollectionQuery {
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default)]
+    format: Option<String>,
+}
+
+async fn get_collection(
+    State(server): State<MdServer>,
+    scopes: Option<Extension<Scopes>>,
+    Query(query): Query<CollectionQuery>,
+) -> Response {
+    if !authority(scopes).read {
+        return forbidden("notes:read");
+    }
+    match query.format.as_deref() {
+        Some("index") => index(&server, query.prefix.as_deref()).await,
+        other => (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unsupported format {:?}; use format=index\n",
+                other.unwrap_or("")
+            ),
+        )
+            .into_response(),
+    }
+}
+
+/// Every note's path, entity tag and size, without its content — so a caller
+/// can work out what changed and fetch only that. The tags are the same values
+/// the note endpoint serves, and so can be replayed as `If-Match`.
+async fn index(server: &MdServer, prefix: Option<&str>) -> Response {
+    let _guard = server.lock().read().await;
+    let entries = match server
+        .vault()
+        .list_entries(prefix.unwrap_or(""), true, None, false)
+    {
+        Ok(entries) => entries,
+        Err(error) => return core_error(&error),
+    };
+
+    let mut body = String::new();
+    for entry in entries {
+        // A note that cannot be read costs its own line, never the listing: a
+        // silently dropped path reads to a syncing client as a deletion.
+        let line = match server.vault().read_note(&entry.path) {
+            Ok(note) => serde_json::json!({
+                "path": entry.path,
+                "etag": entity_tag(note.as_bytes()),
+                "size": note.len(),
+            }),
+            Err(error) => serde_json::json!({
+                "path": entry.path,
+                "error": error.message,
+            }),
+        };
+        body.push_str(&line.to_string());
+        body.push('\n');
+    }
+    ([(header::CONTENT_TYPE, NDJSON.to_string())], body).into_response()
 }
 
 /// Replace or create one note from the request body, verbatim.

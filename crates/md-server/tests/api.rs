@@ -253,3 +253,84 @@ async fn a_decomposed_name_is_stored_composed() {
          leaves the vault holding two spellings of one note. got: {names:?}"
     );
 }
+
+/// Seed a second note so a prefix has something to exclude.
+async fn spawn_with_tree() -> SocketAddr {
+    let addr = spawn(None).await;
+    assert_eq!(
+        put(addr, "inbox/one.md", "# One\n", None).await.status(),
+        201
+    );
+    assert_eq!(
+        put(addr, "inbox/two.md", "# Two\n", None).await.status(),
+        201
+    );
+    addr
+}
+
+async fn index_lines(addr: SocketAddr, query: &str) -> Vec<serde_json::Value> {
+    let body = reqwest::get(format!("http://{addr}/api/notes?{query}"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    body.lines()
+        .map(|line| serde_json::from_str(line).expect("each line is one JSON object"))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_index_names_every_note_with_its_tag_and_size() {
+    let addr = spawn_with_tree().await;
+    let entries = index_lines(addr, "format=index").await;
+
+    let paths: Vec<&str> = entries
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["hello.md", "inbox/one.md", "inbox/two.md"]);
+
+    let one = entries
+        .iter()
+        .find(|e| e["path"] == "inbox/one.md")
+        .unwrap();
+    assert_eq!(one["size"].as_u64().unwrap(), "# One\n".len() as u64);
+    assert!(one["etag"].as_str().unwrap().starts_with('"'));
+}
+
+#[tokio::test]
+async fn a_prefix_narrows_the_index() {
+    let addr = spawn_with_tree().await;
+    let paths: Vec<String> = index_lines(addr, "format=index&prefix=inbox")
+        .await
+        .iter()
+        .map(|e| e["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(paths, ["inbox/one.md", "inbox/two.md"]);
+}
+
+#[tokio::test]
+async fn an_indexed_tag_is_the_one_the_note_endpoint_serves() {
+    let addr = spawn_with_tree().await;
+    let entries = index_lines(addr, "format=index").await;
+    let indexed = entries.iter().find(|e| e["path"] == "hello.md").unwrap()["etag"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert_eq!(
+        indexed,
+        current_tag(addr, "hello.md").await,
+        "an index whose tags cannot be replayed as If-Match is useless for sync"
+    );
+}
+
+#[tokio::test]
+async fn an_unsupported_collection_format_is_refused() {
+    let addr = spawn(None).await;
+    let response = reqwest::get(format!("http://{addr}/api/notes?format=zip"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+}
