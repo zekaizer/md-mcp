@@ -91,6 +91,16 @@ dead text. The commands collect the token into a file and read it back from
 there, so it reaches no command line, shell history, or process listing either.
 Tickets are single-use and lapse in a couple of minutes.
 
+A transfer token lapses quickly when idle and renews by presenting itself while
+it still works, so a long job does not die halfway and a forgotten token stops
+mattering within minutes. Renewal carries no second credential to protect —
+holding a working token is the proof — and cannot resurrect a lapsed one, so the
+idle window bounds something real. Every chain also stops at a ceiling counted
+from its first token: a sliding window without one is a permanent credential in
+disguise. A token issued through the ordinary authorization flow is refused
+here; it renews through its refresh token, and admitting it would launder it
+into an endless chain.
+
 The tool's authority is the caller's: a request that passed the bearer guard is
 the consent, so no second human approval is required. One line
 in the server `instructions` names the situation that should trigger it, and a 401
