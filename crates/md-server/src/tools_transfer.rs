@@ -17,8 +17,8 @@ use md_core::text::nfc;
 
 use crate::MdServer;
 use crate::oauth::{
-    self, OAuthState, Scopes, TRANSFER_CODE_TTL_SECS, TRANSFER_MAX_LIFETIME_SECS,
-    TRANSFER_TOKEN_TTL_SECS, percent_encode, percent_encode_path,
+    self, OAuthState, Scopes, TRANSFER_CODE_TTL_SECS, TRANSFER_TOKEN_TTL_SECS, percent_encode,
+    percent_encode_path,
 };
 
 /// What the examples are written around, in values this vault actually holds.
@@ -77,16 +77,14 @@ pub struct ProvisionTransferResponse {
     pub base: String,
     /// Where to trade the ticket for the token.
     pub redeem: String,
-    /// Where to trade a live token for a fresh one, before it lapses.
-    pub renew: String,
     /// A one-time ticket, not a credential: it is spent by the first redemption
     /// and is worthless afterwards, so what it leaves in this conversation is
     /// dead text.
     pub code: String,
     pub code_expires_in_seconds: u64,
+    /// The whole grant: a transfer token is not renewable. If a job outlives
+    /// it, call this tool again for a fresh ticket.
     pub token_expires_in_seconds: u64,
-    /// A renewal chain cannot pass this, counted from the first token.
-    pub token_max_lifetime_seconds: u64,
     /// Where the recipe leaves the collected token.
     pub token_file: String,
     pub scopes: Vec<String>,
@@ -134,17 +132,14 @@ impl MdServer {
         let root = oauth::base_url(&parts.headers);
         let base = format!("{root}/api/notes");
         let redeem = format!("{root}/transfer/redeem");
-        let renew = format!("{root}/transfer/renew");
 
         Ok(Json(ProvisionTransferResponse {
-            recipe: recipe(&base, &redeem, &renew, &code, req.write, &example),
+            recipe: recipe(&base, &redeem, &code, req.write, &example),
             base,
             redeem,
-            renew,
             code,
             code_expires_in_seconds: TRANSFER_CODE_TTL_SECS,
             token_expires_in_seconds: TRANSFER_TOKEN_TTL_SECS,
-            token_max_lifetime_seconds: TRANSFER_MAX_LIFETIME_SECS,
             token_file: token_file(req.write).to_string(),
             scopes: scope_names(&scopes),
         }))
@@ -214,7 +209,6 @@ fn scope_names(scopes: &Scopes) -> Vec<String> {
 fn recipe(
     base: &str,
     redeem: &str,
-    renew: &str,
     code: &str,
     write: bool,
     example: &Example,
@@ -285,9 +279,6 @@ fn recipe(
             ));
         }
     }
-    recipe.push(format!(
-        "# renew before it lapses; into a temp file first because curl -o truncates before it writes. The old token keeps working for a minute, so a lost replacement can be asked for again\ncurl -sSf -X POST {auth} \"{renew}\" -o {token_file}.new && mv {token_file}.new {token_file}"
-    ));
     recipe
 }
 
@@ -318,7 +309,6 @@ mod tests {
         recipe(
             "https://host/api/notes",
             "https://host/transfer/redeem",
-            "https://host/transfer/renew",
             "TICKET",
             write,
             example,

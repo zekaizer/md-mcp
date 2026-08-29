@@ -26,7 +26,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::http::{parse_bearer, token_matches};
+use crate::http::token_matches;
 
 /// Access-token lifetime: short; the connector refreshes silently.
 const ACCESS_TTL_SECS: u64 = 60 * 60;
@@ -39,19 +39,11 @@ const CODE_TTL_SECS: u64 = 5 * 60;
 /// Long enough, though, that a person reading the answer before running it is
 /// not racing a clock.
 pub(crate) const TRANSFER_CODE_TTL_SECS: u64 = 300;
-/// How long a transfer token stays usable without being renewed. Short enough
-/// that one forgotten in a sandbox stops mattering, long enough to survive the
-/// local work between fetching a vault and pushing it back — renewal needs a
-/// live token, so a lapse mid-script cannot be repaired from the script.
+/// How long a transfer token stays usable. There is no renewal: a fresh grant
+/// is one tool call away, so the TTL alone bounds a forgotten credential.
+/// Short enough that one left in a sandbox stops mattering, long enough to
+/// survive the local work between fetching notes and pushing them back.
 pub(crate) const TRANSFER_TOKEN_TTL_SECS: u64 = 30 * 60;
-/// The ceiling a renewal chain cannot pass, counted from the first token. A
-/// sliding window with no ceiling is a permanent credential wearing a disguise.
-pub(crate) const TRANSFER_MAX_LIFETIME_SECS: u64 = 60 * 60;
-/// How long a renewed token's predecessor keeps working. Revoking it outright
-/// makes losing the replacement — an interrupted script, a failed move, a
-/// second shell — cost the whole remaining lifetime; keeping it forever would
-/// make renewal multiply credentials. It gets just enough to try again.
-const TRANSFER_RENEWAL_GRACE_SECS: u64 = 60;
 
 /// State schema version. Bump on a breaking change; an unreadable/old file starts empty,
 /// which forces a one-time re-auth.
@@ -144,11 +136,6 @@ impl Scopes {
 struct TokenRec {
     /// Unix-seconds expiry.
     expires_at: u64,
-    /// The ceiling a renewal chain cannot pass. Only transfer tokens carry one,
-    /// which is also what makes them renewable: an ordinary access token has a
-    /// refresh token instead and must not be laundered into an endless chain.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    not_after: Option<u64>,
     /// Absent on disk means the record predates scopes, when every issued token
     /// held the static token's full authority. Reading it as "no authority"
     /// would 401 every live session the moment this version is deployed.
@@ -380,44 +367,13 @@ impl OAuthState {
         if rec.expires_at <= now_secs() {
             return None;
         }
-        Some(self.mint(
-            rec.scopes,
-            TRANSFER_TOKEN_TTL_SECS,
-            Some(now_secs() + TRANSFER_MAX_LIFETIME_SECS),
-        ))
-    }
-
-    /// Trade a live transfer token for a fresh one. Renewal needs no second
-    /// credential to protect: holding a working token is the proof. A lapsed
-    /// one cannot be resurrected, so the idle window is a real bound, and the
-    /// chain still dies at its ceiling.
-    ///
-    /// The predecessor is cut back to a grace window rather than revoked, so a
-    /// caller that loses the replacement can ask again instead of losing the
-    /// rest of its lifetime.
-    pub fn renew_transfer(&self, token: &str) -> Option<String> {
-        let now = now_secs();
-        let (scopes, not_after) = {
-            let mut store = self.store.lock().unwrap();
-            let rec = store.access.get(token).cloned()?;
-            // No ceiling means this is not a transfer token; leave it alone.
-            let not_after = rec.not_after?;
-            if rec.expires_at <= now || not_after <= now {
-                return None;
-            }
-            if let Some(previous) = store.access.get_mut(token) {
-                previous.expires_at = previous.expires_at.min(now + TRANSFER_RENEWAL_GRACE_SECS);
-            }
-            (rec.scopes, not_after)
-        };
-        // `mint` persists, so the revocation lands with the replacement.
-        Some(self.mint(scopes, TRANSFER_TOKEN_TTL_SECS, Some(not_after)))
+        Some(self.mint(rec.scopes, TRANSFER_TOKEN_TTL_SECS))
     }
 
     /// Mint a standalone access token holding no more than `scopes`, valid for
     /// `ttl_secs`. It has no refresh token: a credential handed to a sandbox is
     /// meant to lapse, not to renew itself.
-    pub fn mint(&self, scopes: Scopes, ttl_secs: u64, not_after: Option<u64>) -> String {
+    pub fn mint(&self, scopes: Scopes, ttl_secs: u64) -> String {
         let token = random_token();
         // Minting is how a delegated credential comes into being; the flag is
         // set here so no caller can forget to.
@@ -426,14 +382,13 @@ impl OAuthState {
             ..scopes
         };
         {
-            let expires_at = (now_secs() + ttl_secs).min(not_after.unwrap_or(u64::MAX));
+            let expires_at = now_secs() + ttl_secs;
             let mut store = self.store.lock().unwrap();
             store.access.insert(
                 token.clone(),
                 TokenRec {
                     expires_at,
                     scopes,
-                    not_after,
                     client_id: None,
                 },
             );
@@ -453,7 +408,6 @@ impl OAuthState {
                 TokenRec {
                     expires_at: now + ACCESS_TTL_SECS,
                     scopes: Scopes::full(),
-                    not_after: None,
                     client_id: client_id.clone(),
                 },
             );
@@ -462,7 +416,6 @@ impl OAuthState {
                 TokenRec {
                     expires_at: now + REFRESH_TTL_SECS,
                     scopes: Scopes::full(),
-                    not_after: None,
                     client_id,
                 },
             );
@@ -496,7 +449,6 @@ pub fn routes(state: Arc<OAuthState>) -> Router {
         .route("/authorize", get(authorize_get).post(authorize_post))
         .route("/token", post(token))
         .route("/transfer/redeem", post(redeem))
-        .route("/transfer/renew", post(renew))
         .with_state(state)
 }
 
@@ -724,37 +676,6 @@ async fn redeem(State(oauth): State<Arc<OAuthState>>, Form(req): Form<RedeemRequ
             (
                 StatusCode::BAD_REQUEST,
                 "this ticket is spent or lapsed; call provision_transfer again for a fresh one\n",
-            )
-                .into_response()
-        }
-    }
-}
-
-/// Trade a live transfer token for a fresh one.
-///
-/// Holding a working token is the proof, so there is no second credential to
-/// protect. Guarded by nothing but the token itself: an ordinary access token
-/// is refused here and renews through its refresh token instead.
-async fn renew(State(oauth): State<Arc<OAuthState>>, headers: HeaderMap) -> Response {
-    let renewed = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_bearer)
-        .and_then(|token| oauth.renew_transfer(token));
-
-    match renewed {
-        Some(token) => (
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            format!("{token}\n"),
-        )
-            .into_response(),
-        None => {
-            tracing::warn!(
-                "transfer: renewal refused (lapsed, past its ceiling, or not a transfer token)"
-            );
-            (
-                StatusCode::UNAUTHORIZED,
-                "this token has lapsed or reached its ceiling; call provision_transfer for a fresh grant\n",
             )
                 .into_response()
         }
@@ -1030,7 +951,7 @@ mod tests {
             prefix: None,
         };
 
-        let token = oauth.mint(reduced.clone(), 600, None);
+        let token = oauth.mint(reduced.clone(), 600);
 
         assert_ne!(token, "static-token", "a child must not be its parent");
         assert_eq!(
@@ -1049,7 +970,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
 
-        let token = oauth.mint(Scopes::full(), 0, None);
+        let token = oauth.mint(Scopes::full(), 0);
 
         assert_eq!(oauth.validate_bearer(&token), None);
     }
@@ -1133,107 +1054,6 @@ mod tests {
         assert_eq!(oauth.redeem_transfer_code(&code), None);
     }
 
-    /// Collect a transfer token the way the recipe does.
-    fn collect(oauth: &OAuthState, scopes: Scopes) -> String {
-        let code = oauth.issue_transfer_code(scopes);
-        oauth.redeem_transfer_code(&code).expect("a fresh ticket")
-    }
-
-    #[test]
-    fn a_live_transfer_token_renews_itself_and_leaves_a_way_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
-        let granted = Scopes {
-            read: true,
-            write: true,
-            delegated: false,
-            prefix: None,
-        };
-        let first = collect(&oauth, granted.clone());
-
-        let second = oauth
-            .renew_transfer(&first)
-            .expect("a working token is its own proof");
-
-        let delegated = Scopes {
-            delegated: true,
-            ..granted
-        };
-        assert_ne!(second, first);
-        assert_eq!(oauth.validate_bearer(&second), Some(delegated.clone()));
-        assert_eq!(
-            oauth.validate_bearer(&first),
-            Some(delegated),
-            "losing the replacement — a failed move, an interrupted script — must \
-             not cost the whole remaining lifetime"
-        );
-        let cutback = oauth.store.lock().unwrap().access[&first].expires_at;
-        assert!(
-            cutback <= now_secs() + TRANSFER_RENEWAL_GRACE_SECS,
-            "the predecessor gets enough to try again, not its full window"
-        );
-    }
-
-    #[test]
-    fn a_renewal_chain_stops_at_its_ceiling() {
-        let dir = tempfile::tempdir().unwrap();
-        let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
-        let token = collect(&oauth, Scopes::full());
-
-        // Bring the ceiling forward rather than waiting an hour for it.
-        oauth
-            .store
-            .lock()
-            .unwrap()
-            .access
-            .get_mut(&token)
-            .unwrap()
-            .not_after = Some(now_secs() - 1);
-
-        assert_eq!(
-            oauth.renew_transfer(&token),
-            None,
-            "a sliding window with no ceiling is a permanent credential in disguise"
-        );
-    }
-
-    #[test]
-    fn a_lapsed_transfer_token_cannot_be_resurrected() {
-        let dir = tempfile::tempdir().unwrap();
-        let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
-        let token = collect(&oauth, Scopes::full());
-
-        oauth
-            .store
-            .lock()
-            .unwrap()
-            .access
-            .get_mut(&token)
-            .unwrap()
-            .expires_at = now_secs() - 1;
-
-        assert_eq!(
-            oauth.renew_transfer(&token),
-            None,
-            "the idle window only bounds anything if lapsing is final"
-        );
-    }
-
-    #[test]
-    fn an_ordinary_access_token_does_not_renew_through_the_transfer_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
-        let connector = oauth.issue_tokens(None);
-
-        assert_eq!(
-            oauth.renew_transfer(&connector.access_token),
-            None,
-            "a connector token renews through its refresh token; letting it in \
-             here would launder it into an endless chain"
-        );
-        assert_eq!(oauth.renew_transfer("static-token"), None);
-    }
-
     #[test]
     fn a_scoped_credential_reaches_only_its_own_subtree() {
         let scoped = Scopes {
@@ -1304,7 +1124,6 @@ mod tests {
             TokenRec {
                 expires_at: now_secs() + 3600,
                 scopes: reduced.clone(),
-                not_after: None,
                 client_id: None,
             },
         );

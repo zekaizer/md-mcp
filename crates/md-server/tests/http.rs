@@ -318,60 +318,28 @@ async fn the_static_token_is_not_what_gets_handed_out() {
 }
 
 #[tokio::test]
-async fn a_collected_token_renews_itself_and_the_old_one_still_answers() {
+async fn the_transfer_surface_offers_no_renewal() {
     let (addr, _handle) = spawn_server(Some("s3cret")).await;
-    let (token, _) = provision(addr, false).await;
-    let http = reqwest::Client::new();
-    let note = format!("http://{addr}/api/notes/hello.md");
-
-    let response = http
-        .post(format!("http://{addr}/transfer/renew"))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    let fresh = response.text().await.unwrap().trim().to_string();
-    assert_ne!(fresh, token);
-
-    assert_eq!(
-        http.get(&note)
-            .bearer_auth(&fresh)
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        200,
-        "a long job renews rather than dying halfway"
+    let grant = grant(addr, false).await;
+    assert!(
+        grant.get("renew").is_none() && grant.get("token_max_lifetime_seconds").is_none(),
+        "a grant promising renewal would teach a caller to build on a chain \
+         this server no longer runs: {grant}"
     );
-    assert_eq!(
-        http.get(&note)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        200,
-        "a script that renewed and then lost the replacement — a failed move, an \
-         interrupted run — can still ask again inside the grace window"
-    );
-}
 
-#[tokio::test]
-async fn the_connector_bearer_cannot_renew_through_the_transfer_path() {
-    let (addr, _handle) = spawn_server(Some("s3cret")).await;
-
+    let code = grant["code"].as_str().unwrap().to_string();
+    let token = redeem(addr, &code).await.text().await.unwrap();
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/transfer/renew"))
-        .bearer_auth("s3cret")
+        .bearer_auth(token.trim())
         .send()
         .await
         .unwrap();
-
     assert_eq!(
         response.status(),
-        401,
-        "letting the parent bearer in here would launder it into an endless chain"
+        404,
+        "a transfer token lapses on its TTL and is not renewable; a fresh \
+         grant is one tool call away"
     );
 }
 
