@@ -170,9 +170,10 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
         "properties": {
           "path": { "type": "string" },
           "content": { "type": "string" },
-          "frontmatter": { "type": "object" }
+          "frontmatter": { "type": "object" },
+          "base": { "type": "string" }
         },
-        "required": ["path","content"]
+        "required": ["path"]
       }
     },
     "overwrite": { "type": "boolean", "default": false }
@@ -181,6 +182,8 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
 }
 ```
 `content`는 **body만**, frontmatter는 `frontmatter` 객체로 분리 전달한다 — `content`에 선행 `---` 블록을 넣으면 error(이중 frontmatter 방지). `overwrite:false`일 때 기존 노트 존재 시 해당 item만 error(의도치 않은 덮어쓰기 방지). 없는 parent 디렉토리는 자동 생성한다. 출력: per-item `{ path, created, error? }`.
+
+`base`: 기존 노트 경로를 주면 그 노트를 **frontmatter·body 통째로 그대로 복사**해 생성한다(순수 카피 — 치환·병합 없음, 수정은 생성 후 다른 도구로). `base`와 `content`/`frontmatter`는 상호 배타(같이 주면 CONFLICT), base 노트가 없으면 NOT_FOUND. item당 `content` 또는 `base` 중 하나는 필수(둘 다 없으면 MISSING_CONTENT). batch는 배열 순서대로 처리되므로 앞 item이 만든 노트를 뒤 item의 `base`로 쓸 수 있다.
 
 ### append_notes (비파괴 · 부분 성공)
 ```json

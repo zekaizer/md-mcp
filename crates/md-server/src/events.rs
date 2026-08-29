@@ -341,13 +341,15 @@ mod tests {
             notes: vec![
                 NoteInput {
                     path: "a.md".into(),
-                    content: "# A\nbody\n".into(),
+                    content: Some("# A\nbody\n".into()),
                     frontmatter: None,
+                    base: None,
                 },
                 NoteInput {
                     path: ".md-mcp/evil.md".into(),
-                    content: "x".into(),
+                    content: Some("x".into()),
                     frontmatter: None,
+                    base: None,
                 },
             ],
             overwrite: false,

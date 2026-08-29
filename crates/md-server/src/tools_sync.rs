@@ -250,8 +250,9 @@ mod tests {
         s.create_notes(Parameters(CreateNotesRequest {
             notes: vec![NoteInput {
                 path: "new.md".into(),
-                content: "# New\n".into(),
+                content: Some("# New\n".into()),
                 frontmatter: None,
+                base: None,
             }],
             overwrite: false,
         }))
@@ -317,13 +318,15 @@ mod tests {
             notes: vec![
                 NoteInput {
                     path: "one.md".into(),
-                    content: "# One\n".into(),
+                    content: Some("# One\n".into()),
                     frontmatter: None,
+                    base: None,
                 },
                 NoteInput {
                     path: "two.md".into(),
-                    content: "# Two\n".into(),
+                    content: Some("# Two\n".into()),
                     frontmatter: None,
+                    base: None,
                 },
             ],
             overwrite: false,
@@ -427,8 +430,9 @@ mod tests {
         s.create_notes(Parameters(CreateNotesRequest {
             notes: vec![NoteInput {
                 path: "pushed.md".into(),
-                content: "# Pushed\n".into(),
+                content: Some("# Pushed\n".into()),
                 frontmatter: None,
+                base: None,
             }],
             overwrite: false,
         }))
@@ -470,8 +474,9 @@ mod tests {
             .create_notes(Parameters(CreateNotesRequest {
                 notes: vec![NoteInput {
                     path: "while-down.md".into(),
-                    content: "# Down\n".into(),
+                    content: Some("# Down\n".into()),
                     frontmatter: None,
+                    base: None,
                 }],
                 overwrite: false,
             }))
@@ -490,8 +495,9 @@ mod tests {
             .create_notes(Parameters(CreateNotesRequest {
                 notes: vec![NoteInput {
                     path: "after-recovery.md".into(),
-                    content: "# Up\n".into(),
+                    content: Some("# Up\n".into()),
                     frontmatter: None,
+                    base: None,
                 }],
                 overwrite: false,
             }))
@@ -521,8 +527,9 @@ mod tests {
             .create_notes(Parameters(CreateNotesRequest {
                 notes: vec![NoteInput {
                     path: "unrelated.md".into(),
-                    content: "# Unrelated\n".into(),
+                    content: Some("# Unrelated\n".into()),
                     frontmatter: None,
+                    base: None,
                 }],
                 overwrite: false,
             }))
@@ -566,8 +573,9 @@ mod tests {
         s.create_notes(Parameters(CreateNotesRequest {
             notes: vec![NoteInput {
                 path: "cmd.md".into(),
-                content: long.clone(),
+                content: Some(long.clone()),
                 frontmatter: None,
+                base: None,
             }],
             overwrite: false,
         }))
@@ -617,8 +625,9 @@ mod tests {
         s.create_notes(Parameters(CreateNotesRequest {
             notes: vec![NoteInput {
                 path: "retry.md".into(),
-                content: "# Retry\n".into(),
+                content: Some("# Retry\n".into()),
                 frontmatter: None,
+                base: None,
             }],
             overwrite: false,
         }))

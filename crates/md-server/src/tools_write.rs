@@ -49,11 +49,19 @@ pub struct CreateNotesRequest {
 #[schemars(crate = "rmcp::schemars")]
 pub struct NoteInput {
     pub path: String,
-    /// The note body (no leading `---` frontmatter block — pass frontmatter separately).
-    pub content: String,
+    /// The note body (no leading `---` frontmatter block — pass frontmatter
+    /// separately). Required unless `base` is given.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frontmatter: Option<Value>,
+    /// Copy this existing note verbatim (frontmatter and body). Excludes
+    /// `content` and `frontmatter`.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -429,7 +437,7 @@ pub struct PropertyApplied {
 impl MdServer {
     /// Create new notes (refusing to overwrite unless `overwrite` is set).
     #[tool(
-        description = "Create one or more notes. content is the body only; pass frontmatter as a separate object (a leading --- block in content is rejected). Partial success: a failing note does not block the others. overwrite:false refuses an existing note.",
+        description = "Create one or more notes. content is the body only; pass frontmatter as a separate object (a leading --- block in content is rejected). Alternatively pass base — the path of an existing note to copy verbatim (frontmatter and body); base excludes content and frontmatter, so edit the copy afterwards with the other tools. Partial success: a failing note does not block the others. overwrite:false refuses an existing note.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -446,25 +454,37 @@ impl MdServer {
             .notes
             .iter()
             .map(|note| {
-                if body_has_frontmatter(&note.content) {
-                    return CreateResult {
-                        path: note.path.clone(),
-                        created: false,
-                        error: Some(ApiError {
-                            code: Code::Conflict.as_str().to_string(),
-                            message: "content must not start with a --- frontmatter block; pass frontmatter separately".to_string(),
-                            index: None,
-                        }),
-                    };
-                }
-                let fm = note.frontmatter.clone().unwrap_or(Value::Null);
-                let result = frontmatter::with_frontmatter(&note.content, &fm)
-                    .and_then(|text| {
+                let result = match (&note.base, &note.content) {
+                    (Some(_), _) if note.content.is_some() || note.frontmatter.is_some() => {
+                        Err(md_core::Error::conflict(
+                            "base copies a note verbatim; pass neither content nor frontmatter",
+                        ))
+                    }
+                    (Some(base), _) => self.vault().read_note(base).and_then(|text| {
                         if text.len() > MAX_WRITE_BYTES {
                             return Err(write_size_error("note", text.len()));
                         }
                         self.vault().create_note(&note.path, text.as_bytes(), req.overwrite)
-                    });
+                    }),
+                    (None, None) => Err(md_core::Error::new(
+                        Code::MissingContent,
+                        "content is required unless base is given",
+                    )),
+                    (None, Some(content)) if body_has_frontmatter(content) => {
+                        Err(md_core::Error::conflict(
+                            "content must not start with a --- frontmatter block; pass frontmatter separately",
+                        ))
+                    }
+                    (None, Some(content)) => {
+                        let fm = note.frontmatter.clone().unwrap_or(Value::Null);
+                        frontmatter::with_frontmatter(content, &fm).and_then(|text| {
+                            if text.len() > MAX_WRITE_BYTES {
+                                return Err(write_size_error("note", text.len()));
+                            }
+                            self.vault().create_note(&note.path, text.as_bytes(), req.overwrite)
+                        })
+                    }
+                };
                 match result {
                     Ok(()) => CreateResult { path: note.path.clone(), created: true, error: None },
                     Err(e) => CreateResult { path: note.path.clone(), created: false, error: Some(ApiError::from_core(&e)) },
@@ -1001,8 +1021,9 @@ mod tests {
         let notes: Vec<NoteInput> = (0..101)
             .map(|i| NoteInput {
                 path: format!("n{i}.md"),
-                content: "x".into(),
+                content: Some("x".into()),
                 frontmatter: None,
+                base: None,
             })
             .collect();
         let result = s
@@ -1028,13 +1049,15 @@ mod tests {
                 notes: vec![
                     NoteInput {
                         path: "script.sh".to_string(),
-                        content: "echo hi\n".to_string(),
+                        content: Some("echo hi\n".to_string()),
                         frontmatter: None,
+                        base: None,
                     },
                     NoteInput {
                         path: decomposed,
-                        content: "body\n".to_string(),
+                        content: Some("body\n".to_string()),
                         frontmatter: None,
+                        base: None,
                     },
                 ],
                 overwrite: false,
@@ -1070,13 +1093,15 @@ mod tests {
                 notes: vec![
                     NoteInput {
                         path: "big.md".into(),
-                        content: big.clone(),
+                        content: Some(big.clone()),
                         frontmatter: None,
+                        base: None,
                     },
                     NoteInput {
                         path: "small.md".into(),
-                        content: "ok\n".into(),
+                        content: Some("ok\n".into()),
                         frontmatter: None,
+                        base: None,
                     },
                 ],
                 overwrite: false,
@@ -1135,8 +1160,9 @@ mod tests {
             .create_notes(Parameters(CreateNotesRequest {
                 notes: vec![NoteInput {
                     path: "n.md".into(),
-                    content: "# Body\n".into(),
+                    content: Some("# Body\n".into()),
                     frontmatter: Some(json!({"status": "draft"})),
+                    base: None,
                 }],
                 overwrite: false,
             }))
@@ -1158,13 +1184,15 @@ mod tests {
                 notes: vec![
                     NoteInput {
                         path: "exists.md".into(),
-                        content: "new".into(),
+                        content: Some("new".into()),
                         frontmatter: None,
+                        base: None,
                     },
                     NoteInput {
                         path: "dbl.md".into(),
-                        content: "---\nx: 1\n---\nbody\n".into(),
+                        content: Some("---\nx: 1\n---\nbody\n".into()),
                         frontmatter: None,
+                        base: None,
                     },
                 ],
                 overwrite: false,
@@ -1175,6 +1203,101 @@ mod tests {
         assert_eq!(resp.created[0].error.as_ref().unwrap().code, "CONFLICT");
         assert_eq!(resp.created[1].error.as_ref().unwrap().code, "CONFLICT");
         assert_eq!(s.vault().read_note("exists.md").unwrap(), "old");
+    }
+
+    #[tokio::test]
+    async fn create_notes_base_copies_a_note_verbatim() {
+        let tpl = "---\nstatus: draft\n---\n# Tpl\nbody\n";
+        let (_d, s) = server(&[("tpl.md", tpl)]);
+        let resp = s
+            .create_notes(Parameters(CreateNotesRequest {
+                notes: vec![NoteInput {
+                    path: "new.md".into(),
+                    content: None,
+                    frontmatter: None,
+                    base: Some("tpl.md".into()),
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(resp.created[0].created, "{:?}", resp.created[0].error);
+        assert_eq!(s.vault().read_note("new.md").unwrap(), tpl);
+        assert_eq!(s.vault().read_note("tpl.md").unwrap(), tpl);
+    }
+
+    #[tokio::test]
+    async fn create_notes_base_excludes_content_and_frontmatter() {
+        let (_d, s) = server(&[("tpl.md", "body\n")]);
+        let resp = s
+            .create_notes(Parameters(CreateNotesRequest {
+                notes: vec![
+                    NoteInput {
+                        path: "a.md".into(),
+                        content: Some("x\n".into()),
+                        frontmatter: None,
+                        base: Some("tpl.md".into()),
+                    },
+                    NoteInput {
+                        path: "b.md".into(),
+                        content: None,
+                        frontmatter: Some(json!({"k": 1})),
+                        base: Some("tpl.md".into()),
+                    },
+                ],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.created[0].error.as_ref().unwrap().code, "CONFLICT");
+        assert_eq!(resp.created[1].error.as_ref().unwrap().code, "CONFLICT");
+        assert!(!s.vault().exists("a.md").unwrap());
+        assert!(!s.vault().exists("b.md").unwrap());
+    }
+
+    #[tokio::test]
+    async fn create_notes_base_missing_is_not_found() {
+        let (_d, s) = server(&[]);
+        let resp = s
+            .create_notes(Parameters(CreateNotesRequest {
+                notes: vec![NoteInput {
+                    path: "new.md".into(),
+                    content: None,
+                    frontmatter: None,
+                    base: Some("absent.md".into()),
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(resp.created[0].error.as_ref().unwrap().code, "NOT_FOUND");
+        assert!(!s.vault().exists("new.md").unwrap());
+    }
+
+    #[tokio::test]
+    async fn create_notes_without_content_or_base_is_rejected() {
+        let (_d, s) = server(&[]);
+        let resp = s
+            .create_notes(Parameters(CreateNotesRequest {
+                notes: vec![NoteInput {
+                    path: "new.md".into(),
+                    content: None,
+                    frontmatter: None,
+                    base: None,
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            resp.created[0].error.as_ref().unwrap().code,
+            "MISSING_CONTENT"
+        );
+        assert!(!s.vault().exists("new.md").unwrap());
     }
 
     #[tokio::test]
