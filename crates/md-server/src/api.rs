@@ -142,99 +142,36 @@ async fn post_collection(
     let mut report = String::new();
     let mut ops = Vec::new();
     let mut refused = 0usize;
+    let mut buffer = Vec::new();
     for entry in entries {
-        let mut entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                refused += 1;
-                report.push_str(&line(serde_json::json!({ "error": error.to_string() })));
-                continue;
-            }
-        };
-        // Directories are structure, not content. Anything else that is not a
-        // regular file — a link, a device node — has no meaning in a vault and
-        // is refused rather than followed.
-        let kind = entry.header().entry_type();
-        if kind.is_dir() {
-            continue;
-        }
-        if !kind.is_file() {
-            refused += 1;
-            report.push_str(&line(serde_json::json!({ "error": "not a regular file" })));
-            continue;
-        }
-
-        let Ok(name) = entry.path().map(|p| p.to_string_lossy().into_owned()) else {
-            report.push_str(&line(
-                serde_json::json!({ "error": "unreadable entry path" }),
-            ));
-            continue;
-        };
-        // `tar -C dir -cf - .` names every entry `./…`.
-        let path = prefixed(query.to.as_deref(), name.trim_start_matches("./"));
-
-        let mut bytes = Vec::new();
-        if let Err(error) = entry.read_to_end(&mut bytes) {
-            refused += 1;
-            report.push_str(&line(
-                serde_json::json!({ "path": path, "error": error.to_string() }),
-            ));
-            continue;
-        }
-        if bytes.len() > MAX_WRITE_BYTES {
-            refused += 1;
-            report.push_str(&line(serde_json::json!({
-                "path": path,
-                "error": write_size_error("note", bytes.len()).message,
-            })));
-            continue;
-        }
-
-        if !authority.permits(&path) {
-            refused += 1;
-            report.push_str(&line(serde_json::json!({
-                "path": path,
-                "error": "outside this credential's directory",
-            })));
-            continue;
-        }
-        if not_a_note(&path).is_some() {
-            refused += 1;
-            report.push_str(&line(serde_json::json!({
-                "path": path,
-                "error": "not a Markdown note; this vault holds only .md files",
-            })));
-            continue;
-        }
-        let existed = server.vault().exists(&path).unwrap_or(false);
-        if existed && !query.overwrite {
-            refused += 1;
-            report.push_str(&line(serde_json::json!({
-                "path": path,
-                "error": "note exists; pass overwrite=true to replace it",
-            })));
-            continue;
-        }
-        // Containment is the vault jail's job (ADR-0006): a `..` or an absolute
-        // name in the tar is rejected there, not by string inspection here.
-        match server.vault().create_note(&path, &bytes, true) {
-            Ok(()) => {
-                ops.push(if existed {
+        match write_entry(&server, &authority, &query, entry, &mut buffer) {
+            // A directory is structure, not content, and nothing to report.
+            Ok(None) => {}
+            Ok(Some(written)) => {
+                let path = written.path;
+                ops.push(if written.replaced {
                     EventOp::Write { path: path.clone() }
                 } else {
                     EventOp::Create { path: path.clone() }
                 });
-                report.push_str(&line(serde_json::json!({
-                    "path": path,
-                    "written": true,
-                    "replaced": existed,
-                })));
+                push_line(
+                    &mut report,
+                    &serde_json::json!({
+                        "path": path,
+                        "written": true,
+                        "replaced": written.replaced,
+                    }),
+                );
             }
-            Err(error) => {
+            Err(refusal) => {
                 refused += 1;
-                report.push_str(&line(
-                    serde_json::json!({ "path": path, "error": error.message }),
-                ));
+                push_line(
+                    &mut report,
+                    &match refusal.path {
+                        Some(path) => serde_json::json!({ "path": path, "error": refusal.why }),
+                        None => serde_json::json!({ "error": refusal.why }),
+                    },
+                );
             }
         }
     }
@@ -247,6 +184,7 @@ async fn post_collection(
             &serde_json::json!({ "to": query.to, "overwrite": query.overwrite }),
         )
         .await;
+
     // A push that refused something is not a success, and a script gating on
     // the exit status has only the code to go on.
     let status = if refused == 0 {
@@ -255,6 +193,98 @@ async fn post_collection(
         StatusCode::MULTI_STATUS
     };
     (status, [(header::CONTENT_TYPE, NDJSON.to_string())], report).into_response()
+}
+
+/// One note the push landed.
+struct Written {
+    path: String,
+    replaced: bool,
+}
+
+/// Why one entry did not land, and where, when the path was known.
+struct Refusal {
+    path: Option<String>,
+    why: String,
+}
+
+impl Refusal {
+    fn at(path: &str, why: impl Into<String>) -> Self {
+        Self {
+            path: Some(path.to_string()),
+            why: why.into(),
+        }
+    }
+
+    fn bare(why: impl Into<String>) -> Self {
+        Self {
+            path: None,
+            why: why.into(),
+        }
+    }
+}
+
+/// Write one tar entry, or say why not. `Ok(None)` is a directory.
+///
+/// Every refusal leaves through one return type so the caller counts them in
+/// one place: nine hand-written `continue`s is how a push that refused an entry
+/// came to answer 200 on one of the nine paths.
+fn write_entry<R: std::io::Read>(
+    server: &MdServer,
+    authority: &Scopes,
+    query: &PushQuery,
+    entry: std::io::Result<tar::Entry<'_, R>>,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<Written>, Refusal> {
+    let mut entry = entry.map_err(|error| Refusal::bare(error.to_string()))?;
+
+    let kind = entry.header().entry_type();
+    if kind.is_dir() {
+        return Ok(None);
+    }
+    // Anything else that is not a regular file — a link, a device node — has no
+    // meaning in a vault and is refused rather than followed.
+    if !kind.is_file() {
+        return Err(Refusal::bare("not a regular file"));
+    }
+
+    let name = entry
+        .path()
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|_| Refusal::bare("unreadable entry path"))?;
+    // `tar -C dir -cf - .` names every entry `./…`.
+    let path = prefixed(query.to.as_deref(), name.trim_start_matches("./"));
+
+    buffer.clear();
+    entry
+        .read_to_end(buffer)
+        .map_err(|error| Refusal::at(&path, error.to_string()))?;
+    if buffer.len() > MAX_WRITE_BYTES {
+        return Err(Refusal::at(
+            &path,
+            write_size_error("note", buffer.len()).message,
+        ));
+    }
+    if !authority.permits(&path) {
+        return Err(Refusal::at(&path, "outside this credential's directory"));
+    }
+    if !is_note(&path) {
+        return Err(Refusal::at(&path, NOT_A_NOTE));
+    }
+
+    let replaced = server.vault().exists(&path).unwrap_or(false);
+    if replaced && !query.overwrite {
+        return Err(Refusal::at(
+            &path,
+            "note exists; pass overwrite=true to replace it",
+        ));
+    }
+    // Containment is the vault jail's job (ADR-0006): a `..` or an absolute
+    // name in the tar is rejected there, not by string inspection here.
+    server
+        .vault()
+        .create_note(&path, buffer, true)
+        .map_err(|error| Refusal::at(&path, error.message))?;
+    Ok(Some(Written { path, replaced }))
 }
 
 /// Join a pushed entry's name onto the destination prefix.
@@ -270,11 +300,16 @@ fn prefixed(to: Option<&str>, name: &str) -> String {
         }
         _ => name.to_string(),
     };
-    nfc(&joined).into_owned()
+    match nfc(&joined) {
+        std::borrow::Cow::Borrowed(_) => joined,
+        std::borrow::Cow::Owned(composed) => composed,
+    }
 }
 
-fn line(value: serde_json::Value) -> String {
-    format!("{value}\n")
+/// One NDJSON line, written straight into the report.
+fn push_line(report: &mut String, value: &serde_json::Value) {
+    use std::fmt::Write as _;
+    let _ = writeln!(report, "{value}");
 }
 
 /// A subtree as one tar, so a whole vault crosses the wire in one round trip.
@@ -455,8 +490,7 @@ fn index(server: &MdServer, paths: &[String]) -> Response {
                 "error": error.message,
             }),
         };
-        let entry = line(entry);
-        body.push_str(&entry);
+        push_line(&mut body, &entry);
     }
     ([(header::CONTENT_TYPE, NDJSON.to_string())], body).into_response()
 }
@@ -491,8 +525,12 @@ async fn put_note(
     if !authority.permits(&path) {
         return outside_grant(&path);
     }
-    if let Some(refusal) = not_a_note(&path) {
-        return refusal;
+    if !is_note(&path) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("{path:?} is {NOT_A_NOTE}\n"),
+        )
+            .into_response();
     }
 
     // Held across the read-check-write so a concurrent writer in this process
@@ -595,23 +633,19 @@ fn precondition_failed(why: &str) -> Response {
     (StatusCode::PRECONDITION_FAILED, format!("{why}\n")).into_response()
 }
 
+/// Why the vault takes nothing else, in one place so both write paths say it
+/// the same way.
+const NOT_A_NOTE: &str = "not a Markdown note; this vault holds only .md files";
+
 /// The vault holds Markdown and nothing else. A file the listing will never
 /// show is a ghost — writable and readable by path, invisible to every pull —
 /// so a pull-and-push round trip would silently drop it.
-fn not_a_note(path: &str) -> Option<Response> {
-    if std::path::Path::new(path)
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
-    {
-        return None;
-    }
-    Some(
-        (
-            StatusCode::BAD_REQUEST,
-            format!("{path:?} is not a Markdown note; this vault holds only .md files\n"),
-        )
-            .into_response(),
-    )
+///
+/// Spelled exactly as the listing walk spells it (`md_core::listing`), since
+/// that is what decides visibility: matching case-insensitively here would
+/// accept `NOTE.MD` and mint the very ghost this refuses.
+fn is_note(path: &str) -> bool {
+    path.ends_with(".md")
 }
 
 /// Refused for reaching past what the credential was confined to. Distinct

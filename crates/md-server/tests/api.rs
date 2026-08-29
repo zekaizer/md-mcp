@@ -749,3 +749,30 @@ async fn a_protected_directory_is_not_a_prefix() {
          it may not have from one that is empty"
     );
 }
+
+#[tokio::test]
+async fn a_directory_entry_is_skipped_without_counting_as_a_refusal() {
+    let addr = spawn(None).await;
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Directory);
+    header.set_size(0);
+    header.set_mode(0o755);
+    header.set_cksum();
+    builder.append_data(&mut header, "sub/", &[][..]).unwrap();
+    let mut note = tar::Header::new_gnu();
+    note.set_size(7);
+    note.set_mode(0o644);
+    note.set_cksum();
+    builder.append_data(&mut note, "sub/a.md", &b"# A\n\nx"[..]).unwrap();
+
+    let response = post_tar(addr, "", builder.into_inner().unwrap()).await;
+
+    assert_eq!(
+        response.status(),
+        200,
+        "`tar -cf - .` always carries directories; counting them as refusals \
+         would make every ordinary push look partly failed"
+    );
+    assert!(!response.text().await.unwrap().contains("error"));
+}
