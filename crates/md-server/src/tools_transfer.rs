@@ -172,17 +172,17 @@ fn recipe(
             "# 1. run this first: trade the one-time ticket for the token (single use)\ncurl -sSf -X POST -d \"code={code}\" \"{redeem}\" -o {TOKEN_FILE}"
         ),
         format!(
-            "# 2. see what is there and how much of it, without transferring content\ncurl -sS {auth} \"{base}?format=index\""
-        ),
-        format!(
-            "# pull the whole vault into ./vault (the note-count response header says how many arrived)\ncurl -sS {auth} \"{base}\" | tar -xf - -C ./vault"
+            "# 2. see what is there and how much of it, without moving any content\ncurl -sS {auth} \"{base}?format=index\""
         ),
     ];
     if let Some(dir) = example_dir {
         recipe.push(format!(
-            "# or just one directory\ncurl -sS {auth} \"{base}?prefix={dir}\" | tar -xf - -C ./vault"
+            "# pull one directory into ./vault (the note-count response header says how many arrived)\ncurl -sS {auth} \"{base}?prefix={dir}\" | tar -xf - -C ./vault"
         ));
     }
+    recipe.push(format!(
+        "# the whole vault, when you do mean all of it\ncurl -sS {auth} \"{base}?all=true\" | tar -xf - -C ./vault"
+    ));
     recipe.push(format!(
         "# one note\ncurl -sS {auth} -o note.md \"{base}/{note}\""
     ));
@@ -232,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn the_recipe_shows_the_whole_vault_before_a_slice_of_it() {
+    fn the_recipe_reaches_for_the_whole_vault_last_and_says_so() {
         let lines = recipe(
             "https://host/api/notes",
             "https://host/transfer/redeem",
@@ -241,23 +241,23 @@ mod tests {
             false,
             Some("00-inbox"),
         );
-        let pulls: Vec<&String> = lines.iter().filter(|l| l.contains("tar -xf")).collect();
+        let at = |needle: &str| lines.iter().position(|l| l.contains(needle));
 
         assert!(
-            pulls.iter().any(|l| !l.contains("prefix=")),
-            "a recipe that only ever pulls one directory reads as a whole-vault \
-             pull and quietly delivers a fraction of it: {pulls:?}"
+            at("format=index") < at("tar -xf"),
+            "knowing the size comes before deciding to move it"
         );
         assert!(
-            pulls.iter().any(|l| l.contains("prefix=00-inbox")),
-            "narrowing still has to be shown: {pulls:?}"
+            at("prefix=00-inbox") < at("all=true"),
+            "the narrowed pull is the one to reach for first: {lines:?}"
         );
-
-        let index = lines.iter().position(|l| l.contains("format=index"));
-        let whole = lines.iter().position(|l| l.contains("tar -xf"));
         assert!(
-            index < whole,
-            "knowing the size comes before deciding to pull it all"
+            lines
+                .iter()
+                .filter(|l| l.contains("tar -xf"))
+                .all(|l| l.contains("prefix=") || l.contains("all=true")),
+            "a pull with nothing narrowing it and nothing asking for everything \
+             is refused by the server, so it must not appear here: {lines:?}"
         );
     }
 

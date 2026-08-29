@@ -282,6 +282,10 @@ struct CollectionQuery {
     prefix: Option<String>,
     #[serde(default)]
     format: Option<String>,
+    /// Say out loud that a pull with nothing narrowing it is meant to take
+    /// everything, the way `overwrite=true` says so for a bulk write.
+    #[serde(default)]
+    all: bool,
 }
 
 async fn get_collection(
@@ -299,7 +303,21 @@ async fn get_collection(
     }
     match query.format.as_deref() {
         Some("index") => index(&server, query.prefix.as_deref()).await,
-        None | Some("tar") => tar_of_subtree(&server, query.prefix.as_deref()).await,
+        None | Some("tar") => {
+            let narrowed = query
+                .prefix
+                .as_deref()
+                .is_some_and(|prefix| !prefix.trim_matches('/').is_empty());
+            if !narrowed && !query.all {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "this would take the whole vault; pass prefix=<directory> to narrow it, \
+                     or all=true to say you mean all of it\n",
+                )
+                    .into_response();
+            }
+            tar_of_subtree(&server, query.prefix.as_deref()).await
+        }
         Some(other) => (
             StatusCode::BAD_REQUEST,
             format!("unsupported format {other:?}; use tar or index\n"),

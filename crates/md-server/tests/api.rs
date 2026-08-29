@@ -532,3 +532,53 @@ async fn an_archive_says_how_many_notes_it_carries() {
         "a caller should not have to parse the archive to know it got anything"
     );
 }
+
+#[tokio::test]
+async fn taking_the_whole_vault_has_to_be_asked_for() {
+    let addr = spawn_with_tree().await;
+
+    let response = reqwest::get(format!("http://{addr}/api/notes"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        400,
+        "a pull with nothing narrowing it takes everything; that has to be a \
+         choice, the way replacing notes in bulk is"
+    );
+    let message = response.text().await.unwrap();
+    assert!(
+        message.contains("prefix") && message.contains("all=true"),
+        "the refusal has to name both ways forward: {message}"
+    );
+}
+
+#[tokio::test]
+async fn the_whole_vault_is_served_when_it_is_asked_for() {
+    let addr = spawn_with_tree().await;
+
+    let response = reqwest::get(format!("http://{addr}/api/notes?all=true"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["note-count"], "3");
+}
+
+#[tokio::test]
+async fn the_index_needs_no_such_asking() {
+    let addr = spawn_with_tree().await;
+
+    let response = reqwest::get(format!("http://{addr}/api/notes?format=index"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        200,
+        "learning the size of the vault moves no content, and is exactly what a \
+         caller should do before deciding to take it all"
+    );
+    assert_eq!(response.text().await.unwrap().lines().count(), 3);
+}
