@@ -438,7 +438,9 @@ mod tests {
         let nfd = "\u{1112}\u{1161}\u{11ab}.md"; // 한.md in NFD
         let nfc = "\u{d55c}.md"; // 한.md in NFC
         assert_ne!(nfd, nfc);
-        vault.write_atomic(nfd, b"content").unwrap();
+        // Placed as an external sync would: the vault composes what it creates,
+        // so this respelling is a repair of a name it did not choose.
+        std::fs::write(vault.root_path().join(nfd), b"content").unwrap();
 
         let outcomes = vault
             .commit_batch(&[Op::Move {

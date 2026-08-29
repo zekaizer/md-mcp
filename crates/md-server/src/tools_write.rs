@@ -1016,6 +1016,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_tool_surface_obeys_the_vault_own_path_rules() {
+        use unicode_normalization::UnicodeNormalization;
+
+        let (dir, s) = server(&[]);
+        let decomposed: String = "노트.md".nfd().collect();
+        assert_ne!(decomposed, "노트.md", "the fixture must actually differ");
+
+        let result = s
+            .create_notes(Parameters(CreateNotesRequest {
+                notes: vec![
+                    NoteInput {
+                        path: "script.sh".to_string(),
+                        content: "echo hi\n".to_string(),
+                        frontmatter: None,
+                    },
+                    NoteInput {
+                        path: decomposed,
+                        content: "body\n".to_string(),
+                        frontmatter: None,
+                    },
+                ],
+                overwrite: false,
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.0.created[0].created,
+            "the rule that decides what a listing shows belongs to the vault, so \
+             every way in obeys it — not only the transfer API"
+        );
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(!names.iter().any(|n| n == "script.sh"), "got {names:?}");
+        assert!(
+            names.iter().any(|n| n == "노트.md"),
+            "a decomposed name written through the tool surface is composed too: \
+             got {names:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn oversized_writes_are_rejected_per_tool() {
         let (_d, s) = server(&[("seed.md", "# A\nbody\n")]);
         let big = "z".repeat(MAX_WRITE_BYTES + 1);

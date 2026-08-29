@@ -283,9 +283,6 @@ fn write_entry<R: std::io::Read>(
     if !authority.permits(&path) {
         return Err(Refusal::at(&path, "outside this credential's directory"));
     }
-    if !is_note(&path) {
-        return Err(Refusal::at(&path, NOT_A_NOTE));
-    }
 
     let replaced = server.vault().exists(&path).unwrap_or(false);
     if replaced && !query.overwrite {
@@ -547,18 +544,11 @@ async fn put_note(
             .into_response();
     }
 
-    // A client filesystem may spell a name decomposed; the vault stores one
-    // composed spelling so the same note never lands under two paths (ADR-0028).
+    // Composed for the containment comparison below, which is a string test.
+    // What lands on disk is composed by the vault (`Vault::resolve_rel`).
     let path = nfc(&path).into_owned();
     if !authority.permits(&path) {
         return outside_grant(&path);
-    }
-    if !is_note(&path) {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("{path:?} is {NOT_A_NOTE}\n"),
-        )
-            .into_response();
     }
 
     // Held across the read-check-write so a concurrent writer in this process
@@ -666,21 +656,6 @@ fn precondition_required() -> Response {
 
 fn precondition_failed(why: &str) -> Response {
     (StatusCode::PRECONDITION_FAILED, format!("{why}\n")).into_response()
-}
-
-/// Why the vault takes nothing else, in one place so both write paths say it
-/// the same way.
-const NOT_A_NOTE: &str = "not a Markdown note; this vault holds only .md files";
-
-/// The vault holds Markdown and nothing else. A file the listing will never
-/// show is a ghost — writable and readable by path, invisible to every pull —
-/// so a pull-and-push round trip would silently drop it.
-///
-/// Spelled exactly as the listing walk spells it (`md_core::listing`), since
-/// that is what decides visibility: matching case-insensitively here would
-/// accept `NOTE.MD` and mint the very ghost this refuses.
-fn is_note(path: &str) -> bool {
-    path.ends_with(".md")
 }
 
 /// Refused for reaching past what the credential was confined to. Distinct

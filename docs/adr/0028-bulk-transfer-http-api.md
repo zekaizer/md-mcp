@@ -74,11 +74,18 @@ replacing a note is never the silent default, while the common push of new notes
 stays a single unconditional request. A caller that just read a note already holds
 its hash, so the guard costs it no extra round trip.
 
-We will normalize incoming names to NFC before they become vault paths, so a
-decomposed name from a client filesystem addresses the same note as a composed
-one. Path containment stays the jail's job
+We will make the vault, not this API, decide what a note path is: a name being
+created is composed there, and a path that is not a `.md` note is refused there.
+Both rules already existed in the tree — one in the listing walk that decides
+what is visible, one nowhere at all — and enforcing them at the HTTP boundary
+would have left the tool surface writing names the listing can never show. Path
+containment stays the jail's job
 ([ADR-0006](0006-vault-path-jail-and-atomic-write.md)); tar entries are ordinary
 paths to it.
+
+This API still composes a path before comparing it against a grant's
+confinement, because that comparison is a string test on the way in and has
+nothing to do with what is stored.
 
 We will raise the request body limit on the tar routes alone, leaving `/mcp` and
 the OAuth endpoints at the default.

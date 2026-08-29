@@ -145,8 +145,19 @@ impl Vault {
         }
     }
 
-    /// Validate an agent-supplied note path: traversal-safe and not inside a
-    /// protected directory (`.md-mcp/`, `.git/`).
+    /// Whether `rel` names a Markdown note.
+    ///
+    /// The vault holds nothing else, and this is the spelling that decides it:
+    /// the listing walk shows exactly these, so a file written past this rule
+    /// would be readable by path and invisible to every walk — writable,
+    /// fetchable, and dropped by any round trip through a listing.
+    #[must_use]
+    pub fn is_note_path(rel: &str) -> bool {
+        rel.ends_with(".md")
+    }
+
+    /// Validate an agent-supplied note path: traversal-safe, a Markdown note,
+    /// and not inside a protected directory (`.md-mcp/`, `.git/`).
     pub fn validate_note_rel(rel: &str) -> Result<String> {
         let clean = Self::validate_rel(rel)?;
         if Self::is_internal_path(&clean) {
@@ -154,14 +165,24 @@ impl Vault {
                 "cannot target a protected directory: {rel}"
             )));
         }
+        if !Self::is_note_path(&clean) {
+            return Err(Error::new(
+                Code::Suffix,
+                format!("not a Markdown note (only .md files): {rel}"),
+            ));
+        }
         Ok(clean)
     }
 
     /// Resolve a validated relative path against the on-disk tree, comparing
     /// path components after Unicode NFC normalization — so an NFC-spelled path
     /// finds a note a macOS client synced in NFD ([tool_spec §4]). An exact
-    /// byte match always wins; a component with no match (e.g. a file being
-    /// created) is kept as given. Returns the on-disk spelling.
+    /// byte match always wins. Returns the on-disk spelling.
+    ///
+    /// A component with no match is one being created, and it is composed
+    /// rather than kept as given: a client filesystem hands over whichever
+    /// spelling it holds, and storing both leaves the vault with two names for
+    /// one note that git and every listing treat as two files.
     pub fn resolve_rel(&self, rel: &str) -> Result<String> {
         let clean = Self::validate_rel(rel)?;
         if self.root.exists(&clean) {
@@ -196,7 +217,8 @@ impl Vault {
             resolved = match matched {
                 Some(name) if resolved.is_empty() => name,
                 Some(name) => format!("{resolved}/{name}"),
-                None => exact,
+                None if resolved.is_empty() => target.into_owned(),
+                None => format!("{resolved}/{target}"),
             };
         }
         Ok(resolved)
@@ -505,14 +527,60 @@ mod tests {
     // --- create guard -------------------------------------------------------
 
     #[test]
+    fn a_created_note_is_stored_in_one_spelling() {
+        use unicode_normalization::UnicodeNormalization;
+
+        // Derived rather than transcribed, so the fixture cannot encode a
+        // mistake about what "decomposed" means.
+        let (_v, vault) = temp_vault();
+        let decomposed: String = "노트.md".nfd().collect();
+        assert_ne!(decomposed, "노트.md", "the fixture must actually differ");
+
+        vault.create_note(&decomposed, b"content", false).unwrap();
+
+        let names: Vec<String> = std::fs::read_dir(vault.root_path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"노트.md".to_string()),
+            "a client filesystem hands over whichever spelling it holds; storing \
+             both leaves the vault with two names for one note, which git and \
+             every listing treat as two files. got {names:?}"
+        );
+    }
+
+    #[test]
+    fn the_vault_takes_only_markdown() {
+        let (_v, vault) = temp_vault();
+
+        let error = vault
+            .create_note("script.sh", b"echo hi", false)
+            .unwrap_err();
+
+        assert_eq!(
+            error.code,
+            Code::Suffix,
+            "the listing walk shows only .md, so anything else written here is \
+             a file that is readable by path and invisible to every walk"
+        );
+        assert!(vault.create_note("note.md", b"# ok", false).is_ok());
+    }
+
+    #[test]
     fn nfc_path_resolves_nfd_stored_note() {
         // A note synced from macOS is stored with NFD bytes; an agent-supplied
         // NFC path must still find it (tool_spec §4: NFC-normalized comparison).
+        // Placed straight on disk, because that is how such a name arrives —
+        // writing it through the vault would compose it, which is the point of
+        // `a_created_note_is_stored_in_one_spelling`.
         let (_v, vault) = temp_vault();
         let nfd = "\u{110b}\u{1161}/\u{1102}\u{1169}\u{1110}\u{1173}.md"; // 아/노트.md in NFD
         let nfc_path = "아/노트.md";
         assert_ne!(nfd, nfc_path);
-        vault.write_atomic(nfd, b"content").unwrap();
+        let on_disk = vault.root_path().join(nfd);
+        std::fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
+        std::fs::write(&on_disk, b"content").unwrap();
 
         assert!(vault.exists(nfc_path).unwrap());
         assert_eq!(vault.read_note(nfc_path).unwrap(), "content");
@@ -530,7 +598,8 @@ mod tests {
     fn commit_batch_resolves_nfc_paths() {
         let (_v, vault) = temp_vault();
         let nfd = "\u{1102}\u{1169}\u{1110}\u{1173}.md"; // 노트.md in NFD
-        vault.write_atomic(nfd, b"x").unwrap();
+        // Placed as an external sync would, since the vault composes what it creates.
+        std::fs::write(vault.root_path().join(nfd), b"x").unwrap();
         let outcomes = vault
             .commit_batch(&[crate::Op::Delete {
                 path: "노트.md".to_string(),

@@ -141,7 +141,7 @@ impl Vault {
                 if recursive {
                     self.walk(&rel, recursive, include_dirs, out)?;
                 }
-            } else if ft.is_file() && name.ends_with(".md") {
+            } else if ft.is_file() && Vault::is_note_path(&name) {
                 let size = entry.metadata().ok().map(|m| m.len());
                 out.push(Entry {
                     path: rel,
