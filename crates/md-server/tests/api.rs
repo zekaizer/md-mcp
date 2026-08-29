@@ -134,9 +134,20 @@ async fn put(
     body: &str,
     if_match: Option<&str>,
 ) -> reqwest::Response {
+    put_bytes(addr, path, body.as_bytes().to_vec(), if_match).await
+}
+
+/// As [`put`], but bytes: what the wire actually carries. A helper typed
+/// `&str` cannot even express the inputs this endpoint must refuse.
+async fn put_bytes(
+    addr: SocketAddr,
+    path: &str,
+    body: Vec<u8>,
+    if_match: Option<&str>,
+) -> reqwest::Response {
     let mut request = reqwest::Client::new()
         .put(format!("http://{addr}/api/notes/{path}"))
-        .body(body.to_string());
+        .body(body);
     if let Some(value) = if_match {
         request = request.header("if-match", value);
     }
@@ -382,6 +393,11 @@ async fn a_query_parameter_is_refused_rather_than_ignored() {
              errors, and silently ignoring {query:?} would take that away \
              exactly when it is needed"
         );
+        let message = response.text().await.unwrap();
+        assert!(
+            message.contains("takes no parameters"),
+            "the refusal is this API's to word, not serde's: {message:?}"
+        );
     }
 }
 
@@ -524,4 +540,159 @@ async fn a_protected_path_is_not_served() {
         404,
         "the server's own state is not a note, however it is addressed"
     );
+}
+
+#[tokio::test]
+async fn a_body_that_is_not_utf8_never_reaches_the_disk() {
+    let addr = spawn(None).await;
+
+    let response = put_bytes(addr, "bad.md", vec![0xff, 0xfe, b'o', b'k'], None).await;
+    assert_eq!(
+        response.status(),
+        400,
+        "written once, such a note could be neither read nor replaced through \
+         this API — a pipeline accident would poison the path for good"
+    );
+    let message = response.text().await.unwrap();
+    assert!(
+        message.contains("UTF-8"),
+        "the refusal names the law being enforced: {message:?}"
+    );
+
+    assert_eq!(
+        reqwest::get(format!("http://{addr}/api/notes/bad.md"))
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "a refused body must leave nothing behind"
+    );
+    assert_eq!(
+        put(addr, "bad.md", "# fine\n", None).await.status(),
+        201,
+        "and the path is not poisoned for the valid write that follows"
+    );
+}
+
+#[tokio::test]
+async fn a_note_this_api_never_wrote_still_refuses_in_its_own_words() {
+    // Placed straight on disk, as a git sync from another client could.
+    let (addr, root) = spawn_with_root(None).await;
+    std::fs::write(root.join("legacy.md"), [0xffu8, 0xfe]).unwrap();
+
+    let response = reqwest::get(format!("http://{addr}/api/notes/legacy.md"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let message = response.text().await.unwrap();
+    assert!(
+        message.contains("UTF-8") && !message.contains("stream did not contain"),
+        "the io layer's words are not an answer: {message:?}"
+    );
+}
+
+/// One net over every refusal: whatever the individual message tests miss,
+/// no response may carry another layer's words — serde's, axum's, or the
+/// OS's. New refusals get caught here without anyone remembering to test
+/// their wording.
+#[tokio::test]
+async fn no_refusal_speaks_another_layers_words() {
+    let (addr, root) = spawn_with_root(None).await;
+    std::fs::write(root.join("legacy.md"), [0xffu8, 0xfe]).unwrap();
+    assert_eq!(put(addr, "inbox/one.md", "# x\n", None).await.status(), 201);
+    let stale = "\"0000000000000000000000000000000000000000000000000000000000000000\"";
+    let http = reqwest::Client::new();
+    let base = format!("http://{addr}/api/notes");
+
+    let mut answers = vec![
+        (
+            "query param",
+            http.get(format!("{base}?limit=1")).send().await.unwrap(),
+        ),
+        (
+            "directory",
+            http.get(format!("{base}/inbox")).send().await.unwrap(),
+        ),
+        (
+            "absent note",
+            http.get(format!("{base}/missing.md")).send().await.unwrap(),
+        ),
+        (
+            "invalid utf-8 on disk",
+            http.get(format!("{base}/legacy.md")).send().await.unwrap(),
+        ),
+        (
+            "traversal",
+            http.get(format!("{base}/%2e%2e/escape.md"))
+                .send()
+                .await
+                .unwrap(),
+        ),
+        (
+            "collection push",
+            http.post(&base).body("x").send().await.unwrap(),
+        ),
+        (
+            "delete",
+            http.delete(format!("{base}/hello.md"))
+                .send()
+                .await
+                .unwrap(),
+        ),
+    ];
+    answers.push((
+        "replace without if-match",
+        put(addr, "hello.md", "# y\n", None).await,
+    ));
+    answers.push((
+        "unquoted tag",
+        put(addr, "hello.md", "# y\n", Some("deadbeef")).await,
+    ));
+    answers.push((
+        "stale tag",
+        put(addr, "hello.md", "# y\n", Some(stale)).await,
+    ));
+    answers.push((
+        "if-match on absent",
+        put(addr, "missing.md", "# y\n", Some("*")).await,
+    ));
+    answers.push((
+        "non-note extension",
+        put(addr, "script.sh", "x\n", None).await,
+    ));
+    answers.push((
+        "internal path",
+        put(addr, ".md-mcp/x.md", "# y\n", None).await,
+    ));
+    answers.push((
+        "invalid utf-8 body",
+        put_bytes(addr, "b.md", vec![0xff], None).await,
+    ));
+    answers.push((
+        "oversize body",
+        put(addr, "big.md", &"x".repeat(4 * 1024 * 1024 + 1), None).await,
+    ));
+
+    for (label, response) in answers {
+        let status = response.status();
+        assert!(
+            status.is_client_error(),
+            "{label}: every one of these is the caller's mistake, got {status}"
+        );
+        let body = response.text().await.unwrap();
+        for leaked in [
+            "os error",
+            "Failed to",
+            "stream did not contain",
+            "panicked",
+            "backtrace",
+            "deserialize",
+        ] {
+            assert!(
+                !body.contains(leaked),
+                "{label}: a refusal must speak this API's words, found \
+                 {leaked:?} in {body:?}"
+            );
+        }
+    }
 }

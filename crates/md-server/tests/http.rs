@@ -628,6 +628,82 @@ async fn two_grants_do_not_share_a_token_file() {
     );
 }
 
+/// Every grant shape against every path: an asymmetry — issued fine, writes
+/// fine, one path erroring — is exactly what single-finding tests keep
+/// missing, so the whole table is asserted at once.
+#[tokio::test]
+async fn every_grant_shape_answers_every_path() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let http = reqwest::Client::new();
+    let (full, _) = provision(addr, true).await;
+    for name in ["inbox/one.md", "inbox/two.md"] {
+        let put = http
+            .put(format!("http://{addr}/api/notes/{name}"))
+            .bearer_auth(&full)
+            .body("# x\n")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status(), 201);
+    }
+
+    // (prefix, notes the grant reaches today, a note inside the grant)
+    let shapes = [
+        ("inbox", 2, "inbox/one.md"),
+        ("not-yet", 0, "not-yet/probe.md"),
+        ("inbox/one.md", 1, "inbox/one.md"),
+        ("ghost.md", 0, "ghost.md"),
+    ];
+    for (prefix, count, note) in shapes {
+        let (token, _) = provision_confined_raw(addr, true, prefix).await;
+
+        let index = http
+            .get(format!("http://{addr}/api/notes"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            index.status(),
+            200,
+            "{prefix}: a grant whose universe is empty today — a directory \
+             about to be created — still has an index: the empty one"
+        );
+        assert_eq!(index.headers()["note-count"], count.to_string(), "{prefix}");
+        assert_eq!(
+            index.text().await.unwrap().lines().count(),
+            count,
+            "{prefix}"
+        );
+
+        let get = http
+            .get(format!("http://{addr}/api/notes/{note}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            get.status(),
+            if count == 0 { 404 } else { 200 },
+            "{prefix}: inside the grant, absence is 404 — never 403"
+        );
+
+        let put = http
+            .put(format!("http://{addr}/api/notes/{note}"))
+            .bearer_auth(&token)
+            .header("if-match", "*")
+            .body("# w\n")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            put.status(),
+            if count == 0 { 404 } else { 204 },
+            "{prefix}: `*` on an absent note refuses, a present one replaces"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_transfer_credential_is_refused_by_the_tool_surface() {
     let (addr, _handle) = spawn_server(Some("s3cret")).await;
