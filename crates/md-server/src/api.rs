@@ -9,7 +9,8 @@ use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::Uri;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::map_response;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
@@ -48,7 +49,19 @@ pub(crate) fn routes(server: MdServer) -> Router {
                 // surface accepts, the other must not refuse.
                 .layer(DefaultBodyLimit::max(MAX_WRITE_BYTES)),
         )
+        // A compressing intermediary re-encodes the body and weakens the
+        // ETag to W/"...", which then satisfies no if-match. The bytes and
+        // their hash are this API's contract, so every answer says hands off.
+        .layer(map_response(no_transform))
         .with_state(server)
+}
+
+async fn no_transform(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-transform"),
+    );
+    response
 }
 
 async fn get_note(
@@ -267,6 +280,16 @@ async fn put_note(
                     )
                         .into_response();
                 }
+                // Its own truth, not "the note changed": the note did not,
+                // and the usual culprit is a compressing proxy weakening a
+                // tag this API issued strong.
+                IfMatch::Weak => {
+                    return precondition_failed(
+                        "a weak entity-tag (W/...) can never satisfy if-match; this API \
+                         serves strong tags only, so an intermediary weakened this one -- \
+                         re-read the note or the index for the strong tag",
+                    );
+                }
                 IfMatch::Stale => {
                     return precondition_failed("the note changed since it was read");
                 }
@@ -347,6 +370,9 @@ enum IfMatch {
     Match,
     /// Syntactically an entity-tag, but not this note's: the copy is stale.
     Stale,
+    /// `W/"…"`: strong comparison can never satisfy it, and nothing here
+    /// serves one — an intermediary weakened a tag this API issued strong.
+    Weak,
     /// Not an entity-tag at all — usually a tag whose quotes were stripped.
     Malformed,
 }
@@ -355,15 +381,21 @@ enum IfMatch {
 /// it is still an entity-tag, where an unquoted hash is not one.
 fn if_match_check(condition: &str, etag: &str) -> IfMatch {
     let quoted = |tag: &str| tag.len() >= 2 && tag.starts_with('"') && tag.ends_with('"');
-    let mut any_valid = false;
+    let mut any_strong = false;
+    let mut any_weak = false;
     for candidate in condition.split(',').map(str::trim) {
         if candidate == "*" || candidate == etag {
             return IfMatch::Match;
         }
-        any_valid |= quoted(candidate.strip_prefix("W/").unwrap_or(candidate));
+        match candidate.strip_prefix("W/") {
+            Some(rest) => any_weak |= quoted(rest),
+            None => any_strong |= quoted(candidate),
+        }
     }
-    if any_valid {
+    if any_strong {
         IfMatch::Stale
+    } else if any_weak {
+        IfMatch::Weak
     } else {
         IfMatch::Malformed
     }

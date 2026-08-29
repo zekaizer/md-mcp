@@ -653,6 +653,10 @@ async fn no_refusal_speaks_another_layers_words() {
         put(addr, "hello.md", "# y\n", Some(stale)).await,
     ));
     answers.push((
+        "weak tag",
+        put(addr, "hello.md", "# y\n", Some("W/\"00\"")).await,
+    ));
+    answers.push((
         "if-match on absent",
         put(addr, "missing.md", "# y\n", Some("*")).await,
     ));
@@ -695,4 +699,69 @@ async fn no_refusal_speaks_another_layers_words() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn every_answer_forbids_transformation() {
+    // A compressing intermediary re-encodes the body and weakens the ETag to
+    // W/"...", which then satisfies no if-match: the bytes and their hash are
+    // this API's contract, so every answer says "hands off" (no-transform).
+    let addr = spawn(None).await;
+    let http = reqwest::Client::new();
+    let tag = current_tag(addr, "hello.md").await;
+
+    let answers = [
+        (
+            "index",
+            http.get(format!("http://{addr}/api/notes"))
+                .send()
+                .await
+                .unwrap(),
+        ),
+        (
+            "note",
+            http.get(format!("http://{addr}/api/notes/hello.md"))
+                .send()
+                .await
+                .unwrap(),
+        ),
+        (
+            "replace",
+            put(addr, "hello.md", "# new\n", Some(&tag)).await,
+        ),
+        ("refusal", put(addr, "hello.md", "# again\n", None).await),
+    ];
+    for (label, response) in answers {
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-transform"),
+            "{label}: one transformed answer is enough to break every \
+             conditional write built on it"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_weak_tag_names_its_cause_instead_of_lying() {
+    let addr = spawn(None).await;
+    let weak = format!("W/{}", current_tag(addr, "hello.md").await);
+
+    let response = put(addr, "hello.md", "# new\n", Some(&weak)).await;
+
+    assert_eq!(
+        response.status(),
+        412,
+        "if-match compares strongly, so a weak tag never satisfies it (RFC 9110)"
+    );
+    let message = response.text().await.unwrap();
+    assert!(
+        message.contains("weak") && !message.contains("changed"),
+        "the note did not change — saying so sends the caller hunting a race \
+         when the real cause is a compressing proxy that weakened the tag: \
+         {message:?}"
+    );
+    assert_ne!(read_back(addr, "hello.md").await, "# new\n");
 }
