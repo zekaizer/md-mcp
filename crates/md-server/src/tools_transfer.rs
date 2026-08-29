@@ -247,7 +247,7 @@ fn recipe(
     ];
     if let Some(directory) = directory {
         recipe.push(format!(
-            "# pull this directory (on refusal the message is in notes.tar, not lost to tar)\n{fetch} -o notes.tar \"{base}?prefix={}\" && mkdir -p {PULL_DIR} && tar -xf notes.tar -C {PULL_DIR}",
+            "# pull this directory. A refusal lands in notes.tar as plain text and stops the extraction, so read it there\n{fetch} -o notes.tar \"{base}?prefix={}\" && mkdir -p {PULL_DIR} && tar -xf notes.tar -C {PULL_DIR}",
             percent_encode(directory)
         ));
     }
@@ -255,7 +255,7 @@ fn recipe(
     // already what the line above fetched.
     if !confined {
         recipe.push(format!(
-            "# the whole vault (past a few dozen notes this is refused until you say you mean it; the refusal says how many there are and how to)\n{fetch} -o notes.tar \"{base}\" && mkdir -p {PULL_DIR} && tar -xf notes.tar -C {PULL_DIR}"
+            "# the whole vault. Past a few dozen notes this is refused until you say you mean it; the refusal lands in notes.tar and says how many there are and how to ask\n{fetch} -o notes.tar \"{base}\" && mkdir -p {PULL_DIR} && tar -xf notes.tar -C {PULL_DIR}"
         ));
     }
     if let Some(note) = note {
@@ -275,7 +275,7 @@ fn recipe(
                 "# stage what you mean to send in {PUSH_DIR} -- NOT {PULL_DIR}, which holds what you just pulled -- then check it\n#    `tar -cf - .` sends whatever the directory holds, so run this before the line below\nmkdir -p {PUSH_DIR} && tar -C {PUSH_DIR} -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}{and}dry_run=true\""
             ));
             recipe.push(format!(
-                "# then make it (add {separator}overwrite=true to replace existing notes; 207 means some entries were refused, and the lines above say which)\ntar -C {PUSH_DIR} -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}\" -w \"\\nHTTP %{{http_code}}\\n\""
+                "# then make it. {separator}overwrite=true replaces existing notes with no version check -- unlike the single-note PUT below, a bulk push cannot ask whether they changed since you read them.\n#    207 means some entries were refused, and the lines above say which\ntar -C {PUSH_DIR} -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}\" -w \"\\nHTTP %{{http_code}}\\n\""
             ));
         }
         if let Some(note) = note {

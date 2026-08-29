@@ -676,22 +676,29 @@ async fn a_pushed_tar_refuses_what_is_not_a_note_and_keeps_the_rest() {
 }
 
 #[tokio::test]
-async fn a_reported_path_can_be_used_as_given() {
+async fn an_absolute_entry_name_is_refused_like_any_other_bad_one() {
     let addr = spawn(None).await;
-    let body = hostile_tar(&[("/absolute.md", "# Abs\n")]);
+    let body = hostile_tar(&[("/etc/pwned.md", "# No\n"), ("ok.md", "# Ok\n")]);
 
-    let report = post_tar(addr, "to=landing", body)
-        .await
-        .text()
-        .await
-        .unwrap();
+    let response = post_tar(addr, "to=landing", body).await;
+    let report = response.text().await.unwrap();
 
+    let refused = report
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|entry| entry["path"].as_str().is_some_and(|p| p.contains("pwned")))
+        .expect("the entry has to be reported one way or the other");
     assert!(
-        !report.contains("//"),
-        "a script feeds the reported path into its next request; a doubled \
-         separator makes that a different path: {report}"
+        refused["error"].is_string() && refused["written"].is_null(),
+        "`..`, a symlink and a non-note are all refused; quietly stripping a \
+         leading slash and writing it anyway is the one malformed name that \
+         succeeds, and it lands a directory nobody asked for: {refused}"
     );
-    assert!(report.contains("landing/absolute.md"), "{report}");
+    assert_eq!(
+        read_back(addr, "landing/ok.md").await,
+        "# Ok\n",
+        "one refused entry must not abandon the rest of the push"
+    );
 }
 
 #[tokio::test]

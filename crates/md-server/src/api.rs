@@ -284,7 +284,13 @@ fn write_entry<R: std::io::Read>(
         .map(|path| path.to_string_lossy().into_owned())
         .map_err(|_| Refusal::bare("unreadable entry path"))?;
     // `tar -C dir -cf - .` names every entry `./…`.
-    let path = prefixed(query.to.as_deref(), name.trim_start_matches("./"));
+    let name = name.trim_start_matches("./");
+    // Judged before it is joined onto anything: an absolute name joined to a
+    // destination reads as an ordinary relative path afterwards, and stripping
+    // the slash instead would make it the one malformed name that succeeds
+    // while `..`, a symlink and a non-note are all refused.
+    Vault::validate_rel(name).map_err(|error| Refusal::at(name, error.message))?;
+    let path = prefixed(query.to.as_deref(), name);
 
     buffer.clear();
     entry
@@ -326,13 +332,8 @@ fn write_entry<R: std::io::Read>(
     Ok(Some(Written { path, replaced }))
 }
 
-/// Join a pushed entry's name onto the destination prefix.
-///
-/// A tar may name an entry absolutely; the jail rejects the escape either way,
-/// but a leading slash left in place doubles up in the reported path, and a
-/// script that feeds that path back into the next request gets a different one.
+/// Join a validated entry name onto the destination prefix.
 fn prefixed(to: Option<&str>, name: &str) -> String {
-    let name = name.trim_start_matches('/');
     let joined = match to {
         Some(to) if !to.trim_matches('/').is_empty() => {
             format!("{}/{name}", to.trim_matches('/'))
