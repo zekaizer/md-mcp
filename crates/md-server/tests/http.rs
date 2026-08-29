@@ -407,3 +407,130 @@ async fn the_grant_can_be_asked_for_with_no_arguments_at_all() {
             .is_some()
     );
 }
+
+/// A grant confined to one directory.
+async fn provision_confined(addr: SocketAddr, write: bool, prefix: &str) -> String {
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header("s3cret"),
+    );
+    let client = serve_client((), transport).await.expect("client handshake");
+    let mut args = serde_json::Map::new();
+    args.insert("write".into(), json!(write));
+    args.insert("prefix".into(), json!(prefix));
+    let result = client
+        .call_tool(CallToolRequestParams::new("provision_transfer").with_arguments(args))
+        .await
+        .expect("call provision_transfer");
+    let grant: Value = result.structured_content.expect("structured content");
+    assert!(
+        grant["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s == &json!(format!("under:{prefix}"))),
+        "the grant must say what it is confined to: {grant}"
+    );
+    let code = grant["code"].as_str().expect("a ticket").to_string();
+    redeem(addr, &code)
+        .await
+        .text()
+        .await
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_confined_grant_cannot_reach_outside_its_directory() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let http = reqwest::Client::new();
+
+    let (full, _) = provision(addr, true).await;
+    assert_eq!(
+        http.put(format!("http://{addr}/api/notes/inbox/one.md"))
+            .bearer_auth(&full)
+            .body("# One\n")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        201
+    );
+
+    let confined = provision_confined(addr, true, "inbox").await;
+
+    assert_eq!(
+        http.get(format!("http://{addr}/api/notes/inbox/one.md"))
+            .bearer_auth(&confined)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "inside its own directory it works normally"
+    );
+    assert_eq!(
+        http.get(format!("http://{addr}/api/notes/hello.md"))
+            .bearer_auth(&confined)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403,
+        "a confined credential is the only thing here that is a boundary rather \
+         than a speed bump"
+    );
+    assert_eq!(
+        http.put(format!("http://{addr}/api/notes/elsewhere.md"))
+            .bearer_auth(&confined)
+            .body("# No\n")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403,
+        "confinement has to hold for writes too"
+    );
+    assert_eq!(
+        http.get(format!("http://{addr}/api/notes?prefix=."))
+            .bearer_auth(&confined)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403,
+        "nor may it ask for a subtree it is outside"
+    );
+}
+
+#[tokio::test]
+async fn a_confined_grant_narrows_an_unqualified_pull_to_itself() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let http = reqwest::Client::new();
+    let (full, _) = provision(addr, true).await;
+    for name in ["inbox/one.md", "inbox/two.md"] {
+        http.put(format!("http://{addr}/api/notes/{name}"))
+            .bearer_auth(&full)
+            .body("# x\n")
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let confined = provision_confined(addr, false, "inbox").await;
+    let response = http
+        .get(format!("http://{addr}/api/notes"))
+        .bearer_auth(&confined)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        200,
+        "a credential that can only see one subtree is already narrowed, so it \
+         has nothing to opt into"
+    );
+    assert_eq!(response.headers()["note-count"], "2");
+}

@@ -83,9 +83,19 @@ We will **not** expose DELETE. Deletion is the one operation whose blast radius
 does not justify a second surface, and `delete_notes` already covers it with
 all-or-nothing batching.
 
-We will attach **scopes** (`notes:read`, `notes:write`) to issued tokens and check
-them per operation. A stored token record without scopes predates this decision
-and means full authority, so sessions that are live at deployment keep working.
+We will attach **scopes** (`notes:read`, `notes:write`, and a directory the
+credential is confined to) to issued tokens and check them per operation. A
+stored token record without scopes predates this decision and means full
+authority over the whole vault, so sessions that are live at deployment keep
+working.
+
+Confinement is the only real boundary here rather than a discouragement: a
+credential that cannot name a subtree cannot reach it however the request is
+phrased, and an unqualified request from a confined credential is narrowed to
+what it can see rather than refused. It bounds accidents, not intent — the
+human's consent at connector authorisation is already vault-wide, and MCP can
+already read every note. Containment compares path segments, never string
+prefixes.
 
 We will surface the API to models through **one MCP tool**, which answers not
 with a credential but with a one-time ticket and the commands that trade it for

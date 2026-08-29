@@ -81,12 +81,17 @@ impl Default for Persisted {
 
 /// What a credential is allowed to do. A token may hold less than the authority
 /// that issued it, never more.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scopes {
     #[serde(default)]
     pub read: bool,
     #[serde(default)]
     pub write: bool,
+    /// The only subtree this credential can reach. `None` is the whole vault —
+    /// which is what every token held before scopes existed, so absence has to
+    /// keep meaning that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
 }
 
 impl Scopes {
@@ -95,7 +100,25 @@ impl Scopes {
         Self {
             read: true,
             write: true,
+            prefix: None,
         }
+    }
+
+    /// Whether this credential may touch `path`. Compared by path segment, not
+    /// by string: `00-inbox-archive` merely starts with `00-inbox` and is a
+    /// different directory.
+    pub fn permits(&self, path: &str) -> bool {
+        let Some(prefix) = self.prefix.as_deref().map(|p| p.trim_matches('/')) else {
+            return true;
+        };
+        if prefix.is_empty() {
+            return true;
+        }
+        let path = path.trim_matches('/');
+        path == prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
     }
 }
 
@@ -191,7 +214,7 @@ impl OAuthState {
             .access
             .get(token)
             .filter(|rec| rec.expires_at > now_secs())
-            .map(|rec| rec.scopes)
+            .map(|rec| rec.scopes.clone())
     }
 
     /// Atomically persist the store (owner-only, temp + rename, creating the state dir).
@@ -982,9 +1005,10 @@ mod tests {
         let reduced = Scopes {
             read: true,
             write: false,
+            prefix: None,
         };
 
-        let token = oauth.mint(reduced, 600, None);
+        let token = oauth.mint(reduced.clone(), 600, None);
 
         assert_ne!(token, "static-token", "a child must not be its parent");
         assert_eq!(
@@ -1039,9 +1063,10 @@ mod tests {
         let granted = Scopes {
             read: true,
             write: false,
+            prefix: None,
         };
 
-        let code = oauth.issue_transfer_code(granted);
+        let code = oauth.issue_transfer_code(granted.clone());
         assert_ne!(code, "", "a ticket has to be something");
 
         let token = oauth
@@ -1088,8 +1113,9 @@ mod tests {
         let granted = Scopes {
             read: true,
             write: true,
+            prefix: None,
         };
-        let first = collect(&oauth, granted);
+        let first = collect(&oauth, granted.clone());
 
         let second = oauth
             .renew_transfer(&first)
@@ -1165,6 +1191,39 @@ mod tests {
     }
 
     #[test]
+    fn a_scoped_credential_reaches_only_its_own_subtree() {
+        let scoped = Scopes {
+            read: true,
+            write: false,
+            prefix: Some("00-inbox".to_string()),
+        };
+
+        assert!(scoped.permits("00-inbox/a.md"));
+        assert!(scoped.permits("00-inbox/deep/b.md"));
+        assert!(
+            scoped.permits("00-inbox"),
+            "the directory itself is inside it"
+        );
+
+        assert!(!scoped.permits("01-projects/a.md"));
+        assert!(
+            !scoped.permits("a.md"),
+            "the vault root is outside a subtree"
+        );
+        assert!(
+            !scoped.permits("00-inbox-archive/a.md"),
+            "a sibling that merely starts with the same letters is outside: \
+             comparing strings rather than path segments is how this leaks"
+        );
+    }
+
+    #[test]
+    fn an_unscoped_credential_reaches_the_whole_vault() {
+        assert!(Scopes::full().permits("anywhere/at/all.md"));
+        assert!(Scopes::full().permits("root.md"));
+    }
+
+    #[test]
     fn the_static_token_holds_full_authority() {
         let dir = tempfile::tempdir().unwrap();
         let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
@@ -1190,6 +1249,7 @@ mod tests {
         let reduced = Scopes {
             read: false,
             write: true,
+            prefix: None,
         };
 
         let oauth = OAuthState::load("static-token".to_string(), file.clone());
@@ -1197,7 +1257,7 @@ mod tests {
             "child-token".to_string(),
             TokenRec {
                 expires_at: now_secs() + 3600,
-                scopes: reduced,
+                scopes: reduced.clone(),
                 not_after: None,
                 client_id: None,
             },
@@ -1208,7 +1268,7 @@ mod tests {
         let reloaded = OAuthState::load("static-token".to_string(), file);
         assert_eq!(
             reloaded.validate_bearer("child-token"),
-            Some(reduced),
+            Some(reduced.clone()),
             "a token minted weaker than its parent must not widen across a restart"
         );
     }

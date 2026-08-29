@@ -29,6 +29,11 @@ pub struct ProvisionTransferRequest {
     /// that only reads cannot damage the vault if it leaks.
     #[serde(default)]
     pub write: bool,
+    /// Confine the credential to one directory. Ask for the narrowest one the
+    /// task needs: a token that cannot reach the rest of the vault cannot take
+    /// or damage it by mistake. Omit only when the task really is vault-wide.
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -84,8 +89,9 @@ impl MdServer {
         let scopes = Scopes {
             read: true,
             write: req.write,
+            prefix: req.prefix.clone(),
         };
-        let code = oauth.issue_transfer_code(scopes);
+        let code = oauth.issue_transfer_code(scopes.clone());
         let root = origin(&parts);
         let base = format!("{root}/api/notes");
         let redeem = format!("{root}/transfer/redeem");
@@ -98,7 +104,13 @@ impl MdServer {
                 &renew,
                 &code,
                 req.write,
-                example_dir(self).await.as_deref(),
+                // A confined credential makes its own directory the example;
+                // anything else in the recipe would be refused as printed.
+                match &req.prefix {
+                    Some(prefix) => Some(prefix.clone()),
+                    None => example_dir(self).await,
+                }
+                .as_deref(),
             ),
             base,
             redeem,
@@ -108,7 +120,7 @@ impl MdServer {
             token_expires_in_seconds: OAuthState::transfer_token_ttl_secs(),
             token_max_lifetime_seconds: OAuthState::transfer_max_lifetime_secs(),
             token_file: TOKEN_FILE.to_string(),
-            scopes: scope_names(scopes),
+            scopes: scope_names(&scopes),
         }))
     }
 }
@@ -138,13 +150,16 @@ fn origin(parts: &Parts) -> String {
     format!("https://{host}")
 }
 
-fn scope_names(scopes: Scopes) -> Vec<String> {
+fn scope_names(scopes: &Scopes) -> Vec<String> {
     let mut names = Vec::new();
     if scopes.read {
         names.push("notes:read".to_string());
     }
     if scopes.write {
         names.push("notes:write".to_string());
+    }
+    if let Some(prefix) = &scopes.prefix {
+        names.push(format!("under:{prefix}"));
     }
     names
 }

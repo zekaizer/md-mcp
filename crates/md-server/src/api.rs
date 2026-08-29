@@ -60,10 +60,14 @@ async fn get_note(
     scopes: Option<Extension<Scopes>>,
     headers: HeaderMap,
 ) -> Response {
-    if !authority(scopes).read {
+    let authority = authority(scopes);
+    if !authority.read {
         return forbidden("notes:read");
     }
     let path = nfc(&path);
+    if !authority.permits(&path) {
+        return outside_grant(&path);
+    }
     let _guard = server.lock().read().await;
     let note = match server.vault().read_note(&path) {
         Ok(note) => note,
@@ -106,7 +110,8 @@ async fn post_collection(
     Query(query): Query<PushQuery>,
     body: Bytes,
 ) -> Response {
-    if !authority(scopes).write {
+    let authority = authority(scopes);
+    if !authority.write {
         return forbidden("notes:write");
     }
 
@@ -169,6 +174,13 @@ async fn post_collection(
             continue;
         }
 
+        if !authority.permits(&path) {
+            report.push_str(&line(serde_json::json!({
+                "path": path,
+                "error": "outside this credential's directory",
+            })));
+            continue;
+        }
         let existed = server.vault().exists(&path).unwrap_or(false);
         if existed && !query.overwrite {
             report.push_str(&line(serde_json::json!({
@@ -293,22 +305,34 @@ async fn get_collection(
     scopes: Option<Extension<Scopes>>,
     Query(query): Query<CollectionQuery>,
 ) -> Response {
-    if !authority(scopes).read {
+    let authority = authority(scopes);
+    if !authority.read {
         return forbidden("notes:read");
     }
+    // A credential confined to one subtree narrows an unqualified request to
+    // what it can see, rather than refusing it: it is already narrowed.
+    let asked = query
+        .prefix
+        .as_deref()
+        .filter(|prefix| !prefix.trim_matches('/').is_empty());
+    if let Some(asked) = asked
+        && !authority.permits(asked)
+    {
+        return outside_grant(asked);
+    }
+    let prefix = asked
+        .map(str::to_owned)
+        .or_else(|| authority.prefix.clone());
+
     // An empty archive and a mistyped prefix look identical to a caller, and
     // one of them means the command they ran did nothing.
-    if let Some(missing) = unknown_prefix(&server, query.prefix.as_deref()).await {
+    if let Some(missing) = unknown_prefix(&server, prefix.as_deref()).await {
         return missing;
     }
     match query.format.as_deref() {
-        Some("index") => index(&server, query.prefix.as_deref()).await,
+        Some("index") => index(&server, prefix.as_deref()).await,
         None | Some("tar") => {
-            let narrowed = query
-                .prefix
-                .as_deref()
-                .is_some_and(|prefix| !prefix.trim_matches('/').is_empty());
-            if !narrowed && !query.all {
+            if prefix.is_none() && !query.all {
                 return (
                     StatusCode::BAD_REQUEST,
                     "this would take the whole vault; pass prefix=<directory> to narrow it, \
@@ -316,7 +340,7 @@ async fn get_collection(
                 )
                     .into_response();
             }
-            tar_of_subtree(&server, query.prefix.as_deref()).await
+            tar_of_subtree(&server, prefix.as_deref()).await
         }
         Some(other) => (
             StatusCode::BAD_REQUEST,
@@ -392,7 +416,8 @@ async fn put_note(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !authority(scopes).write {
+    let authority = authority(scopes);
+    if !authority.write {
         return forbidden("notes:write");
     }
     if body.len() > MAX_WRITE_BYTES {
@@ -409,6 +434,9 @@ async fn put_note(
     // A client filesystem may spell a name decomposed; the vault stores one
     // composed spelling so the same note never lands under two paths (ADR-0028).
     let path = nfc(&path).into_owned();
+    if !authority.permits(&path) {
+        return outside_grant(&path);
+    }
 
     // Held across the read-check-write so a concurrent writer in this process
     // cannot slip between the precondition and the write (ADR-0008).
@@ -508,6 +536,16 @@ fn precondition_required() -> Response {
 
 fn precondition_failed(why: &str) -> Response {
     (StatusCode::PRECONDITION_FAILED, format!("{why}\n")).into_response()
+}
+
+/// Refused for reaching past what the credential was confined to. Distinct
+/// from a missing scope: nothing the caller can pass widens it.
+fn outside_grant(path: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        format!("{path:?} is outside this credential's directory\n"),
+    )
+        .into_response()
 }
 
 fn forbidden(scope: &str) -> Response {
