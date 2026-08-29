@@ -228,8 +228,9 @@ async fn a_wildcard_precondition_on_an_absent_note_is_refused() {
 
     assert_eq!(
         response.status(),
-        412,
-        "`*` asserts the note exists; it must not quietly create one"
+        404,
+        "`*` asserts the note exists, so it must not quietly create one — and \
+         there is no version to disagree about, which is what 412 would claim"
     );
 }
 
@@ -797,5 +798,21 @@ async fn a_refused_credential_says_what_to_do_about_it() {
         "a transfer token lapses in ten minutes, so this is the failure a caller \
          meets most often; answering with an empty body makes it the only one \
          that explains nothing: {message:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_index_states_its_size_the_way_an_archive_does() {
+    let addr = spawn_with_tree().await;
+
+    let response = reqwest::get(format!("http://{addr}/api/notes?format=index"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.headers()["note-count"],
+        "3",
+        "the archive says how many it carries; a caller should not have to \
+         count lines to learn the same thing from the index"
     );
 }

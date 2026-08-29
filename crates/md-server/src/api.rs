@@ -492,7 +492,14 @@ fn index(server: &MdServer, paths: &[String]) -> Response {
         };
         push_line(&mut body, &entry);
     }
-    ([(header::CONTENT_TYPE, NDJSON.to_string())], body).into_response()
+    (
+        [
+            (header::CONTENT_TYPE, NDJSON.to_string()),
+            (NOTE_COUNT, paths.len().to_string()),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// Replace or create one note from the request body, verbatim.
@@ -553,9 +560,16 @@ async fn put_note(
                 return precondition_failed("the note changed since it was read");
             }
         }
-        // `If-Match` asserts a version of something that exists; on an absent
-        // note it fails rather than quietly creating one.
-        (None, Some(_)) => return precondition_failed("no such note to match against"),
+        // `If-Match` asserts a version of something that exists. There is no
+        // version to disagree about here, and 412 would read as "your tag is
+        // stale" and send a caller looking for a fresh one.
+        (None, Some(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("no note at {path:?} to match against\n"),
+            )
+                .into_response();
+        }
         (None, None) => {}
     }
 
