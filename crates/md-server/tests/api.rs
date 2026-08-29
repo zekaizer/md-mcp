@@ -715,3 +715,19 @@ async fn a_push_that_refused_something_does_not_report_success() {
     assert_eq!(read_back(addr, "hello.md").await, NOTE);
     assert_eq!(read_back(addr, "other.md").await, "# O\n");
 }
+
+#[tokio::test]
+async fn a_mistyped_parameter_is_refused_rather_than_ignored() {
+    let addr = spawn_with_tree().await;
+
+    let response = reqwest::get(format!("http://{addr}/api/notes?prefx=inbox"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        400,
+        "silently ignoring it would answer with the whole vault while the \
+         caller believes it narrowed the request"
+    );
+}

@@ -100,6 +100,7 @@ async fn get_note(
 
 /// Where a pushed tar lands, and whether it may replace what is there.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PushQuery {
     #[serde(default)]
     to: Option<String>,
@@ -318,7 +319,12 @@ fn export_failed(path: &str, why: &str) -> Response {
 }
 
 /// What the collection endpoint should answer with, and over what subtree.
+///
+/// Unknown parameters are refused rather than ignored: this API teaches through
+/// its errors, and a silently dropped `prefx=` would take that away exactly
+/// when it is needed.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CollectionQuery {
     #[serde(default)]
     prefix: Option<String>,
