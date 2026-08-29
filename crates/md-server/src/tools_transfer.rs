@@ -180,7 +180,7 @@ fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>)
         ));
     }
     recipe.push(format!(
-        "# many notes: pull the index once, then loop -- its url field is the path already percent-encoded, so it pastes into the URL raw\ncurl -sS --fail-with-body {auth} \"{base}\" | sed -n 's/.*\"url\":\"\\([^\"]*\\)\".*/\\1/p' | while IFS= read -r u; do curl -sS --fail-with-body {auth} --create-dirs -o \"notes/$u\" \"{base}/$u\"; done"
+        "# many notes: pull the index once, then loop -- its url field is the path already percent-encoded, so it pastes into the URL raw;\n#    the printf undoes that encoding so the file lands under the note's real name\ncurl -sS --fail-with-body {auth} \"{base}\" | sed -n 's/.*\"url\":\"\\([^\"]*\\)\".*/\\1/p' | while IFS= read -r u; do curl -sS --fail-with-body {auth} --create-dirs -o \"notes/$(printf '%b' \"$(printf '%s' \"$u\" | sed 's/%/\\\\x/g')\")\" \"{base}/$u\"; done"
     ));
     recipe.push(
         "# deleting and moving are not part of this API: use the delete_notes and move_notes tools"
@@ -310,6 +310,11 @@ mod tests {
                 joined.contains("while IFS= read"),
                 "bulk work has to be discoverable from the recipe alone, as a \
                  loop that runs, not a promise that one exists: {joined}"
+            );
+            assert!(
+                joined.contains("printf '%b'"),
+                "saving under the percent-encoded name leaves a vault of \
+                 %ED%95%9C files; the loop decodes before it lands: {joined}"
             );
         }
     }
