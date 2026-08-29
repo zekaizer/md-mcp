@@ -79,7 +79,7 @@ pub struct ProvisionTransferResponse {
 impl MdServer {
     /// Mint a short-lived, scope-reduced credential for the transfer API.
     #[tool(
-        description = "Open a byte-level HTTP surface for working on note bytes outside model context, and return a one-time ticket with ready-to-run curl commands. The note tools are how work in this vault is normally done; reach for this when a note is too large to pull through context, or a job is repetitive enough that a shell script plainly beats them — rewriting a large note with sed, processing many notes in a loop. It serves an index (path, etag, size per note) and one-note GET/PUT with If-Match; bulk work is those commands in a loop. Useless without shell access. Pass write:true to write back, and prefix to confine the grant to one directory or one note. Deleting and moving are not part of it: use delete_notes and move_notes.",
+        description = "Open a byte-level HTTP surface for working on note bytes outside model context, and return a one-time ticket with ready-to-run curl commands. The note tools are how work in this vault is normally done; reach for this when a note is too large to pull through context, or a job is repetitive enough that a shell script plainly beats them — rewriting a large note with sed, processing many notes in a loop. It serves an index (path, etag, size per note) and one-note GET/PUT with If-Match; bulk work is those commands in a loop. Each PUT rides the vault's per-write auto-commit, the same as a tool write. Useless without shell access. Pass write:true to write back, and prefix to confine the grant to one directory or one note. Deleting and moving are not part of it: use delete_notes and move_notes.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -176,7 +176,8 @@ fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>)
 
     let mut recipe = vec![
         format!(
-            "# 1. run this first: trade the one-time ticket for the token (single use)\ncurl -sSf -X POST -d \"code={code}\" \"{redeem}\" -o {token_file}"
+            "# 1. run this first: trade the one-time ticket for the token (single use).\n#    the token lasts {token_ttl}s and lapses instead of renewing; a lapsed token answers 401 like a wrong one -- provision a fresh ticket\ncurl -sSf -X POST -d \"code={code}\" \"{redeem}\" -o {token_file}",
+            token_ttl = crate::oauth::TRANSFER_TOKEN_TTL_SECS,
         ),
         format!(
             "# 2. the index: every note this grant reaches -- path, etag, size -- one JSON object per line, no content.\n#    etag is blake3 of the note's exact bytes, quoted; recompute it locally (b3sum) to find what changed.\n#    to poll for changes, repeat this GET with if-none-match: <its etag header> -- 304 means nothing did\ncurl -sS --fail-with-body {auth} \"{base}\""
@@ -187,13 +188,17 @@ fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>)
     ];
     if write {
         recipe.push(format!(
-            "# put it back, only if it did not change since you read it (etag from the index or the GET);\n#    to create a note that does not exist yet, send no if-match header at all; if-match: * replaces whatever is there, knowingly.\n#    201 created, 204 replaced -- the reply carries the new etag, so a second edit needs no fresh GET -- 412 it changed underneath you, 428 replacing needs if-match\ncurl -sS -D - {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{target}\""
+            "# put it back, only if it did not change since you read it (etag from the index or the GET);\n#    edit bytes a GET from this surface returned: a put carries frontmatter and body whole, and the note tools' read_notes strips the frontmatter -- putting its output back erases it.\n#    to create a note that does not exist yet, send no if-match header at all; if-match: * replaces whatever is there, knowingly.\n#    201 created, 204 replaced -- the reply carries the new etag, so a second edit needs no fresh GET -- 412 it changed underneath you, 428 replacing needs if-match\ncurl -sS -D - {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{target}\""
         ));
     }
-    recipe.push(format!(
+    // A grant confined to one note has no many-notes case; the loop would be
+    // noise it cannot use.
+    if note.is_none() {
+        recipe.push(format!(
         "# many notes: pull the index once, then fetch in parallel -- sequential outruns the token's TTL on a big vault, and whitespace-split args shred paths; NUL-delimited pairs survive both.\n#    curl is the floor, not the contract -- python or jq parses real JSON instead of this sed, whose naive extraction truncates a name containing a quote or backslash (the url stays authoritative)\ncurl -sS --fail-with-body {auth} \"{base}\" | sed -n 's/.*\"path\":\"\\([^\"]*\\)\".*\"url\":\"\\([^\"]*\\)\".*/\\1\\
 \\2/p' | tr '\\n' '\\0' | xargs -0 -n2 -P8 sh -c 'curl -sS --fail-with-body -H \"authorization: Bearer $(cat {token_file})\" --create-dirs -o \"{pull_dir}/$0\" \"{base}/$1\"'"
-    ));
+        ));
+    }
     recipe.push(
         "# deleting and moving are not part of this API: use the delete_notes and move_notes tools"
             .to_string(),
@@ -261,6 +266,45 @@ mod tests {
     }
 
     #[test]
+    fn a_one_note_grant_carries_no_bulk_loop() {
+        let one = lines(true, Some("00-inbox/a.md")).join("\n");
+        let wide = lines(true, None).join("\n");
+
+        assert!(
+            !one.contains("xargs"),
+            "a grant that reaches one note has no many-notes case; the \
+             parallel-fetch loop is noise it cannot use: {one}"
+        );
+        assert!(
+            wide.contains("xargs"),
+            "a wider grant still gets the loop: {wide}"
+        );
+    }
+
+    #[test]
+    fn a_writing_recipe_says_where_the_bytes_to_put_come_from() {
+        let joined = lines(true, Some("00-inbox/a.md")).join("\n");
+
+        assert!(
+            joined.contains("frontmatter"),
+            "this surface carries frontmatter and body as one byte stream, \
+             read_notes returns the body alone; a recipe that does not say so \
+             teaches a caller to erase frontmatter with a put: {joined}"
+        );
+    }
+
+    #[test]
+    fn the_recipe_says_what_a_lapsed_token_answers() {
+        let joined = lines(false, None).join("\n");
+
+        assert!(
+            joined.contains("401"),
+            "the token lapses by design; a script cannot branch on an expiry \
+             it was never told the status code of: {joined}"
+        );
+    }
+
+    #[test]
     fn a_grant_that_is_one_note_names_that_note() {
         let joined = lines(true, Some("00-inbox/a real note.md")).join("\n");
 
@@ -319,27 +363,25 @@ mod tests {
     }
 
     #[test]
-    fn the_loop_is_taught_whatever_the_grant() {
-        for note in [None, Some("00-inbox/a real note.md")] {
-            let joined = lines(true, note).join("\n");
-            assert!(
-                joined.contains("xargs -0") && joined.contains("-P"),
-                "bulk fetching runs in parallel: sequential outruns the \
-                 token's TTL on a big vault, and whitespace-split xargs \
-                 shreds the 275/300 paths that carry spaces: {joined}"
-            );
-            assert!(
-                joined.contains("\"path\":\"") && joined.contains("\"url\":\""),
-                "the loop takes the note's on-disk name from the index (path) \
-                 and its wire form (url) -- the server holds both, so the \
-                 client decodes nothing: {joined}"
-            );
-            assert!(
-                !joined.contains("%b"),
-                "printf %b \\xNN decoding is a bashism: dash writes the \
-                 escapes into filenames and exits 0 -- silent corruption: {joined}"
-            );
-        }
+    fn the_loop_is_taught_for_any_grant_wider_than_one_note() {
+        let joined = lines(true, None).join("\n");
+        assert!(
+            joined.contains("xargs -0") && joined.contains("-P"),
+            "bulk fetching runs in parallel: sequential outruns the \
+             token's TTL on a big vault, and whitespace-split xargs \
+             shreds the 275/300 paths that carry spaces: {joined}"
+        );
+        assert!(
+            joined.contains("\"path\":\"") && joined.contains("\"url\":\""),
+            "the loop takes the note's on-disk name from the index (path) \
+             and its wire form (url) -- the server holds both, so the \
+             client decodes nothing: {joined}"
+        );
+        assert!(
+            !joined.contains("%b"),
+            "printf %b \\xNN decoding is a bashism: dash writes the \
+             escapes into filenames and exits 0 -- silent corruption: {joined}"
+        );
     }
 
     #[test]
