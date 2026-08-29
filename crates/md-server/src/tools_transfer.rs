@@ -24,12 +24,13 @@ use crate::oauth::{
 /// command, only read back through `$(cat …)`, so it stays out of shell history
 /// and out of `ps`. Named by what it may do and by its ticket, so neither a
 /// second grant nor one of the other mode silently replaces a token still in
-/// use. The ticket is already printed in full in the recipe, so its first
-/// characters name the file without exposing anything new.
+/// use. The name is derived from the ticket by hash, never by prefix: the
+/// ticket is a credential, and a /tmp filename is visible to every local
+/// process — a different audience than the conversation the recipe sits in.
 fn token_file(write: bool, code: &str) -> String {
     let mode = if write { "rw" } else { "ro" };
-    let tag = &code[..8.min(code.len())];
-    format!("/tmp/md-token-{mode}-{tag}")
+    let hash = blake3::hash(code.as_bytes()).to_hex();
+    format!("/tmp/md-token-{mode}-{}", &hash.as_str()[..8])
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -168,7 +169,7 @@ fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>)
             "# 1. run this first: trade the one-time ticket for the token (single use)\ncurl -sSf -X POST -d \"code={code}\" \"{redeem}\" -o {token_file}"
         ),
         format!(
-            "# 2. the index: every note this grant reaches -- path, etag, size -- one JSON object per line, no content.\n#    etag is blake3 of the note's exact bytes, quoted; recompute it locally to find what changed\ncurl -sS --fail-with-body {auth} \"{base}\""
+            "# 2. the index: every note this grant reaches -- path, etag, size -- one JSON object per line, no content.\n#    etag is blake3 of the note's exact bytes, quoted; recompute it locally to find what changed.\n#    to poll for changes, repeat this GET with if-none-match: <its etag header> -- 304 means nothing did\ncurl -sS --fail-with-body {auth} \"{base}\""
         ),
         format!(
             "# one note, verbatim, to a file -- work on it with your tools instead of reading it into context\ncurl -sS --fail-with-body {auth} -o note.md \"{base}/{target}\""
@@ -180,7 +181,8 @@ fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>)
         ));
     }
     recipe.push(format!(
-        "# many notes: pull the index once, then loop. Each line carries the note's on-disk name (path) and its URL form (url), so nothing is decoded client-side.\n#    curl is the floor, not the contract -- this is a REST API, and a client with python or jq parses real JSON instead of this sed,\n#    whose path extraction is naive: a name containing a quote or backslash lands under a truncated filename (the download itself stays correct -- url is authoritative)\ncurl -sS --fail-with-body {auth} \"{base}\" | while IFS= read -r line; do p=$(printf '%s' \"$line\" | sed -n 's/.*\"path\":\"\\([^\"]*\\)\".*/\\1/p'); u=$(printf '%s' \"$line\" | sed -n 's/.*\"url\":\"\\([^\"]*\\)\".*/\\1/p'); [ -n \"$u\" ] && curl -sS --fail-with-body {auth} --create-dirs -o \"notes/$p\" \"{base}/$u\"; done"
+        "# many notes: pull the index once, then fetch in parallel -- sequential outruns the token's TTL on a big vault, and whitespace-split args shred paths; NUL-delimited pairs survive both.\n#    curl is the floor, not the contract -- python or jq parses real JSON instead of this sed, whose naive extraction truncates a name containing a quote or backslash (the url stays authoritative)\ncurl -sS --fail-with-body {auth} \"{base}\" | sed -n 's/.*\"path\":\"\\([^\"]*\\)\".*\"url\":\"\\([^\"]*\\)\".*/\\1\\
+\\2/p' | tr '\\n' '\\0' | xargs -0 -n2 -P8 sh -c 'curl -sS --fail-with-body -H \"authorization: Bearer $(cat {token_file})\" --create-dirs -o \"notes/$0\" \"{base}/$1\"'"
     ));
     recipe.push(
         "# deleting and moving are not part of this API: use the delete_notes and move_notes tools"
@@ -191,7 +193,7 @@ fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>)
 
 #[cfg(test)]
 mod tests {
-    use super::recipe;
+    use super::{recipe, token_file};
 
     fn lines(write: bool, note: Option<&str>) -> Vec<String> {
         recipe(
@@ -307,9 +309,10 @@ mod tests {
         for note in [None, Some("00-inbox/a real note.md")] {
             let joined = lines(true, note).join("\n");
             assert!(
-                joined.contains("while IFS= read"),
-                "bulk work has to be discoverable from the recipe alone, as a \
-                 loop that runs, not a promise that one exists: {joined}"
+                joined.contains("xargs -0") && joined.contains("-P"),
+                "bulk fetching runs in parallel: sequential outruns the \
+                 token's TTL on a big vault, and whitespace-split xargs \
+                 shreds the 275/300 paths that carry spaces: {joined}"
             );
             assert!(
                 joined.contains("\"path\":\"") && joined.contains("\"url\":\""),
@@ -342,6 +345,37 @@ mod tests {
             !joined.contains("tags"),
             "in a notes vault `tags` means frontmatter tags, which this does not \
              return: {joined}"
+        );
+    }
+
+    #[test]
+    fn the_index_teaches_the_cheap_poll() {
+        let joined = lines(false, None).join("\n");
+        assert!(
+            joined.contains("if-none-match") && joined.contains("304"),
+            "the server answers 304 to the tag it served; a recipe that only \
+             teaches local recomputation hides the primitive that makes \
+             polling free: {joined}"
+        );
+    }
+
+    #[test]
+    fn the_token_file_does_not_wear_the_ticket() {
+        let file = token_file(false, "TICKETXYZ1234567890abcdef");
+        assert!(
+            !file.contains("TICKETXY"),
+            "the ticket is a credential and /tmp filenames are visible to \
+             every local process: {file}"
+        );
+        assert_ne!(
+            file,
+            token_file(false, "OTHERTICKET9876543210zyxw"),
+            "two grants must still not share a file"
+        );
+        assert_ne!(
+            file,
+            token_file(true, "TICKETXYZ1234567890abcdef"),
+            "nor may the two modes of one ticket"
         );
     }
 }
