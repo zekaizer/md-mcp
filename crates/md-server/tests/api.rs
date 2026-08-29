@@ -846,3 +846,65 @@ async fn a_dry_run_reports_what_it_would_do_and_does_none_of_it() {
     );
     assert_eq!(read_back(addr, "hello.md").await, NOTE, "nor replaced");
 }
+
+#[tokio::test]
+async fn a_dry_run_refuses_exactly_what_the_real_push_would() {
+    let addr = spawn(None).await;
+    let entries: &[(&str, &str)] = &[("ok.md", "# Ok\n"), ("a.sh", "echo\n")];
+
+    let dry = post_tar(addr, "dry_run=true", tar_of(entries)).await;
+    let dry_status = dry.status();
+    let dry_report = dry.text().await.unwrap();
+
+    let real = post_tar(addr, "", tar_of(entries)).await;
+    let real_status = real.status();
+    let real_report = real.text().await.unwrap();
+
+    assert_eq!(
+        dry_status, real_status,
+        "a check that passes what the push then refuses has no reason to \
+         exist: dry {dry_report} / real {real_report}"
+    );
+    assert!(
+        dry_report.contains("a.sh") && dry_report.contains("error"),
+        "{dry_report}"
+    );
+    assert!(dry_report.contains("ok.md"), "{dry_report}");
+}
+
+#[tokio::test]
+async fn a_traversing_entry_is_refused_by_the_check_too() {
+    let addr = spawn(None).await;
+    let body = hostile_tar(&[("../escape.md", "# No\n")]);
+
+    let report = post_tar(addr, "dry_run=true", body)
+        .await
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        report.contains("error") && !report.contains("would_write"),
+        "reporting that an escaping entry would land is worse than useless: \
+         {report}"
+    );
+}
+
+#[tokio::test]
+async fn a_destination_outside_the_vault_is_refused_outright() {
+    let (addr, root) = spawn_with_root(None).await;
+
+    let response = post_tar(addr, "to=/etc", tar_of(&[("e.md", "# E\n")])).await;
+
+    assert_eq!(
+        response.status(),
+        400,
+        "silently dropping the leading slash lands a top-level `etc/` in the \
+         vault, which one typo away is how a structure grows a directory \
+         nobody chose"
+    );
+    assert!(
+        !root.join("etc").exists(),
+        "and it must not have been created"
+    );
+}

@@ -131,6 +131,22 @@ async fn post_collection(
         return forbidden("notes:write");
     }
 
+    // A destination is a vault-relative directory. Quietly dropping a leading
+    // slash would land a top-level `etc/` in the vault, which is one typo away
+    // from a structure growing a directory nobody chose.
+    if let Some(to) = query.to.as_deref().filter(|to| !to.trim().is_empty())
+        && let Err(error) = md_core::Vault::validate_rel(to)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "destination {to:?} is not a vault directory: {}\n",
+                error.message
+            ),
+        )
+            .into_response();
+    }
+
     let _guard = server.lock().write().await;
     let mut archive = tar::Archive::new(body.as_ref());
     let entries = match archive.entries() {
@@ -283,6 +299,11 @@ fn write_entry<R: std::io::Read>(
     if !authority.permits(&path) {
         return Err(Refusal::at(&path, "outside this credential's directory"));
     }
+    // Asked here rather than left to the write, so a dry run reaches the same
+    // verdict. Traversal, a protected directory and anything that is not a note
+    // are the vault's rules, and a check that passes what the push then refuses
+    // has no reason to exist.
+    Vault::validate_note_rel(&path).map_err(|error| Refusal::at(&path, error.message))?;
 
     let replaced = server.vault().exists(&path).unwrap_or(false);
     if replaced && !query.overwrite {
@@ -296,8 +317,8 @@ fn write_entry<R: std::io::Read>(
     if query.dry_run {
         return Ok(Some(Written { path, replaced }));
     }
-    // Containment is the vault jail's job (ADR-0006): a `..` or an absolute
-    // name in the tar is rejected there, not by string inspection here.
+    // The jail is still the backstop (ADR-0006): the check above is lexical,
+    // and a live symlink escape is the kernel's to refuse.
     server
         .vault()
         .create_note(&path, buffer, true)
