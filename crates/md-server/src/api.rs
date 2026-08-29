@@ -418,11 +418,16 @@ fn entries_under(
     if prefix.is_empty() {
         return listing("");
     }
-    if server.vault().is_dir(prefix).unwrap_or(false) {
-        return listing(prefix);
-    }
-    if !Vault::is_internal_path(prefix) && server.vault().exists(prefix).unwrap_or(false) {
-        return Ok(vec![prefix.to_string()]);
+    // `exists` and `is_dir` answer for protected paths where `read_note` and
+    // `list_entries` hide them, so the check belongs here for both branches —
+    // otherwise `.md-mcp` comes back as an empty archive rather than a refusal.
+    if !Vault::is_internal_path(prefix) {
+        if server.vault().is_dir(prefix).unwrap_or(false) {
+            return listing(prefix);
+        }
+        if server.vault().exists(prefix).unwrap_or(false) {
+            return Ok(vec![prefix.to_string()]);
+        }
     }
     Err((
         StatusCode::NOT_FOUND,

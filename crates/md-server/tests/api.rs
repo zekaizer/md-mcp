@@ -731,3 +731,21 @@ async fn a_mistyped_parameter_is_refused_rather_than_ignored() {
          caller believes it narrowed the request"
     );
 }
+
+#[tokio::test]
+async fn a_protected_directory_is_not_a_prefix() {
+    let (addr, root) = spawn_with_root(None).await;
+    std::fs::create_dir_all(root.join(".md-mcp")).unwrap();
+
+    let response = reqwest::get(format!("http://{addr}/api/notes?prefix=.md-mcp"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        404,
+        "answering 200 with an empty archive is exactly the confusion this \
+         endpoint refuses everywhere else: the caller cannot tell a directory \
+         it may not have from one that is empty"
+    );
+}
