@@ -637,3 +637,39 @@ async fn the_index_is_never_gated_however_large_the_vault() {
     );
     assert_eq!(response.text().await.unwrap().lines().count(), 61);
 }
+
+#[tokio::test]
+async fn the_vault_stays_markdown() {
+    let addr = spawn(None).await;
+
+    let response = put(addr, "script.sh", "echo hi\n", None).await;
+
+    assert_eq!(
+        response.status(),
+        400,
+        "a file the listing will never show is a ghost: writable, readable by \
+         path, and invisible to every pull, so a round trip silently drops it"
+    );
+    assert_eq!(
+        reqwest::get(format!("http://{addr}/api/notes/script.sh"))
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+}
+
+#[tokio::test]
+async fn a_pushed_tar_refuses_what_is_not_a_note_and_keeps_the_rest() {
+    let addr = spawn(None).await;
+    let body = tar_of(&[("keep.md", "# Keep\n"), ("evil.sh", "echo hi\n")]);
+
+    let response = post_tar(addr, "", body).await;
+    let report = response.text().await.unwrap();
+
+    assert!(
+        report.contains("evil.sh") && report.contains("error"),
+        "{report}"
+    );
+    assert_eq!(read_back(addr, "keep.md").await, "# Keep\n");
+}

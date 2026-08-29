@@ -190,6 +190,13 @@ async fn post_collection(
             })));
             continue;
         }
+        if not_a_note(&path).is_some() {
+            report.push_str(&line(serde_json::json!({
+                "path": path,
+                "error": "not a Markdown note; this vault holds only .md files",
+            })));
+            continue;
+        }
         let existed = server.vault().exists(&path).unwrap_or(false);
         if existed && !query.overwrite {
             report.push_str(&line(serde_json::json!({
@@ -452,6 +459,9 @@ async fn put_note(
     if !authority.permits(&path) {
         return outside_grant(&path);
     }
+    if let Some(refusal) = not_a_note(&path) {
+        return refusal;
+    }
 
     // Held across the read-check-write so a concurrent writer in this process
     // cannot slip between the precondition and the write (ADR-0008).
@@ -551,6 +561,25 @@ fn precondition_required() -> Response {
 
 fn precondition_failed(why: &str) -> Response {
     (StatusCode::PRECONDITION_FAILED, format!("{why}\n")).into_response()
+}
+
+/// The vault holds Markdown and nothing else. A file the listing will never
+/// show is a ghost — writable and readable by path, invisible to every pull —
+/// so a pull-and-push round trip would silently drop it.
+fn not_a_note(path: &str) -> Option<Response> {
+    if std::path::Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+    {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            format!("{path:?} is not a Markdown note; this vault holds only .md files\n"),
+        )
+            .into_response(),
+    )
 }
 
 /// Refused for reaching past what the credential was confined to. Distinct
