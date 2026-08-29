@@ -40,6 +40,8 @@ pub enum Code {
     FrontmatterParse,
     /// A single write payload exceeds the server's per-item size limit.
     TooLarge,
+    /// A note body that is not valid UTF-8 text.
+    Encoding,
     /// An unexpected I/O failure.
     Io,
 }
@@ -64,6 +66,7 @@ impl Code {
             Code::Traversal => "TRAVERSAL",
             Code::FrontmatterParse => "FRONTMATTER_PARSE",
             Code::TooLarge => "TOO_LARGE",
+            Code::Encoding => "ENCODING",
             Code::Io => "IO",
         }
     }

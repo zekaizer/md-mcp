@@ -273,6 +273,12 @@ impl Vault {
                 | std::io::ErrorKind::NotADirectory => {
                     Error::not_found(format!("note not found: {rel}"))
                 }
+                // Written by another client and synced in; this vault's own
+                // writes refuse such bytes at the door.
+                std::io::ErrorKind::InvalidData => Error::new(
+                    Code::Encoding,
+                    format!("note {rel} is not valid UTF-8 text"),
+                ),
                 _ => Error::io(format!("read {rel}: {e}")),
             })
     }
@@ -366,6 +372,18 @@ impl Vault {
     /// occupied and is refused.
     pub fn create_note(&self, rel: &str, bytes: &[u8], overwrite: bool) -> Result<()> {
         Self::validate_note_rel(rel)?;
+        // A note is UTF-8 text by the vault's law. Refused at the write, or a
+        // byte-level client could land a note this vault can neither read nor
+        // replace afterwards.
+        if let Err(e) = std::str::from_utf8(bytes) {
+            return Err(Error::new(
+                Code::Encoding,
+                format!(
+                    "a note is UTF-8 text; this body is not, from byte {}",
+                    e.valid_up_to()
+                ),
+            ));
+        }
         let clean = self.resolve_rel(rel)?;
         if !overwrite && self.root.symlink_metadata(&clean).is_ok() {
             return Err(Error::conflict(format!("note already exists: {rel}")));
@@ -390,6 +408,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
         assert!(Vault::open(&missing).is_err());
+    }
+
+    #[test]
+    fn a_note_body_must_be_utf8_and_a_refused_one_leaves_nothing() {
+        let (_dir, vault) = temp_vault();
+        let err = vault.create_note("a.md", &[0xff, 0xfe], true).unwrap_err();
+        assert_eq!(err.code, Code::Encoding);
+        assert!(
+            !vault.exists("a.md").unwrap(),
+            "a refused body must not land"
+        );
+    }
+
+    #[test]
+    fn foreign_invalid_bytes_read_as_encoding_not_raw_io() {
+        // Another client can sync such a file in; this vault never writes one.
+        let (dir, vault) = temp_vault();
+        std::fs::write(dir.path().join("legacy.md"), [0xffu8, 0xfe]).unwrap();
+        let err = vault.read_note("legacy.md").unwrap_err();
+        assert_eq!(err.code, Code::Encoding);
+        assert!(
+            !err.message.contains("stream did not contain"),
+            "the io layer's words are not an answer: {}",
+            err.message
+        );
     }
 
     // --- traversal corpus ---------------------------------------------------
