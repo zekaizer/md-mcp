@@ -816,3 +816,33 @@ async fn the_index_states_its_size_the_way_an_archive_does() {
          count lines to learn the same thing from the index"
     );
 }
+
+#[tokio::test]
+async fn a_dry_run_reports_what_it_would_do_and_does_none_of_it() {
+    let addr = spawn(None).await;
+    let body = tar_of(&[("fresh.md", "# F\n"), ("hello.md", "# clobber\n")]);
+
+    let response = post_tar(addr, "dry_run=true&overwrite=true", body).await;
+
+    assert_eq!(response.status(), 200);
+    let report = response.text().await.unwrap();
+    assert!(
+        report.contains("would_write") && !report.contains("\"written\""),
+        "a caller checking a push before making it needs the same per-entry \
+         answer, marked as not having happened: {report}"
+    );
+    assert!(
+        report.contains("fresh.md") && report.contains("hello.md"),
+        "{report}"
+    );
+
+    assert_eq!(
+        reqwest::get(format!("http://{addr}/api/notes/fresh.md"))
+            .await
+            .unwrap()
+            .status(),
+        404,
+        "nothing may be created by a run that only reports"
+    );
+    assert_eq!(read_back(addr, "hello.md").await, NOTE, "nor replaced");
+}

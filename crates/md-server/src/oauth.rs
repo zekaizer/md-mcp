@@ -34,9 +34,11 @@ const ACCESS_TTL_SECS: u64 = 60 * 60;
 const REFRESH_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 /// Authorization codes are single-use and short-lived.
 const CODE_TTL_SECS: u64 = 5 * 60;
-/// A transfer code is redeemed in the same turn it is handed out, so it lapses
-/// fast: what it leaves behind in a conversation transcript is dead text.
-pub(crate) const TRANSFER_CODE_TTL_SECS: u64 = 120;
+/// A transfer ticket is usually redeemed in the same turn it is handed out, so
+/// it lapses fast and what it leaves in a conversation transcript is dead text.
+/// Long enough, though, that a person reading the answer before running it is
+/// not racing a clock.
+pub(crate) const TRANSFER_CODE_TTL_SECS: u64 = 300;
 /// How long a transfer token stays usable without being renewed. Short, so a
 /// token forgotten in a sandbox stops mattering quickly.
 pub(crate) const TRANSFER_TOKEN_TTL_SECS: u64 = 10 * 60;

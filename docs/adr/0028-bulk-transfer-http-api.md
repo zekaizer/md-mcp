@@ -85,7 +85,13 @@ the OAuth endpoints at the default.
 
 We will **not** expose DELETE. Deletion is the one operation whose blast radius
 does not justify a second surface, and `delete_notes` already covers it with
-all-or-nothing batching.
+all-or-nothing batching. The tool that opens this API says so, since a caller
+told to work in scripts will otherwise discover the gap by meeting a 405.
+
+A bulk push will accept `dry_run=true` and answer with the same per-entry report
+having written nothing. `tar -cf - .` carries whatever a directory happens to
+hold rather than what the caller meant to send, and a push is the one operation
+here that cannot be undone by repeating it.
 
 We will attach **scopes** (`notes:read`, `notes:write`, and a directory the
 credential is confined to) to issued tokens and check them per operation. A

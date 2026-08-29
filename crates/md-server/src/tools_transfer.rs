@@ -85,7 +85,7 @@ pub struct ProvisionTransferResponse {
 impl MdServer {
     /// Mint a short-lived, scope-reduced credential for the transfer API.
     #[tool(
-        description = "Open the bulk-transfer HTTP API and return a short-lived token with ready-to-run curl commands. Use this instead of reading or writing notes one at a time when you need to move many notes, or to process notes with scripts rather than pulling their content into context. Requires shell access to be of any use. Pass write:true to push notes back.",
+        description = "Open the bulk-transfer HTTP API and return a one-time ticket with ready-to-run curl commands. Use this instead of reading or writing notes one at a time when you need to move many notes, or to process notes with scripts rather than pulling their content into context. Requires shell access to be of any use. Pass write:true to push notes back, and prefix to confine the grant to one directory or note. It reads, creates and replaces notes; deleting is not part of it, so use delete_notes for that.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -252,8 +252,12 @@ fn recipe(
             let destination =
                 directory.map_or_else(String::new, |dir| format!("?to={}", percent_encode(dir)));
             let separator = if destination.is_empty() { "?" } else { "&" };
+            let and = if destination.is_empty() { "?" } else { "&" };
             recipe.push(format!(
-                "# push a directory (add {separator}overwrite=true to replace existing notes; 207 means some entries were refused, and the lines above say which)\ntar -C ./vault -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}\" -w \"\\nHTTP %{{http_code}}\\n\""
+                "# check the push first -- `tar -cf - .` sends whatever the directory holds, not only what you meant\ntar -C ./vault -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}{and}dry_run=true\""
+            ));
+            recipe.push(format!(
+                "# then make it (add {separator}overwrite=true to replace existing notes; 207 means some entries were refused, and the lines above say which)\ntar -C ./vault -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}\" -w \"\\nHTTP %{{http_code}}\\n\""
             ));
         }
         if let Some(note) = note {

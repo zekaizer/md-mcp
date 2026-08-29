@@ -109,6 +109,11 @@ struct PushQuery {
     /// replacing has to be said out loud the way `If-Match: *` says it.
     #[serde(default)]
     overwrite: bool,
+    /// Report what the push would do and write none of it. `tar -cf - .` takes
+    /// whatever the directory happens to hold, which is not always what the
+    /// caller meant to send.
+    #[serde(default)]
+    dry_run: bool,
 }
 
 /// Write every note in a tar, reporting one line per entry.
@@ -149,19 +154,30 @@ async fn post_collection(
             Ok(None) => {}
             Ok(Some(written)) => {
                 let path = written.path;
-                ops.push(if written.replaced {
-                    EventOp::Write { path: path.clone() }
+                if query.dry_run {
+                    push_line(
+                        &mut report,
+                        &serde_json::json!({
+                            "path": path,
+                            "would_write": true,
+                            "replaced": written.replaced,
+                        }),
+                    );
                 } else {
-                    EventOp::Create { path: path.clone() }
-                });
-                push_line(
-                    &mut report,
-                    &serde_json::json!({
-                        "path": path,
-                        "written": true,
-                        "replaced": written.replaced,
-                    }),
-                );
+                    ops.push(if written.replaced {
+                        EventOp::Write { path: path.clone() }
+                    } else {
+                        EventOp::Create { path: path.clone() }
+                    });
+                    push_line(
+                        &mut report,
+                        &serde_json::json!({
+                            "path": path,
+                            "written": true,
+                            "replaced": written.replaced,
+                        }),
+                    );
+                }
             }
             Err(refusal) => {
                 refused += 1;
@@ -277,6 +293,11 @@ fn write_entry<R: std::io::Read>(
             &path,
             "note exists; pass overwrite=true to replace it",
         ));
+    }
+    // Everything that could refuse this entry has now spoken, so a dry run can
+    // report the same answer without making it true.
+    if query.dry_run {
+        return Ok(Some(Written { path, replaced }));
     }
     // Containment is the vault jail's job (ADR-0006): a `..` or an absolute
     // name in the tar is rejected there, not by string inspection here.
