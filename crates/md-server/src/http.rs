@@ -250,6 +250,12 @@ const ACCESS_SNIFF_MAX: usize = 256 * 1024;
 async fn access_log(request: Request, next: Next) -> Response {
     let started = std::time::Instant::now();
     let http_method = request.method().clone();
+    // Path and query only: the bodies that carry secrets (a ticket, a bearer)
+    // never put them here.
+    let target = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_string(), ToString::to_string);
 
     let (parts, body) = request.into_parts();
     let content_length = parts
@@ -278,8 +284,14 @@ async fn access_log(request: Request, next: Next) -> Response {
     let (rpc, tool) = call.map_or((None, None), |(rpc, tool)| (Some(rpc), tool));
     let meta = AccessMeta {
         method: http_method,
+        path: target,
         rpc,
         tool,
+        notes: response
+            .headers()
+            .get("note-count")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
         status: response.status().as_u16(),
         started,
     };
@@ -303,8 +315,14 @@ async fn access_log(request: Request, next: Next) -> Response {
 /// The access-log fields captured up front, emitted once at end-of-stream.
 struct AccessMeta {
     method: axum::http::Method,
+    /// Path and query. `/mcp` carries neither, but a transfer request says what
+    /// it reached for right here, and a whole-vault pull is otherwise
+    /// indistinguishable from fetching one note.
+    path: String,
     rpc: Option<String>,
     tool: Option<String>,
+    /// How many notes a transfer carried, from the response's own header.
+    notes: Option<String>,
     status: u16,
     started: std::time::Instant,
 }
@@ -315,8 +333,10 @@ impl AccessMeta {
         tracing::info!(
             target: "md_server::access",
             method = %self.method,
+            path = %self.path,
             rpc = self.rpc.as_deref(),
             tool = self.tool.as_deref(),
+            notes = self.notes.as_deref(),
             status = self.status,
             duration_ms,
             outcome,
