@@ -98,7 +98,7 @@ pub struct ProvisionTransferResponse {
 impl MdServer {
     /// Mint a short-lived, scope-reduced credential for the transfer API.
     #[tool(
-        description = "Open the bulk-transfer HTTP API and return a one-time ticket with ready-to-run curl commands. Use this instead of reading or writing notes one at a time when you need to move many notes, or to process notes with scripts rather than pulling their content into context. Requires shell access to be of any use. Pass write:true to push notes back, and prefix to confine the grant to one directory or note. It reads, creates and replaces notes; deleting is not part of it, so use delete_notes for that.",
+        description = "Open an HTTP surface for bulk note transfer and return a one-time ticket with ready-to-run curl commands. The note tools are how work in this vault is normally done; reach for this only when the job is bulky or repetitive enough that a shell would plainly beat them — importing a directory, rewriting hundreds of notes with a script, or moving content that has no reason to pass through context. Useless without shell access. Pass write:true to push notes back, and prefix to confine the grant to one directory or one note. It reads, creates and replaces notes; deleting is not part of it, so use delete_notes for that.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,

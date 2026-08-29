@@ -126,6 +126,13 @@ connector authorisation is already vault-wide, and MCP can already read every
 note. Containment compares path segments, never string
 prefixes.
 
+This surface is an accelerator, not a replacement. The note tools remain how
+work in the vault is normally done, and both the tool's description and the
+server instructions say so: the cost of provisioning, redeeming and shelling
+out is only worth paying when the job is bulky or repetitive enough that a shell
+plainly beats them. A model that reaches here for three notes has spent more
+than it saved.
+
 We will surface the API to models through **one MCP tool**, which answers not
 with a credential but with a one-time ticket and the commands that trade it for
 one. A token named in a tool's answer sits in the conversation for as long as

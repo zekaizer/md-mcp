@@ -39,9 +39,11 @@ const CODE_TTL_SECS: u64 = 5 * 60;
 /// Long enough, though, that a person reading the answer before running it is
 /// not racing a clock.
 pub(crate) const TRANSFER_CODE_TTL_SECS: u64 = 300;
-/// How long a transfer token stays usable without being renewed. Short, so a
-/// token forgotten in a sandbox stops mattering quickly.
-pub(crate) const TRANSFER_TOKEN_TTL_SECS: u64 = 10 * 60;
+/// How long a transfer token stays usable without being renewed. Short enough
+/// that one forgotten in a sandbox stops mattering, long enough to survive the
+/// local work between fetching a vault and pushing it back — renewal needs a
+/// live token, so a lapse mid-script cannot be repaired from the script.
+pub(crate) const TRANSFER_TOKEN_TTL_SECS: u64 = 30 * 60;
 /// The ceiling a renewal chain cannot pass, counted from the first token. A
 /// sliding window with no ceiling is a permanent credential wearing a disguise.
 pub(crate) const TRANSFER_MAX_LIFETIME_SECS: u64 = 60 * 60;

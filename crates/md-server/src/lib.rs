@@ -316,10 +316,10 @@ impl ServerHandler for MdServer {
              Address notes by vault-relative path. Notes over ~10 KB (size_bytes in \
              list_notes) are cheaper section-wise: read_outlines first, then \
              read_sections for the sections you need; read smaller notes whole via \
-             read_notes. Destructive batches are all-or-nothing. To move many \
-             notes at once, or to process notes with scripts instead of pulling \
-             their content into context, call provision_transfer rather than \
-             reading and writing them one at a time."
+             read_notes. Destructive batches are all-or-nothing. These tools are \
+             how work here is normally done; when a job is bulky or repetitive \
+             enough that a shell would plainly beat them, provision_transfer \
+             opens an HTTP surface for that instead."
         )
         .to_string();
         if let Some(intro) = &self.intro_note {
