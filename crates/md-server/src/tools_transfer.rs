@@ -180,7 +180,7 @@ fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>)
         ));
     }
     recipe.push(format!(
-        "# many notes: pull the index once, then loop. Each line carries the note's on-disk name (path) and its URL form (url), so nothing is decoded client-side\ncurl -sS --fail-with-body {auth} \"{base}\" | while IFS= read -r line; do p=$(printf '%s' \"$line\" | sed -n 's/.*\"path\":\"\\([^\"]*\\)\".*/\\1/p'); u=$(printf '%s' \"$line\" | sed -n 's/.*\"url\":\"\\([^\"]*\\)\".*/\\1/p'); [ -n \"$u\" ] && curl -sS --fail-with-body {auth} --create-dirs -o \"notes/$p\" \"{base}/$u\"; done"
+        "# many notes: pull the index once, then loop. Each line carries the note's on-disk name (path) and its URL form (url), so nothing is decoded client-side.\n#    curl is the floor, not the contract -- this is a REST API, and a client with python or jq parses real JSON instead of this sed,\n#    whose path extraction is naive: a name containing a quote or backslash lands under a truncated filename (the download itself stays correct -- url is authoritative)\ncurl -sS --fail-with-body {auth} \"{base}\" | while IFS= read -r line; do p=$(printf '%s' \"$line\" | sed -n 's/.*\"path\":\"\\([^\"]*\\)\".*/\\1/p'); u=$(printf '%s' \"$line\" | sed -n 's/.*\"url\":\"\\([^\"]*\\)\".*/\\1/p'); [ -n \"$u\" ] && curl -sS --fail-with-body {auth} --create-dirs -o \"notes/$p\" \"{base}/$u\"; done"
     ));
     recipe.push(
         "# deleting and moving are not part of this API: use the delete_notes and move_notes tools"
