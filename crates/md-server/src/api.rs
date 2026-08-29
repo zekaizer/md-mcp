@@ -7,7 +7,8 @@
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::http::Uri;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -91,14 +92,6 @@ fn push_line(report: &mut String, value: &serde_json::Value) {
     let _ = writeln!(report, "{value}");
 }
 
-/// Nothing a caller can pass: the grant already decides what the index
-/// covers. An unknown parameter is refused rather than ignored — this API
-/// teaches through its errors, and a silently dropped `prefx=` would take
-/// that away exactly when it is needed.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NoQuery {}
-
 /// The collection is its index: every note this credential reaches — path,
 /// entity tag and size, one JSON object per line, no content. Bulk transfer
 /// is the single-note endpoints in a loop over these paths (ADR-0028), so
@@ -106,8 +99,19 @@ struct NoQuery {}
 async fn get_collection(
     State(server): State<MdServer>,
     scopes: Option<Extension<Scopes>>,
-    Query(NoQuery {}): Query<NoQuery>,
+    uri: Uri,
 ) -> Response {
+    // Nothing a caller can pass: the grant already decides what the index
+    // covers. A parameter is refused in this API's words, not serde's — it
+    // teaches through its errors, and a silently dropped `prefx=` would take
+    // that away exactly when it is needed.
+    if uri.query().is_some_and(|q| !q.is_empty()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "the index takes no parameters; the grant already decides what it covers\n",
+        )
+            .into_response();
+    }
     let authority = authority(scopes);
     if !authority.read {
         return forbidden("notes:read");
@@ -121,13 +125,15 @@ async fn get_collection(
     }
 }
 
-/// The note paths a credential covers, or why there are none to speak of. An
-/// empty index and a mistyped confinement look identical to a caller, and one
-/// of them means every request they are about to loop over will do nothing.
+/// The note paths a credential covers today. A confinement that matches
+/// nothing yet — a directory the writing grant is about to create — is an
+/// empty universe, and the truthful index of an empty universe is the empty
+/// one, not a refusal that kills the caller's pipeline on its first line.
 ///
 /// A prefix may name one note rather than a directory: the narrowest useful
 /// grant is a single note, and a credential confined to one still has a
-/// collection — it is that note.
+/// collection — it is that note. A protected prefix also answers empty, which
+/// tells whoever holds such a grant nothing about what the server keeps there.
 fn entries_under(
     server: &MdServer,
     prefix: Option<&str>,
@@ -144,9 +150,6 @@ fn entries_under(
     if prefix.is_empty() {
         return listing("");
     }
-    // `exists` and `is_dir` answer for protected paths where `read_note` and
-    // `list_entries` hide them, so the check belongs here for both branches —
-    // otherwise `.md-mcp` comes back as an empty archive rather than a refusal.
     if !Vault::is_internal_path(prefix) {
         if server.vault().is_dir(prefix).unwrap_or(false) {
             return listing(prefix);
@@ -155,10 +158,7 @@ fn entries_under(
             return Ok(vec![prefix.to_string()]);
         }
     }
-    Err((
-        StatusCode::NOT_FOUND,
-        format!("nothing at {prefix:?} in this vault\n"),
-    ))
+    Ok(Vec::new())
 }
 
 /// Every note's path, entity tag and size, without its content — so a caller
