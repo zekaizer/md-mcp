@@ -36,4 +36,4 @@ immutable; a changed decision supersedes the old one with a new ADR.
 - [0025](0025-insertion-placement.md) — Insertion placement follows authoring intent
 - [0026](0026-outline-addressing-and-text-encoding.md) — Outline addressing and text encoding
 - [0027](0027-literal-text-replacement.md) — Literal text replacement
-- [0028](0028-bulk-transfer-http-api.md) — Bulk note transfer over a byte-level HTTP API
+- [0028](0028-byte-level-note-api.md) — Byte-level note I/O over HTTP

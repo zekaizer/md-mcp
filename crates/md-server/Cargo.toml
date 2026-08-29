@@ -22,7 +22,6 @@ rmcp = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tar.workspace = true
 url.workspace = true
 # `process` + `time` drive the commit hook and git automation (ADR-0017/0018);
 # `sync` is the hook queue channel.
@@ -34,7 +33,6 @@ clap.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tar.workspace = true
 # Derives the decomposed-name fixture for the transfer API's NFC test.
 unicode-normalization.workspace = true
 # Client side for the in-process e2e test; the reqwest streamable-http client +

@@ -1,4 +1,4 @@
-//! The byte-level transfer API (ADR-0028), driven over real HTTP.
+//! The byte-level note I/O API (ADR-0028), driven over real HTTP.
 
 use std::net::SocketAddr;
 
@@ -269,8 +269,8 @@ async fn spawn_with_tree() -> SocketAddr {
     addr
 }
 
-async fn index_lines(addr: SocketAddr, query: &str) -> Vec<serde_json::Value> {
-    let body = reqwest::get(format!("http://{addr}/api/notes?{query}"))
+async fn index_lines(addr: SocketAddr) -> Vec<serde_json::Value> {
+    let body = reqwest::get(format!("http://{addr}/api/notes"))
         .await
         .unwrap()
         .text()
@@ -284,7 +284,7 @@ async fn index_lines(addr: SocketAddr, query: &str) -> Vec<serde_json::Value> {
 #[tokio::test]
 async fn the_index_names_every_note_with_its_tag_and_size() {
     let addr = spawn_with_tree().await;
-    let entries = index_lines(addr, "format=index").await;
+    let entries = index_lines(addr).await;
 
     let paths: Vec<&str> = entries
         .iter()
@@ -301,20 +301,27 @@ async fn the_index_names_every_note_with_its_tag_and_size() {
 }
 
 #[tokio::test]
-async fn a_prefix_narrows_the_index() {
+async fn a_query_parameter_is_refused_rather_than_ignored() {
     let addr = spawn_with_tree().await;
-    let paths: Vec<String> = index_lines(addr, "format=index&prefix=inbox")
-        .await
-        .iter()
-        .map(|e| e["path"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(paths, ["inbox/one.md", "inbox/two.md"]);
+
+    for query in ["prefix=inbox", "format=index", "confirm=true", "prefx=x"] {
+        let response = reqwest::get(format!("http://{addr}/api/notes?{query}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            400,
+            "the index takes no parameters; this API teaches through its \
+             errors, and silently ignoring {query:?} would take that away \
+             exactly when it is needed"
+        );
+    }
 }
 
 #[tokio::test]
 async fn an_indexed_tag_is_the_one_the_note_endpoint_serves() {
     let addr = spawn_with_tree().await;
-    let entries = index_lines(addr, "format=index").await;
+    let entries = index_lines(addr).await;
     let indexed = entries.iter().find(|e| e["path"] == "hello.md").unwrap()["etag"]
         .as_str()
         .unwrap()
@@ -325,322 +332,6 @@ async fn an_indexed_tag_is_the_one_the_note_endpoint_serves() {
         current_tag(addr, "hello.md").await,
         "an index whose tags cannot be replayed as If-Match is useless for sync"
     );
-}
-
-#[tokio::test]
-async fn an_unsupported_collection_format_is_refused() {
-    let addr = spawn(None).await;
-    let response = reqwest::get(format!("http://{addr}/api/notes?format=zip"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 400);
-}
-
-/// Build a tar holding `(path, body)` pairs, as `tar -cf -` would.
-fn tar_of(files: &[(&str, &str)]) -> Vec<u8> {
-    let mut builder = tar::Builder::new(Vec::new());
-    for (path, body) in files {
-        let mut header = tar::Header::new_gnu();
-        header.set_size(body.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, path, body.as_bytes())
-            .unwrap();
-    }
-    builder.into_inner().unwrap()
-}
-
-/// Every regular file in a tar, as `(path, body)`.
-fn untar(bytes: &[u8]) -> Vec<(String, String)> {
-    let mut archive = tar::Archive::new(bytes);
-    archive
-        .entries()
-        .unwrap()
-        .map(|entry| {
-            let mut entry = entry.unwrap();
-            let path = entry.path().unwrap().to_string_lossy().into_owned();
-            let mut body = String::new();
-            std::io::Read::read_to_string(&mut entry, &mut body).unwrap();
-            (path, body)
-        })
-        .collect()
-}
-
-async fn post_tar(addr: SocketAddr, query: &str, body: Vec<u8>) -> reqwest::Response {
-    reqwest::Client::new()
-        .post(format!("http://{addr}/api/notes?{query}"))
-        .body(body)
-        .send()
-        .await
-        .unwrap()
-}
-
-#[tokio::test]
-async fn a_subtree_is_served_as_one_tar() {
-    let addr = spawn_with_tree().await;
-    let response = reqwest::get(format!("http://{addr}/api/notes?prefix=inbox"))
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), 200);
-    assert_eq!(
-        response.headers()["content-type"],
-        "application/x-tar",
-        "a client pipes this straight into `tar -xf -`"
-    );
-    let files = untar(&response.bytes().await.unwrap());
-    assert_eq!(
-        files,
-        vec![
-            ("inbox/one.md".to_string(), "# One\n".to_string()),
-            ("inbox/two.md".to_string(), "# Two\n".to_string()),
-        ]
-    );
-}
-
-#[tokio::test]
-async fn a_posted_tar_creates_every_note_in_one_round_trip() {
-    let addr = spawn(None).await;
-    let body = tar_of(&[("a.md", "# A\n"), ("b.md", "# B\n")]);
-
-    let response = post_tar(addr, "to=imported", body).await;
-
-    assert_eq!(response.status(), 200);
-    assert_eq!(read_back(addr, "imported/a.md").await, "# A\n");
-    assert_eq!(read_back(addr, "imported/b.md").await, "# B\n");
-}
-
-#[tokio::test]
-async fn a_posted_tar_does_not_clobber_by_default() {
-    let addr = spawn(None).await;
-    let body = tar_of(&[("hello.md", "clobbered\n")]);
-
-    let response = post_tar(addr, "", body).await;
-
-    assert_eq!(
-        response.status(),
-        422,
-        "the only entry was refused, so nothing landed at all"
-    );
-    let report = response.text().await.unwrap();
-    assert!(
-        report.contains("hello.md") && report.contains("error"),
-        "the untouched note has to be reported, not silently skipped: {report}"
-    );
-    assert_eq!(read_back(addr, "hello.md").await, NOTE);
-}
-
-#[tokio::test]
-async fn a_posted_tar_replaces_when_told_to() {
-    let addr = spawn(None).await;
-    let body = tar_of(&[("hello.md", "# Deliberate\n")]);
-
-    let response = post_tar(addr, "overwrite=true", body).await;
-
-    assert_eq!(response.status(), 200);
-    assert_eq!(read_back(addr, "hello.md").await, "# Deliberate\n");
-}
-
-/// A tar whose entry names bypass `Builder`'s own refusal to write `..`, so the
-/// server is tested against what a hostile client can actually send rather than
-/// against what the writing library permits.
-fn hostile_tar(files: &[(&str, &str)]) -> Vec<u8> {
-    let mut builder = tar::Builder::new(Vec::new());
-    for (name, body) in files {
-        let mut header = tar::Header::new_old();
-        header.set_size(body.len() as u64);
-        header.set_mode(0o644);
-        header.set_entry_type(tar::EntryType::Regular);
-        let raw = header.as_old_mut();
-        raw.name[..name.len()].copy_from_slice(name.as_bytes());
-        header.set_cksum();
-        builder.append(&header, body.as_bytes()).unwrap();
-    }
-    builder.into_inner().unwrap()
-}
-
-#[tokio::test]
-async fn a_posted_tar_cannot_escape_the_vault() {
-    let (addr, root) = spawn_with_root(None).await;
-    let body = hostile_tar(&[("../escaped.md", "# Nope\n"), ("ok.md", "# Ok\n")]);
-
-    let response = post_tar(addr, "", body).await;
-
-    assert_eq!(response.status(), 207, "refusing an entry is not a success");
-    let report = response.text().await.unwrap();
-    assert!(
-        report.contains("error"),
-        "a traversing entry must be refused: {report}"
-    );
-    assert!(
-        !root.parent().unwrap().join("escaped.md").exists(),
-        "a tar entry wrote outside the vault root"
-    );
-    assert_eq!(
-        read_back(addr, "ok.md").await,
-        "# Ok\n",
-        "one refused entry must not abandon the rest of the push"
-    );
-}
-
-#[tokio::test]
-async fn an_unknown_prefix_is_not_an_empty_result() {
-    let addr = spawn_with_tree().await;
-
-    // The vault holds `inbox`, not `00-inbox` — the shape of a real mistype.
-    let tar = reqwest::get(format!("http://{addr}/api/notes?prefix=00-inbox"))
-        .await
-        .unwrap();
-    assert_eq!(
-        tar.status(),
-        404,
-        "a mistyped prefix must not come back as a silently empty archive"
-    );
-
-    let index = reqwest::get(format!(
-        "http://{addr}/api/notes?format=index&prefix=00-inbox"
-    ))
-    .await
-    .unwrap();
-    assert_eq!(index.status(), 404);
-}
-
-#[tokio::test]
-async fn a_directory_holding_no_notes_is_an_empty_archive() {
-    let (addr, root) = spawn_with_root(None).await;
-    std::fs::create_dir(root.join("drafts")).unwrap();
-
-    let response = reqwest::get(format!("http://{addr}/api/notes?prefix=drafts"))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response.status(),
-        200,
-        "a real directory that happens to hold nothing is not an error"
-    );
-    assert_eq!(response.headers()["note-count"], "0");
-}
-
-#[tokio::test]
-async fn an_archive_says_how_many_notes_it_carries() {
-    let addr = spawn_with_tree().await;
-    let response = reqwest::get(format!("http://{addr}/api/notes?prefix=inbox/"))
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), 200);
-    assert_eq!(
-        response.headers()["note-count"],
-        "2",
-        "a caller should not have to parse the archive to know it got anything"
-    );
-}
-
-#[tokio::test]
-async fn the_index_needs_no_such_asking() {
-    let addr = spawn_with_tree().await;
-
-    let response = reqwest::get(format!("http://{addr}/api/notes?format=index"))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response.status(),
-        200,
-        "learning the size of the vault moves no content, and is exactly what a \
-         caller should do before deciding to take it all"
-    );
-    assert_eq!(response.text().await.unwrap().lines().count(), 3);
-}
-
-/// Seed `count` notes so a transfer is big enough to be worth questioning.
-async fn spawn_with_many(count: usize) -> SocketAddr {
-    let (addr, root) = spawn_with_root(None).await;
-    std::fs::create_dir_all(root.join("bulk")).unwrap();
-    for i in 0..count {
-        std::fs::write(root.join(format!("bulk/note-{i:03}.md")), "# x\n").unwrap();
-    }
-    addr
-}
-
-#[tokio::test]
-async fn a_small_transfer_needs_no_ceremony() {
-    let addr = spawn_with_tree().await;
-
-    let response = reqwest::get(format!("http://{addr}/api/notes"))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response.status(),
-        200,
-        "three notes is not a bulk exfiltration; gating on whether a prefix was \
-         typed measures the wrong thing"
-    );
-    assert_eq!(response.headers()["note-count"], "3");
-}
-
-#[tokio::test]
-async fn a_large_transfer_states_its_size_and_asks() {
-    let addr = spawn_with_many(60).await;
-
-    let response = reqwest::get(format!("http://{addr}/api/notes"))
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), 400);
-    let message = response.text().await.unwrap();
-    assert!(
-        message.contains("61") && message.contains("confirm=true"),
-        "the refusal has to name the real size and the one way forward, so the \
-         caller needs no second guess: {message}"
-    );
-}
-
-#[tokio::test]
-async fn a_narrowed_transfer_is_gated_by_its_own_size() {
-    let addr = spawn_with_many(60).await;
-
-    let response = reqwest::get(format!("http://{addr}/api/notes?prefix=bulk"))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response.status(),
-        400,
-        "naming a directory says nothing about how much is in it"
-    );
-}
-
-#[tokio::test]
-async fn a_confirmed_large_transfer_is_served() {
-    let addr = spawn_with_many(60).await;
-
-    let response = reqwest::get(format!("http://{addr}/api/notes?confirm=true"))
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.headers()["note-count"], "61");
-}
-
-#[tokio::test]
-async fn the_index_is_never_gated_however_large_the_vault() {
-    let addr = spawn_with_many(60).await;
-
-    let response = reqwest::get(format!("http://{addr}/api/notes?format=index"))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response.status(),
-        200,
-        "the index moves no content and is how a caller learns the size it is \
-         being asked to confirm"
-    );
-    assert_eq!(response.text().await.unwrap().lines().count(), 61);
 }
 
 #[tokio::test]
@@ -665,133 +356,6 @@ async fn the_vault_stays_markdown() {
 }
 
 #[tokio::test]
-async fn a_pushed_tar_refuses_what_is_not_a_note_and_keeps_the_rest() {
-    let addr = spawn(None).await;
-    let body = tar_of(&[("keep.md", "# Keep\n"), ("evil.sh", "echo hi\n")]);
-
-    let response = post_tar(addr, "", body).await;
-    let report = response.text().await.unwrap();
-
-    assert!(
-        report.contains("evil.sh") && report.contains("error"),
-        "{report}"
-    );
-    assert_eq!(read_back(addr, "keep.md").await, "# Keep\n");
-}
-
-#[tokio::test]
-async fn an_absolute_entry_name_is_refused_like_any_other_bad_one() {
-    let addr = spawn(None).await;
-    let body = hostile_tar(&[("/etc/pwned.md", "# No\n"), ("ok.md", "# Ok\n")]);
-
-    let response = post_tar(addr, "to=landing", body).await;
-    let report = response.text().await.unwrap();
-
-    let refused = report
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .find(|entry| entry["path"].as_str().is_some_and(|p| p.contains("pwned")))
-        .expect("the entry has to be reported one way or the other");
-    assert!(
-        refused["error"].is_string() && refused["written"].is_null(),
-        "`..`, a symlink and a non-note are all refused; quietly stripping a \
-         leading slash and writing it anyway is the one malformed name that \
-         succeeds, and it lands a directory nobody asked for: {refused}"
-    );
-    assert_eq!(
-        read_back(addr, "landing/ok.md").await,
-        "# Ok\n",
-        "one refused entry must not abandon the rest of the push"
-    );
-}
-
-#[tokio::test]
-async fn a_push_that_refused_something_does_not_report_success() {
-    let addr = spawn(None).await;
-
-    let all_written = post_tar(addr, "", tar_of(&[("fresh.md", "# F\n")])).await;
-    assert_eq!(all_written.status(), 200);
-
-    let partly_refused = post_tar(
-        addr,
-        "",
-        tar_of(&[("other.md", "# O\n"), ("hello.md", "# clobber\n")]),
-    )
-    .await;
-
-    assert_eq!(
-        partly_refused.status(),
-        207,
-        "`curl -sSf … && echo ok` on a push that wrote nothing must not print ok"
-    );
-    assert_eq!(read_back(addr, "hello.md").await, NOTE);
-    assert_eq!(read_back(addr, "other.md").await, "# O\n");
-}
-
-#[tokio::test]
-async fn a_mistyped_parameter_is_refused_rather_than_ignored() {
-    let addr = spawn_with_tree().await;
-
-    let response = reqwest::get(format!("http://{addr}/api/notes?prefx=inbox"))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response.status(),
-        400,
-        "silently ignoring it would answer with the whole vault while the \
-         caller believes it narrowed the request"
-    );
-}
-
-#[tokio::test]
-async fn a_protected_directory_is_not_a_prefix() {
-    let (addr, root) = spawn_with_root(None).await;
-    std::fs::create_dir_all(root.join(".md-mcp")).unwrap();
-
-    let response = reqwest::get(format!("http://{addr}/api/notes?prefix=.md-mcp"))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response.status(),
-        404,
-        "answering 200 with an empty archive is exactly the confusion this \
-         endpoint refuses everywhere else: the caller cannot tell a directory \
-         it may not have from one that is empty"
-    );
-}
-
-#[tokio::test]
-async fn a_directory_entry_is_skipped_without_counting_as_a_refusal() {
-    let addr = spawn(None).await;
-    let mut builder = tar::Builder::new(Vec::new());
-    let mut header = tar::Header::new_gnu();
-    header.set_entry_type(tar::EntryType::Directory);
-    header.set_size(0);
-    header.set_mode(0o755);
-    header.set_cksum();
-    builder.append_data(&mut header, "sub/", &[][..]).unwrap();
-    let mut note = tar::Header::new_gnu();
-    note.set_size(7);
-    note.set_mode(0o644);
-    note.set_cksum();
-    builder
-        .append_data(&mut note, "sub/a.md", &b"# A\n\nx"[..])
-        .unwrap();
-
-    let response = post_tar(addr, "", builder.into_inner().unwrap()).await;
-
-    assert_eq!(
-        response.status(),
-        200,
-        "`tar -cf - .` always carries directories; counting them as refusals \
-         would make every ordinary push look partly failed"
-    );
-    assert!(!response.text().await.unwrap().contains("error"));
-}
-
-#[tokio::test]
 async fn a_refused_credential_says_what_to_do_about_it() {
     let addr = spawn(Some("secret")).await;
 
@@ -813,136 +377,52 @@ async fn a_refused_credential_says_what_to_do_about_it() {
 }
 
 #[tokio::test]
-async fn the_index_states_its_size_the_way_an_archive_does() {
+async fn the_index_states_its_size_in_a_header() {
     let addr = spawn_with_tree().await;
 
-    let response = reqwest::get(format!("http://{addr}/api/notes?format=index"))
+    let response = reqwest::get(format!("http://{addr}/api/notes"))
         .await
         .unwrap();
 
     assert_eq!(
         response.headers()["note-count"],
         "3",
-        "the archive says how many it carries; a caller should not have to \
-         count lines to learn the same thing from the index"
+        "a caller deciding whether to loop should not have to count lines to \
+         learn how many there are"
     );
 }
 
 #[tokio::test]
-async fn a_dry_run_reports_what_it_would_do_and_does_none_of_it() {
+async fn the_collection_accepts_no_push() {
     let addr = spawn(None).await;
-    let body = tar_of(&[("fresh.md", "# F\n"), ("hello.md", "# clobber\n")]);
 
-    let response = post_tar(addr, "dry_run=true&overwrite=true", body).await;
-
-    assert_eq!(response.status(), 200);
-    let report = response.text().await.unwrap();
-    assert!(
-        report.contains("would_write") && !report.contains("\"written\""),
-        "a caller checking a push before making it needs the same per-entry \
-         answer, marked as not having happened: {report}"
-    );
-    assert!(
-        report.contains("fresh.md") && report.contains("hello.md"),
-        "{report}"
-    );
-
-    assert_eq!(
-        reqwest::get(format!("http://{addr}/api/notes/fresh.md"))
-            .await
-            .unwrap()
-            .status(),
-        404,
-        "nothing may be created by a run that only reports"
-    );
-    assert_eq!(read_back(addr, "hello.md").await, NOTE, "nor replaced");
-}
-
-#[tokio::test]
-async fn a_dry_run_refuses_exactly_what_the_real_push_would() {
-    let addr = spawn(None).await;
-    let entries: &[(&str, &str)] = &[("ok.md", "# Ok\n"), ("a.sh", "echo\n")];
-
-    let dry = post_tar(addr, "dry_run=true", tar_of(entries)).await;
-    let dry_status = dry.status();
-    let dry_report = dry.text().await.unwrap();
-
-    let real = post_tar(addr, "", tar_of(entries)).await;
-    let real_status = real.status();
-    let real_report = real.text().await.unwrap();
-
-    assert_eq!(
-        dry_status, real_status,
-        "a check that passes what the push then refuses has no reason to \
-         exist: dry {dry_report} / real {real_report}"
-    );
-    assert!(
-        dry_report.contains("a.sh") && dry_report.contains("error"),
-        "{dry_report}"
-    );
-    assert!(dry_report.contains("ok.md"), "{dry_report}");
-}
-
-#[tokio::test]
-async fn a_traversing_entry_is_refused_by_the_check_too() {
-    let addr = spawn(None).await;
-    let body = hostile_tar(&[("../escape.md", "# No\n")]);
-
-    let report = post_tar(addr, "dry_run=true", body)
-        .await
-        .text()
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/notes"))
+        .body("# anything\n")
+        .send()
         .await
         .unwrap();
 
-    assert!(
-        report.contains("error") && !report.contains("would_write"),
-        "reporting that an escaping entry would land is worse than useless: \
-         {report}"
+    assert_eq!(
+        response.status(),
+        405,
+        "bulk transfer is a loop over the single-note endpoints; an archive \
+         parser at an authenticated boundary is a hole habitat this surface \
+         no longer keeps"
     );
 }
 
 #[tokio::test]
-async fn a_destination_outside_the_vault_is_refused_outright() {
-    let (addr, root) = spawn_with_root(None).await;
+async fn a_protected_path_is_not_served() {
+    let addr = spawn(None).await;
 
-    let response = post_tar(addr, "to=/etc", tar_of(&[("e.md", "# E\n")])).await;
+    let response = reqwest::get(format!("http://{addr}/api/notes/.md-mcp/journal.md"))
+        .await
+        .unwrap();
 
     assert_eq!(
         response.status(),
-        400,
-        "silently dropping the leading slash lands a top-level `etc/` in the \
-         vault, which one typo away is how a structure grows a directory \
-         nobody chose"
+        404,
+        "the server's own state is not a note, however it is addressed"
     );
-    assert!(
-        !root.join("etc").exists(),
-        "and it must not have been created"
-    );
-}
-
-#[tokio::test]
-async fn a_push_that_landed_nothing_is_not_a_partial_success() {
-    let addr = spawn(None).await;
-
-    let nothing_landed = post_tar(addr, "", tar_of(&[("hello.md", "# clobber\n")])).await;
-
-    assert_eq!(
-        nothing_landed.status(),
-        422,
-        "207 says `some of it worked`; a script gating on the status cannot \
-         tell that from a push that wrote nothing at all"
-    );
-
-    let partly = post_tar(
-        addr,
-        "",
-        tar_of(&[("new.md", "# New\n"), ("hello.md", "# clobber\n")]),
-    )
-    .await;
-    assert_eq!(
-        partly.status(),
-        207,
-        "and a real partial is still a partial"
-    );
-    assert_eq!(read_back(addr, "hello.md").await, NOTE);
 }

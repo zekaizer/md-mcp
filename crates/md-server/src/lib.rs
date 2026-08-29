@@ -317,9 +317,10 @@ impl ServerHandler for MdServer {
              list_notes) are cheaper section-wise: read_outlines first, then \
              read_sections for the sections you need; read smaller notes whole via \
              read_notes. Destructive batches are all-or-nothing. These tools are \
-             how work here is normally done; when a job is bulky or repetitive \
-             enough that a shell would plainly beat them, provision_transfer \
-             opens an HTTP surface for that instead."
+             how work here is normally done; when a note is too large to pull \
+             through context, or a job is repetitive enough that a shell script \
+             would plainly beat them, provision_transfer opens a byte-level HTTP \
+             surface for that instead."
         )
         .to_string();
         if let Some(intro) = &self.intro_note {

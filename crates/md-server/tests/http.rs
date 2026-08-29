@@ -479,13 +479,14 @@ async fn a_confined_grant_cannot_reach_outside_its_directory() {
             .await
             .unwrap()
             .status(),
-        403,
-        "nor may it ask for a subtree it is outside"
+        400,
+        "the index takes no parameters; a prefix would only restate or \
+         contradict what the grant already is"
     );
 }
 
 #[tokio::test]
-async fn a_confined_grant_narrows_an_unqualified_pull_to_itself() {
+async fn a_confined_grant_narrows_an_unqualified_index_to_itself() {
     let (addr, _handle) = spawn_server(Some("s3cret")).await;
     let http = reqwest::Client::new();
     let (full, _) = provision(addr, true).await;
@@ -617,26 +618,5 @@ async fn a_grant_confined_with_a_decomposed_name_still_reaches_its_own_notes() {
          decomposed would be refused its own directory — and the recipe, which \
          resolves the name through the vault, would look fine while every \
          request it prints fails"
-    );
-}
-
-#[tokio::test]
-async fn a_destination_outside_the_grant_is_refused_before_the_upload() {
-    let (addr, _handle) = spawn_server(Some("s3cret")).await;
-    let confined = provision_confined(addr, true, "inbox").await;
-
-    let response = reqwest::Client::new()
-        .post(format!("http://{addr}/api/notes?to=elsewhere"))
-        .bearer_auth(&confined)
-        .body(Vec::new())
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response.status(),
-        403,
-        "the destination alone settles this, so a large tar should not be read \
-         and refused entry by entry to reach the same answer"
     );
 }

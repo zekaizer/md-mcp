@@ -1,13 +1,12 @@
-//! Byte-level HTTP API for note transfer (ADR-0028).
+//! Byte-level HTTP API for note I/O (ADR-0028).
 //!
-//! Bodies here are note bytes, not an envelope: a client with a filesystem can
-//! move a vault around without any of it crossing a model's context. MCP stays
-//! the surface a model reads and writes through.
-
-use std::io::Read as _;
+//! Bodies here are note bytes, not an envelope: a client with a shell works on
+//! a note without any of it crossing a model's context. One note per request;
+//! bulk work is the same requests in a loop over the index. MCP stays the
+//! surface a model reads and writes through.
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -30,36 +29,15 @@ const MARKDOWN: &str = "text/markdown; charset=utf-8";
 /// costs one line rather than the whole listing.
 const NDJSON: &str = "application/x-ndjson";
 
-/// `tar` the command exists on every client, so a bulk transfer is a pipe on
-/// both ends rather than anything a caller has to build.
-const TAR: &str = "application/x-tar";
-
-/// A pushed tar is buffered whole to be parsed, so it is capped well above a
-/// vault of notes and well below memory pressure. The default 2 MiB limit that
-/// guards every other route would refuse an ordinary bulk import.
-const MAX_TAR_BYTES: usize = 32 * 1024 * 1024;
-
-/// How many notes a transfer may carry before the server asks whether that was
-/// meant. Gating on whether a prefix was typed measures syntax; a named
-/// directory can hold the whole vault and an unnamed one can hold five notes.
-/// Reading is where this matters — a copy cannot be taken back, while a bad
-/// write is in git.
-const MAX_UNCONFIRMED_NOTES: usize = 50;
-
-/// How many notes an archive carries, so a caller can tell "got nothing" from
-/// "got something" without unpacking it.
+/// How many notes the index lists, so a caller deciding whether to loop can
+/// read one header instead of counting lines.
 pub(crate) const NOTE_COUNT: axum::http::HeaderName =
     axum::http::HeaderName::from_static("note-count");
 
 /// `/api/notes/...`, mounted beside `/mcp` and behind the same bearer guard.
 pub(crate) fn routes(server: MdServer) -> Router {
     Router::new()
-        .route(
-            "/api/notes",
-            get(get_collection)
-                .post(post_collection)
-                .layer(DefaultBodyLimit::max(MAX_TAR_BYTES)),
-        )
+        .route("/api/notes", get(get_collection))
         .route("/api/notes/{*path}", get(get_note).put(put_note))
         .with_state(server)
 }
@@ -99,389 +77,45 @@ async fn get_note(
         .into_response()
 }
 
-/// Where a pushed tar lands, and whether it may replace what is there.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PushQuery {
-    #[serde(default)]
-    to: Option<String>,
-    /// Off by default: a bulk push cannot express a per-note precondition, so
-    /// replacing has to be said out loud the way `If-Match: *` says it.
-    #[serde(default)]
-    overwrite: bool,
-    /// Report what the push would do and write none of it. `tar -cf - .` takes
-    /// whatever the directory happens to hold, which is not always what the
-    /// caller meant to send.
-    #[serde(default)]
-    dry_run: bool,
-}
-
-/// Write every note in a tar, reporting one line per entry.
-///
-/// Unlike an MCP batch (ADR-0007) this is not all-or-nothing: a bulk push is
-/// re-runnable, and one rejected note should not undo the rest.
-async fn post_collection(
-    State(server): State<MdServer>,
-    scopes: Option<Extension<Scopes>>,
-    Query(query): Query<PushQuery>,
-    body: Bytes,
-) -> Response {
-    let authority = authority(scopes);
-    if !authority.write {
-        return forbidden("notes:write");
-    }
-
-    // A destination is a vault-relative directory. Quietly dropping a leading
-    // slash would land a top-level `etc/` in the vault, which is one typo away
-    // from a structure growing a directory nobody chose.
-    if let Some(to) = query.to.as_deref().filter(|to| !to.trim().is_empty()) {
-        if let Err(error) = Vault::validate_rel(to) {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "destination {to:?} is not a vault directory: {}\n",
-                    error.message
-                ),
-            )
-                .into_response();
-        }
-        // Settled by the destination alone, so a large tar is not read and
-        // refused entry by entry to arrive at the same answer.
-        if !authority.permits(&nfc(to)) {
-            return outside_grant(to);
-        }
-    }
-
-    let _guard = server.lock().write().await;
-    let mut archive = tar::Archive::new(body.as_ref());
-    let entries = match archive.entries() {
-        Ok(entries) => entries,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("not a tar stream: {error}\n"),
-            )
-                .into_response();
-        }
-    };
-
-    let mut report = String::new();
-    let mut ops = Vec::new();
-    let mut refused = 0usize;
-    // Counted apart from `ops`, which a dry run deliberately leaves empty.
-    let mut report_wrote = 0usize;
-    let mut buffer = Vec::new();
-    for entry in entries {
-        match write_entry(&server, &authority, &query, entry, &mut buffer) {
-            // A directory is structure, not content, and nothing to report.
-            Ok(None) => {}
-            Ok(Some(written)) => {
-                report_wrote += 1;
-                let path = written.path;
-                if query.dry_run {
-                    push_line(
-                        &mut report,
-                        &serde_json::json!({
-                            "path": path,
-                            "would_write": true,
-                            "replaced": written.replaced,
-                        }),
-                    );
-                } else {
-                    ops.push(if written.replaced {
-                        EventOp::Write { path: path.clone() }
-                    } else {
-                        EventOp::Create { path: path.clone() }
-                    });
-                    push_line(
-                        &mut report,
-                        &serde_json::json!({
-                            "path": path,
-                            "written": true,
-                            "replaced": written.replaced,
-                        }),
-                    );
-                }
-            }
-            Err(refusal) => {
-                refused += 1;
-                push_line(
-                    &mut report,
-                    &match refusal.path {
-                        Some(path) => serde_json::json!({ "path": path, "error": refusal.why }),
-                        None => serde_json::json!({ "error": refusal.why }),
-                    },
-                );
-            }
-        }
-    }
-
-    server.emit_event("post_notes", None, &ops);
-    server
-        .auto_commit(
-            "post_notes",
-            &ops,
-            &serde_json::json!({ "to": query.to, "overwrite": query.overwrite }),
-        )
-        .await;
-
-    // A script gating on the status has only the code to go on, so the three
-    // outcomes are three codes: all of it, some of it, none of it.
-    let status = match (ops.is_empty() && report_wrote == 0, refused) {
-        (_, 0) => StatusCode::OK,
-        (true, _) => StatusCode::UNPROCESSABLE_ENTITY,
-        (false, _) => StatusCode::MULTI_STATUS,
-    };
-    (status, [(header::CONTENT_TYPE, NDJSON.to_string())], report).into_response()
-}
-
-/// One note the push landed.
-struct Written {
-    path: String,
-    replaced: bool,
-}
-
-/// Why one entry did not land, and where, when the path was known.
-struct Refusal {
-    path: Option<String>,
-    why: String,
-}
-
-impl Refusal {
-    fn at(path: &str, why: impl Into<String>) -> Self {
-        Self {
-            path: Some(path.to_string()),
-            why: why.into(),
-        }
-    }
-
-    fn bare(why: impl Into<String>) -> Self {
-        Self {
-            path: None,
-            why: why.into(),
-        }
-    }
-}
-
-/// Write one tar entry, or say why not. `Ok(None)` is a directory.
-///
-/// Every refusal leaves through one return type so the caller counts them in
-/// one place: nine hand-written `continue`s is how a push that refused an entry
-/// came to answer 200 on one of the nine paths.
-fn write_entry<R: std::io::Read>(
-    server: &MdServer,
-    authority: &Scopes,
-    query: &PushQuery,
-    entry: std::io::Result<tar::Entry<'_, R>>,
-    buffer: &mut Vec<u8>,
-) -> Result<Option<Written>, Refusal> {
-    let mut entry = entry.map_err(|error| Refusal::bare(error.to_string()))?;
-
-    let kind = entry.header().entry_type();
-    if kind.is_dir() {
-        return Ok(None);
-    }
-    // Anything else that is not a regular file — a link, a device node — has no
-    // meaning in a vault and is refused rather than followed.
-    if !kind.is_file() {
-        return Err(Refusal::bare("not a regular file"));
-    }
-
-    let name = entry
-        .path()
-        .map(|path| path.to_string_lossy().into_owned())
-        .map_err(|_| Refusal::bare("unreadable entry path"))?;
-    // `tar -C dir -cf - .` names every entry `./…`.
-    let name = name.trim_start_matches("./");
-    // Judged before it is joined onto anything: an absolute name joined to a
-    // destination reads as an ordinary relative path afterwards, and stripping
-    // the slash instead would make it the one malformed name that succeeds
-    // while `..`, a symlink and a non-note are all refused.
-    Vault::validate_rel(name).map_err(|error| Refusal::at(name, error.message))?;
-    let path = prefixed(query.to.as_deref(), name);
-
-    buffer.clear();
-    entry
-        .read_to_end(buffer)
-        .map_err(|error| Refusal::at(&path, error.to_string()))?;
-    if buffer.len() > MAX_WRITE_BYTES {
-        return Err(Refusal::at(
-            &path,
-            write_size_error("note", buffer.len()).message,
-        ));
-    }
-    if !authority.permits(&path) {
-        return Err(Refusal::at(&path, "outside this credential's directory"));
-    }
-    // Asked here rather than left to the write, so a dry run reaches the same
-    // verdict. Traversal, a protected directory and anything that is not a note
-    // are the vault's rules, and a check that passes what the push then refuses
-    // has no reason to exist.
-    Vault::validate_note_rel(&path).map_err(|error| Refusal::at(&path, error.message))?;
-
-    let replaced = server.vault().exists(&path).unwrap_or(false);
-    if replaced && !query.overwrite {
-        return Err(Refusal::at(
-            &path,
-            "note exists; pass overwrite=true to replace it",
-        ));
-    }
-    // Everything that could refuse this entry has now spoken, so a dry run can
-    // report the same answer without making it true.
-    if query.dry_run {
-        return Ok(Some(Written { path, replaced }));
-    }
-    // The jail is still the backstop (ADR-0006): the check above is lexical,
-    // and a live symlink escape is the kernel's to refuse.
-    server
-        .vault()
-        .create_note(&path, buffer, true)
-        .map_err(|error| Refusal::at(&path, error.message))?;
-    Ok(Some(Written { path, replaced }))
-}
-
-/// Join a validated entry name onto the destination prefix.
-fn prefixed(to: Option<&str>, name: &str) -> String {
-    let joined = match to {
-        Some(to) if !to.trim_matches('/').is_empty() => {
-            format!("{}/{name}", to.trim_matches('/'))
-        }
-        _ => name.to_string(),
-    };
-    match nfc(&joined) {
-        std::borrow::Cow::Borrowed(_) => joined,
-        std::borrow::Cow::Owned(composed) => composed,
-    }
-}
-
-/// One NDJSON line, written straight into the report.
+/// One NDJSON line, written straight into the index body.
 fn push_line(report: &mut String, value: &serde_json::Value) {
     use std::fmt::Write as _;
     let _ = writeln!(report, "{value}");
 }
 
-/// A subtree as one tar, so a whole vault crosses the wire in one round trip.
-fn tar_of(server: &MdServer, paths: &[String]) -> Response {
-    let count = paths.len();
-    let mut builder = tar::Builder::new(Vec::new());
-    for path in paths {
-        // A transfer that silently drops a note it could not read would read as
-        // a deletion on the far side, so one failure fails the export.
-        let note = match server.vault().read_note(path) {
-            Ok(note) => note,
-            Err(error) => return export_failed(path, &error.message),
-        };
-        let mut header = tar::Header::new_gnu();
-        header.set_size(note.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        if let Err(error) = builder.append_data(&mut header, path, note.as_bytes()) {
-            return export_failed(path, &error.to_string());
-        }
-    }
-    match builder.into_inner() {
-        // A tar of nothing is 1024 bytes of padding and looks exactly like a tar
-        // of something, so the count is stated rather than left to be parsed.
-        Ok(bytes) => (
-            [
-                (header::CONTENT_TYPE, TAR.to_string()),
-                (NOTE_COUNT, count.to_string()),
-            ],
-            bytes,
-        )
-            .into_response(),
-        Err(error) => export_failed("", &error.to_string()),
-    }
-}
-
-fn export_failed(path: &str, why: &str) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("export aborted at {path:?}: {why}\n"),
-    )
-        .into_response()
-}
-
-/// What the collection endpoint should answer with, and over what subtree.
-///
-/// Unknown parameters are refused rather than ignored: this API teaches through
-/// its errors, and a silently dropped `prefx=` would take that away exactly
-/// when it is needed.
+/// Nothing a caller can pass: the grant already decides what the index
+/// covers. An unknown parameter is refused rather than ignored — this API
+/// teaches through its errors, and a silently dropped `prefx=` would take
+/// that away exactly when it is needed.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CollectionQuery {
-    #[serde(default)]
-    prefix: Option<String>,
-    #[serde(default)]
-    format: Option<String>,
-    /// Acknowledge a transfer large enough that the server asks first.
-    #[serde(default)]
-    confirm: bool,
-}
+struct NoQuery {}
 
+/// The collection is its index: every note this credential reaches — path,
+/// entity tag and size, one JSON object per line, no content. Bulk transfer
+/// is the single-note endpoints in a loop over these paths (ADR-0028), so
+/// this is the one collection representation there is.
 async fn get_collection(
     State(server): State<MdServer>,
     scopes: Option<Extension<Scopes>>,
-    Query(query): Query<CollectionQuery>,
+    Query(NoQuery {}): Query<NoQuery>,
 ) -> Response {
     let authority = authority(scopes);
     if !authority.read {
         return forbidden("notes:read");
     }
-    // A credential confined to one subtree narrows an unqualified request to
-    // what it can see, rather than refusing it: it is already narrowed.
-    let asked = query
-        .prefix
-        .as_deref()
-        .filter(|prefix| !prefix.trim_matches('/').is_empty());
-    if let Some(asked) = asked
-        && !authority.permits(asked)
-    {
-        return outside_grant(asked);
-    }
-    let prefix = asked
-        .map(str::to_owned)
-        .or_else(|| authority.prefix.clone());
-
-    // One guard over listing and reading, so a transfer is a consistent
+    // One guard over listing and hashing, so the index is a consistent
     // snapshot rather than a walk through a moving vault.
     let _guard = server.lock().read().await;
-    let entries = match entries_under(&server, prefix.as_deref()) {
-        Ok(entries) => entries,
-        Err(refusal) => return refusal.into_response(),
-    };
-
-    match query.format.as_deref() {
-        // The index moves no content, and is how a caller learns the size it is
-        // being asked to confirm. Gating it would discourage the one step worth
-        // encouraging.
-        Some("index") => index(&server, &entries),
-        None | Some("tar") => {
-            if entries.len() > MAX_UNCONFIRMED_NOTES && !query.confirm {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "this would transfer {} notes, over the {MAX_UNCONFIRMED_NOTES} that go \
-                         without asking; pass confirm=true to take them, or narrow it with \
-                         prefix=<directory>\n",
-                        entries.len()
-                    ),
-                )
-                    .into_response();
-            }
-            tar_of(&server, &entries)
-        }
-        Some(other) => (
-            StatusCode::BAD_REQUEST,
-            format!("unsupported format {other:?}; use tar or index\n"),
-        )
-            .into_response(),
+    match entries_under(&server, authority.prefix.as_deref()) {
+        Ok(entries) => index(&server, &entries),
+        Err(refusal) => refusal.into_response(),
     }
 }
 
-/// The note paths a request covers, or why there are none to speak of. An empty
-/// archive and a mistyped prefix look identical to a caller, and one of them
-/// means the command they ran did nothing.
+/// The note paths a credential covers, or why there are none to speak of. An
+/// empty index and a mistyped confinement look identical to a caller, and one
+/// of them means every request they are about to loop over will do nothing.
 ///
 /// A prefix may name one note rather than a directory: the narrowest useful
 /// grant is a single note, and a credential confined to one still has a

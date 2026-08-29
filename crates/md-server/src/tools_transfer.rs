@@ -1,5 +1,5 @@
-//! The tool that opens the byte-level transfer API to a client with a shell
-//! ([ADR-0028](../../../docs/adr/0028-bulk-transfer-http-api.md)).
+//! The tool that opens the byte-level note API to a client with a shell
+//! ([ADR-0028](../../../docs/adr/0028-byte-level-note-api.md)).
 //!
 //! It answers with a credential and with commands whose values are already
 //! filled in, because the aim is not that a model learn an API but that it run
@@ -17,26 +17,8 @@ use md_core::text::nfc;
 
 use crate::MdServer;
 use crate::oauth::{
-    self, OAuthState, Scopes, TRANSFER_CODE_TTL_SECS, TRANSFER_TOKEN_TTL_SECS, percent_encode,
-    percent_encode_path,
+    self, OAuthState, Scopes, TRANSFER_CODE_TTL_SECS, TRANSFER_TOKEN_TTL_SECS, percent_encode_path,
 };
-
-/// What the examples are written around, in values this vault actually holds.
-/// A recipe is a contract to be runnable as printed: a placeholder filename
-/// 404s, and a directory that is the whole grant is not "the whole vault".
-enum Example {
-    /// Unconfined, with no directory worth naming.
-    Vault { note: Option<String> },
-    Directory {
-        path: String,
-        note: Option<String>,
-        /// The grant reaches nothing outside this directory, so it has no
-        /// wider pull to offer and nothing to narrow from.
-        confined: bool,
-    },
-    /// The grant is exactly one note.
-    Note(String),
-}
 
 /// Where the recipe parks the collected token. Never interpolated into a
 /// command, only read back through `$(cat …)`, so it stays out of shell history
@@ -49,12 +31,6 @@ fn token_file(write: bool) -> &'static str {
         "/tmp/md-token-ro"
     }
 }
-
-/// Where a pull unpacks to, and where a push is staged from. Deliberately not
-/// the same directory: a recipe run top to bottom would otherwise push back
-/// everything it had just pulled.
-const PULL_DIR: &str = "./vault";
-const PUSH_DIR: &str = "./outbox";
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -88,7 +64,7 @@ pub struct ProvisionTransferResponse {
     /// Where the recipe leaves the collected token.
     pub token_file: String,
     pub scopes: Vec<String>,
-    /// Runnable as printed, in a shell that has `curl` and `tar`.
+    /// Runnable as printed, in a shell that has `curl`.
     pub recipe: Vec<String>,
 }
 
@@ -96,7 +72,7 @@ pub struct ProvisionTransferResponse {
 impl MdServer {
     /// Mint a short-lived, scope-reduced credential for the transfer API.
     #[tool(
-        description = "Open an HTTP surface for bulk note transfer and return a one-time ticket with ready-to-run curl commands. The note tools are how work in this vault is normally done; reach for this only when the job is bulky or repetitive enough that a shell would plainly beat them — importing a directory, rewriting hundreds of notes with a script, or moving content that has no reason to pass through context. Useless without shell access. Pass write:true to push notes back, and prefix to confine the grant to one directory or one note. It reads, creates and replaces notes; deleting is not part of it, so use delete_notes for that.",
+        description = "Open a byte-level HTTP surface for working on note bytes outside model context, and return a one-time ticket with ready-to-run curl commands. The note tools are how work in this vault is normally done; reach for this when a note is too large to pull through context, or a job is repetitive enough that a shell script plainly beats them — rewriting a large note with sed, processing many notes in a loop. It serves an index (path, etag, size per note) and one-note GET/PUT with If-Match; bulk work is those commands in a loop. Useless without shell access. Pass write:true to write back, and prefix to confine the grant to one directory or one note. Deleting and moving are not part of it: use delete_notes and move_notes.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -127,14 +103,14 @@ impl MdServer {
             // composed, so a decomposed spelling would refuse its own notes.
             prefix: req.prefix.as_deref().map(|p| nfc(p).into_owned()),
         };
-        let example = example_scope(self, req.prefix.as_deref()).await;
+        let example = example_note(self, req.prefix.as_deref()).await;
         let code = oauth.issue_transfer_code(scopes.clone());
         let root = oauth::base_url(&parts.headers);
         let base = format!("{root}/api/notes");
         let redeem = format!("{root}/transfer/redeem");
 
         Ok(Json(ProvisionTransferResponse {
-            recipe: recipe(&base, &redeem, &code, req.write, &example),
+            recipe: recipe(&base, &redeem, &code, req.write, example.as_deref()),
             base,
             redeem,
             code,
@@ -146,48 +122,23 @@ impl MdServer {
     }
 }
 
-/// The values to write the examples around. A confined grant describes its own
-/// scope; otherwise a directory this vault has, since naming one it does not
-/// unpacks nothing on a pull and creates a stray one on a push, reporting
-/// success either way.
-async fn example_scope(server: &MdServer, confined_to: Option<&str>) -> Example {
+/// The note the examples name, in a value this vault actually holds. A recipe
+/// is a contract to be runnable as printed, and a placeholder filename 404s.
+/// A grant confined to one note names that note; anything wider names the
+/// first note it reaches, or nothing in an empty scope.
+async fn example_note(server: &MdServer, confined_to: Option<&str>) -> Option<String> {
     let _guard = server.lock().read().await;
-    let first_note = |directory: &str| {
-        server
-            .vault()
-            .list_entries(directory, true, None, false)
-            .ok()
-            .and_then(|entries| entries.into_iter().next())
-            .map(|entry| entry.path)
-    };
-
-    if let Some(scope) = confined_to {
-        return if server.vault().is_dir(scope).unwrap_or(false) {
-            Example::Directory {
-                note: first_note(scope),
-                path: scope.to_string(),
-                confined: true,
-            }
-        } else {
-            Example::Note(scope.to_string())
-        };
-    }
-    match server
-        .vault()
-        .list_entries("", false, None, true)
-        .ok()
-        .and_then(|entries| entries.into_iter().find(|entry| entry.is_dir))
-        .map(|entry| entry.path.trim_end_matches('/').to_string())
+    if let Some(scope) = confined_to
+        && !server.vault().is_dir(scope).unwrap_or(false)
     {
-        Some(path) => Example::Directory {
-            note: first_note(&path),
-            path,
-            confined: false,
-        },
-        None => Example::Vault {
-            note: first_note(""),
-        },
+        return Some(scope.to_string());
     }
+    server
+        .vault()
+        .list_entries(confined_to.unwrap_or(""), true, None, false)
+        .ok()
+        .and_then(|entries| entries.into_iter().next())
+        .map(|entry| entry.path)
 }
 
 fn scope_names(scopes: &Scopes) -> Vec<String> {
@@ -206,97 +157,57 @@ fn scope_names(scopes: &Scopes) -> Vec<String> {
 
 /// Commands with the values already substituted: a model should run a line,
 /// not assemble one.
-fn recipe(
-    base: &str,
-    redeem: &str,
-    code: &str,
-    write: bool,
-    example: &Example,
-) -> Vec<String> {
+fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>) -> Vec<String> {
     let token_file = token_file(write);
     // Read back from the file rather than interpolated: the token then never
     // reaches a command line, shell history, or this conversation.
     let auth = format!("-H \"authorization: Bearer $(cat {token_file})\"");
-    // Never `curl … | tar -xf -`: a refusal is a plain-text explanation, and
-    // piping it into tar turns "pass confirm=true" into "this does not look
-    // like a tar archive". Landing it in a file keeps the message readable.
-    let fetch = format!("curl -sS --fail-with-body {auth}");
-    let (directory, note, confined) = match example {
-        Example::Vault { note } => (None, note.as_deref(), false),
-        Example::Directory {
-            path,
-            note,
-            confined,
-        } => (Some(path.as_str()), note.as_deref(), *confined),
-        Example::Note(note) => (None, Some(note.as_str()), true),
-    };
 
     let mut recipe = vec![
         format!(
             "# 1. run this first: trade the one-time ticket for the token (single use)\ncurl -sSf -X POST -d \"code={code}\" \"{redeem}\" -o {token_file}"
         ),
         format!(
-            "# 2. see what is there and how much of it, without moving any content.\n#    etag is blake3 of the note's exact bytes, quoted -- recompute it locally to find what changed\ncurl -sS {auth} \"{base}?format=index\""
+            "# 2. the index: every note this grant reaches -- path, etag, size -- one JSON object per line, no content.\n#    etag is blake3 of the note's exact bytes, quoted; recompute it locally to find what changed\ncurl -sS --fail-with-body {auth} \"{base}\""
         ),
     ];
-    if let Some(directory) = directory {
-        recipe.push(format!(
-            "# pull this directory. A refusal lands in notes.tar as plain text and stops the extraction, so read it there\n{fetch} -o notes.tar \"{base}?prefix={}\" && mkdir -p {PULL_DIR} && tar -xf notes.tar -C {PULL_DIR}",
-            percent_encode(directory)
-        ));
-    }
-    // A confined grant has no wider pull to offer: everything it can reach is
-    // already what the line above fetched.
-    if !confined {
-        recipe.push(format!(
-            "# the whole vault. Past a few dozen notes this is refused until you say you mean it; the refusal lands in notes.tar and says how many there are and how to ask\n{fetch} -o notes.tar \"{base}\" && mkdir -p {PULL_DIR} && tar -xf notes.tar -C {PULL_DIR}"
-        ));
-    }
     if let Some(note) = note {
         recipe.push(format!(
-            "# one note\n{fetch} -o note.md \"{base}/{}\"",
+            "# one note, verbatim, to a file -- work on it with your tools instead of reading it into context\ncurl -sS --fail-with-body {auth} -o note.md \"{base}/{}\"",
             percent_encode_path(note)
         ));
-    }
-
-    if write {
-        if directory.is_some() || !confined {
-            let destination =
-                directory.map_or_else(String::new, |dir| format!("?to={}", percent_encode(dir)));
-            let separator = if destination.is_empty() { "?" } else { "&" };
-            let and = if destination.is_empty() { "?" } else { "&" };
+        if write {
             recipe.push(format!(
-                "# stage what you mean to send in {PUSH_DIR} -- NOT {PULL_DIR}, which holds what you just pulled -- then check it\n#    `tar -cf - .` sends whatever the directory holds, so run this before the line below\nmkdir -p {PUSH_DIR} && tar -C {PUSH_DIR} -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}{and}dry_run=true\""
-            ));
-            recipe.push(format!(
-                "# then make it. {separator}overwrite=true replaces existing notes with no version check -- unlike the single-note PUT below, a bulk push cannot ask whether they changed since you read them.\n#    200 all landed, 207 some did and the lines say which, 422 none did. Deleting is not part of this API: use the delete_notes tool\ntar -C {PUSH_DIR} -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}\" -w \"\\nHTTP %{{http_code}}\\n\""
-            ));
-        }
-        if let Some(note) = note {
-            recipe.push(format!(
-                "# replace that note, only if it has not changed since you read it. The reply carries the new etag, so a second edit needs no fresh GET\ncurl -sS -D - {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{}\"",
+                "# put it back, only if it did not change since you read it (etag from the index or the GET).\n#    201 created, 204 replaced -- the reply carries the new etag, so a second edit needs no fresh GET -- 412 it changed underneath you, 428 the if-match is missing\ncurl -sS -D - {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{}\"",
                 percent_encode_path(note)
             ));
         }
     }
+    recipe.push(
+        "# many notes are the same two commands in a loop over the index paths. Deleting and \
+         moving are not part of this API: use the delete_notes and move_notes tools"
+            .to_string(),
+    );
     recipe
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Example, recipe};
+    use super::recipe;
+
+    fn lines(write: bool, note: Option<&str>) -> Vec<String> {
+        recipe(
+            "https://host/api/notes",
+            "https://host/transfer/redeem",
+            "TICKET",
+            write,
+            note,
+        )
+    }
 
     #[test]
     fn a_name_with_a_space_never_reaches_the_command_line_raw() {
-        let joined = lines(
-            true,
-            &Example::Directory {
-                path: "00-inbox".to_string(),
-                note: Some("00-inbox/Marp 프레젠테이션 테스트.md".to_string()),
-                confined: true,
-            },
-        )
-        .join("\n");
+        let joined = lines(true, Some("00-inbox/Marp 프레젠테이션 테스트.md")).join("\n");
 
         assert!(
             !joined.contains("Marp 프레젠테이션"),
@@ -305,69 +216,20 @@ mod tests {
         assert!(joined.contains("Marp%20"), "{joined}");
     }
 
-    fn lines(write: bool, example: &Example) -> Vec<String> {
-        recipe(
-            "https://host/api/notes",
-            "https://host/transfer/redeem",
-            "TICKET",
-            write,
-            example,
-        )
-    }
-
-    fn example_directory(confined: bool) -> Example {
-        Example::Directory {
-            path: "00-inbox".to_string(),
-            note: Some("00-inbox/a real note.md".to_string()),
-            confined,
-        }
-    }
-
     #[test]
-    fn a_refusal_reaches_the_caller_instead_of_reaching_tar() {
-        let joined = lines(false, &example_directory(false)).join("\n");
-
+    fn the_recipe_needs_nothing_but_curl() {
+        let joined = lines(true, Some("00-inbox/a real note.md")).join("\n");
         assert!(
-            !joined.contains("| tar -xf"),
-            "a refusal is a plain-text explanation; piping it into tar turns \
-             `pass confirm=true` into `this does not look like a tar archive` \
-             and loses the one thing the caller needed: {joined}"
-        );
-        assert!(
-            joined.contains("--fail-with-body"),
-            "the body has to survive the failure it explains: {joined}"
-        );
-    }
-
-    #[test]
-    fn a_push_is_staged_somewhere_other_than_what_was_pulled() {
-        let lines = lines(true, &example_directory(false));
-        let pull = lines
-            .iter()
-            .find(|l| l.contains("tar -xf"))
-            .expect("a pull line");
-        let push = lines
-            .iter()
-            .find(|l| l.contains("-cf -") && !l.contains("dry_run"))
-            .expect("a push line");
-
-        let target = if pull.contains("./vault") {
-            "./vault"
-        } else {
-            ""
-        };
-        assert!(!target.is_empty(), "{pull}");
-        assert!(
-            !push.contains(&format!("-C {target} -cf")),
-            "running the recipe in order would push back everything it just \
-             pulled: {push}"
+            !joined.contains("tar "),
+            "there is no archive endpoint to feed; a tar anywhere in here is a \
+             leftover of the bulk surface this API no longer has: {joined}"
         );
     }
 
     #[test]
     fn a_reading_grant_and_a_writing_one_do_not_share_a_token_file() {
-        let reading = lines(false, &Example::Vault { note: None }).join("\n");
-        let writing = lines(true, &Example::Vault { note: None }).join("\n");
+        let reading = lines(false, None).join("\n");
+        let writing = lines(true, None).join("\n");
         let file = |recipe: &str| {
             recipe
                 .split("/tmp/md-token")
@@ -386,10 +248,8 @@ mod tests {
 
     #[test]
     fn the_examples_name_things_this_vault_actually_holds() {
-        let joined = lines(true, &example_directory(false)).join("\n");
+        let joined = lines(true, Some("00-inbox/a real note.md")).join("\n");
 
-        assert!(joined.contains("prefix=00-inbox"));
-        assert!(joined.contains("to=00-inbox"));
         assert!(
             joined.contains("00-inbox/a%20real%20note.md"),
             "the one-note example names a note that exists, escaped so the \
@@ -402,69 +262,53 @@ mod tests {
     }
 
     #[test]
-    fn the_recipe_reaches_for_the_narrow_thing_first() {
-        let lines = lines(false, &example_directory(false));
+    fn knowing_what_is_there_comes_before_fetching_any_of_it() {
+        let lines = lines(true, Some("00-inbox/a real note.md"));
         let at = |needle: &str| lines.iter().position(|l| l.contains(needle));
 
         assert!(
-            at("format=index") < at("tar -xf"),
-            "knowing the size comes before deciding to move it"
-        );
-        assert!(
-            at("prefix=00-inbox") < lines.iter().rposition(|l| l.contains("tar -xf")),
-            "the narrowed pull is the one to reach for first: {lines:?}"
-        );
-        assert!(
-            lines.iter().all(|l| !l.contains("confirm=")),
-            "the server names the flag only when a transfer is large enough to \
-             need it; printing it here would make it a reflex: {lines:?}"
+            at("\"https://host/api/notes\"") < at("-o note.md"),
+            "the index is how a caller learns paths and tags; fetching first \
+             is guessing: {lines:?}"
         );
     }
 
     #[test]
-    fn a_directory_confined_grant_offers_no_wider_pull() {
-        let lines = lines(false, &example_directory(true));
-
-        assert_eq!(
-            lines.iter().filter(|l| l.contains("tar -xf")).count(),
-            1,
-            "everything this grant can reach is the one directory; a second \
-             line calling that the whole vault says something untrue: {lines:?}"
+    fn a_reading_grant_is_offered_no_way_to_write() {
+        let joined = lines(false, Some("00-inbox/a real note.md")).join("\n");
+        assert!(
+            !joined.contains("-X PUT"),
+            "a command the credential cannot run teaches a caller to fail: {joined}"
         );
     }
 
     #[test]
-    fn a_grant_that_is_one_note_names_that_note_and_nothing_else() {
-        let joined = lines(true, &Example::Note("00-inbox/README.md".to_string())).join("\n");
-
+    fn a_replacement_carries_its_precondition() {
+        let joined = lines(true, Some("00-inbox/a real note.md")).join("\n");
         assert!(
-            joined.contains("\"https://host/api/notes/00-inbox/README.md\""),
-            "the one-note example is the note itself: {joined}"
-        );
-        assert!(
-            !joined.contains("README.md/note.md"),
-            "treating the note as a directory invents a path that cannot \
-             exist: {joined}"
-        );
-        assert!(
-            !joined.contains("prefix=") && !joined.contains("to=") && !joined.contains("tar -xf"),
-            "a grant that is one note has no subtree to narrow to or push \
-             into: {joined}"
+            joined.contains("if-match"),
+            "an unconditional replace is the lost-update hole this API exists \
+             to close: {joined}"
         );
     }
 
     #[test]
-    fn an_empty_vault_gets_examples_without_a_prefix() {
-        let joined = lines(true, &Example::Vault { note: None }).join("\n");
+    fn an_empty_scope_still_teaches_the_loop() {
+        let lines = lines(true, None);
+        let joined = lines.join("\n");
         assert!(
-            !joined.contains("prefix=") && !joined.contains("to="),
-            "with nothing to name, the examples take the whole vault: {joined}"
+            !joined.contains("note.md"),
+            "with no note to name there is no note line to print: {joined}"
+        );
+        assert!(
+            joined.contains("loop over the index paths"),
+            "bulk work has to be discoverable from the recipe alone: {joined}"
         );
     }
 
     #[test]
     fn the_index_example_does_not_promise_note_tags() {
-        let joined = lines(false, &Example::Vault { note: None }).join("\n");
+        let joined = lines(false, None).join("\n");
         assert!(
             !joined.contains("tags"),
             "in a notes vault `tags` means frontmatter tags, which this does not \
