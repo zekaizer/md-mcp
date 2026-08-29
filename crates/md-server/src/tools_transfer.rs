@@ -180,7 +180,7 @@ fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>)
         ));
     }
     recipe.push(format!(
-        "# many notes: pull the index once, then loop -- its url field is the path already percent-encoded, so it pastes into the URL raw;\n#    the printf undoes that encoding so the file lands under the note's real name\ncurl -sS --fail-with-body {auth} \"{base}\" | sed -n 's/.*\"url\":\"\\([^\"]*\\)\".*/\\1/p' | while IFS= read -r u; do curl -sS --fail-with-body {auth} --create-dirs -o \"notes/$(printf '%b' \"$(printf '%s' \"$u\" | sed 's/%/\\\\x/g')\")\" \"{base}/$u\"; done"
+        "# many notes: pull the index once, then loop. Each line carries the note's on-disk name (path) and its URL form (url), so nothing is decoded client-side\ncurl -sS --fail-with-body {auth} \"{base}\" | while IFS= read -r line; do p=$(printf '%s' \"$line\" | sed -n 's/.*\"path\":\"\\([^\"]*\\)\".*/\\1/p'); u=$(printf '%s' \"$line\" | sed -n 's/.*\"url\":\"\\([^\"]*\\)\".*/\\1/p'); [ -n \"$u\" ] && curl -sS --fail-with-body {auth} --create-dirs -o \"notes/$p\" \"{base}/$u\"; done"
     ));
     recipe.push(
         "# deleting and moving are not part of this API: use the delete_notes and move_notes tools"
@@ -312,9 +312,15 @@ mod tests {
                  loop that runs, not a promise that one exists: {joined}"
             );
             assert!(
-                joined.contains("printf '%b'"),
-                "saving under the percent-encoded name leaves a vault of \
-                 %ED%95%9C files; the loop decodes before it lands: {joined}"
+                joined.contains("\"path\":\"") && joined.contains("\"url\":\""),
+                "the loop takes the note's on-disk name from the index (path) \
+                 and its wire form (url) -- the server holds both, so the \
+                 client decodes nothing: {joined}"
+            );
+            assert!(
+                !joined.contains("%b"),
+                "printf %b \\xNN decoding is a bashism: dash writes the \
+                 escapes into filenames and exits 0 -- silent corruption: {joined}"
             );
         }
     }
