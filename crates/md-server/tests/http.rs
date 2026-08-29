@@ -67,7 +67,7 @@ async fn http_client_lists_tools_and_calls_one() {
     assert_eq!(
         tools.len(),
         12,
-        "expected the full 12-tool surface over HTTP"
+        "an unguarded server has no bearer to delegate, so no provision_transfer"
     );
 
     let mut args = serde_json::Map::new();
@@ -104,7 +104,7 @@ async fn http_requires_bearer_when_token_set() {
         StreamableHttpClientTransportConfig::with_uri(url).auth_header("s3cret"),
     );
     let client = serve_client((), authed).await.expect("authed handshake");
-    assert_eq!(client.list_all_tools().await.expect("list tools").len(), 12);
+    assert_eq!(client.list_all_tools().await.expect("list tools").len(), 13);
 
     client.cancel().await.ok();
     handle.abort();
@@ -184,4 +184,576 @@ async fn concurrent_sessions_share_one_vault_and_serialize_writes() {
     s1.cancel().await.ok();
     s2.cancel().await.ok();
     handle.abort();
+}
+
+/// Ask for a transfer grant over MCP and return the raw MCP answer.
+async fn grant(addr: SocketAddr, write: bool) -> Value {
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header("s3cret"),
+    );
+    let client = serve_client((), transport).await.expect("client handshake");
+    let mut args = serde_json::Map::new();
+    args.insert("write".into(), json!(write));
+    let result = client
+        .call_tool(CallToolRequestParams::new("provision_transfer").with_arguments(args))
+        .await
+        .expect("call provision_transfer");
+    result.structured_content.expect("structured content")
+}
+
+/// Trade a ticket for the token it stands for, as the recipe's first line does.
+async fn redeem(addr: SocketAddr, code: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{addr}/transfer/redeem"))
+        .form(&[("code", code)])
+        .send()
+        .await
+        .unwrap()
+}
+
+/// The whole first step of the recipe: provision, then collect.
+async fn provision(addr: SocketAddr, write: bool) -> (String, Value) {
+    let grant = grant(addr, write).await;
+    let code = grant["code"].as_str().expect("a ticket").to_string();
+    let token = redeem(addr, &code)
+        .await
+        .text()
+        .await
+        .unwrap()
+        .trim()
+        .to_string();
+    (token, grant["scopes"].clone())
+}
+
+#[tokio::test]
+async fn the_grant_itself_carries_no_credential() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let grant = grant(addr, true).await;
+
+    assert!(
+        grant.get("token").is_none(),
+        "a credential in the answer would sit in the conversation for good: {grant}"
+    );
+    assert!(grant["code"].as_str().is_some_and(|c| c.len() > 20));
+}
+
+#[tokio::test]
+async fn a_ticket_is_spent_by_its_first_use() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let grant = grant(addr, false).await;
+    let code = grant["code"].as_str().unwrap().to_string();
+
+    let first = redeem(addr, &code).await;
+    assert_eq!(first.status(), 200);
+    assert!(!first.text().await.unwrap().trim().is_empty());
+
+    let second = redeem(addr, &code).await;
+    assert_eq!(
+        second.status(),
+        400,
+        "a ticket left behind in a transcript has to be worthless"
+    );
+}
+
+#[tokio::test]
+async fn the_collected_token_is_exactly_the_token() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let grant = grant(addr, false).await;
+    let code = grant["code"].as_str().unwrap().to_string();
+
+    let body = redeem(addr, &code).await.text().await.unwrap();
+    assert_eq!(
+        body,
+        body.trim(),
+        "the recipe reads the file back verbatim; a stray newline is invisible \
+         in a shell and fatal to every other consumer"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_ticket_buys_nothing() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    assert_eq!(redeem(addr, "not-a-ticket").await.status(), 400);
+}
+
+#[tokio::test]
+async fn a_provisioned_credential_reads_but_cannot_write() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let (token, scopes) = provision(addr, false).await;
+    assert_eq!(scopes, json!(["notes:read"]), "writing is opt-in");
+
+    let http = reqwest::Client::new();
+    let read = http
+        .get(format!("http://{addr}/api/notes/hello.md"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 200);
+
+    let write = http
+        .put(format!("http://{addr}/api/notes/new.md"))
+        .bearer_auth(&token)
+        .body("# New\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        write.status(),
+        403,
+        "a token minted weaker than its parent has to actually be weaker"
+    );
+}
+
+#[tokio::test]
+async fn a_provisioned_credential_writes_when_asked_to() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let (token, scopes) = provision(addr, true).await;
+    assert_eq!(scopes, json!(["notes:read", "notes:write"]));
+
+    let write = reqwest::Client::new()
+        .put(format!("http://{addr}/api/notes/new.md"))
+        .bearer_auth(&token)
+        .body("# New\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(write.status(), 201);
+}
+
+#[tokio::test]
+async fn the_static_token_is_not_what_gets_handed_out() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let (token, _) = provision(addr, true).await;
+    assert_ne!(
+        token, "s3cret",
+        "handing back the parent bearer would defeat the whole grant"
+    );
+}
+
+#[tokio::test]
+async fn the_transfer_surface_offers_no_renewal() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let grant = grant(addr, false).await;
+    assert!(
+        grant.get("renew").is_none() && grant.get("token_max_lifetime_seconds").is_none(),
+        "a grant promising renewal would teach a caller to build on a chain \
+         this server no longer runs: {grant}"
+    );
+
+    let code = grant["code"].as_str().unwrap().to_string();
+    let token = redeem(addr, &code).await.text().await.unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/transfer/renew"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        404,
+        "a transfer token lapses on its TTL and is not renewable; a fresh \
+         grant is one tool call away"
+    );
+}
+
+#[tokio::test]
+async fn the_grant_can_be_asked_for_with_no_arguments_at_all() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header("s3cret"),
+    );
+    let client = serve_client((), transport).await.expect("client handshake");
+
+    // Every field has a default, so a caller that passes nothing is asking for
+    // the default grant, not making a mistake.
+    let bare = client
+        .call_tool(CallToolRequestParams::new("provision_transfer"))
+        .await
+        .expect("a tool whose arguments are all optional must accept none");
+    assert!(
+        bare.structured_content.expect("structured content")["code"]
+            .as_str()
+            .is_some()
+    );
+
+    let empty = client
+        .call_tool(
+            CallToolRequestParams::new("provision_transfer").with_arguments(serde_json::Map::new()),
+        )
+        .await
+        .expect("an empty argument object is the same request");
+    assert!(
+        empty.structured_content.expect("structured content")["code"]
+            .as_str()
+            .is_some()
+    );
+}
+
+/// A grant confined to one directory, checking it says what it is confined to.
+async fn provision_confined(addr: SocketAddr, write: bool, prefix: &str) -> String {
+    let (token, scopes) = provision_confined_raw(addr, write, prefix).await;
+    assert!(
+        scopes
+            .iter()
+            .any(|s| s == &json!(format!("under:{prefix}"))),
+        "the grant must say what it is confined to: {scopes:?}"
+    );
+    token
+}
+
+/// As [`provision_confined`], handing back the scopes rather than checking how
+/// they are spelled — the server composes a name it was given decomposed.
+async fn provision_confined_raw(
+    addr: SocketAddr,
+    write: bool,
+    prefix: &str,
+) -> (String, Vec<Value>) {
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header("s3cret"),
+    );
+    let client = serve_client((), transport).await.expect("client handshake");
+    let mut args = serde_json::Map::new();
+    args.insert("write".into(), json!(write));
+    args.insert("prefix".into(), json!(prefix));
+    let result = client
+        .call_tool(CallToolRequestParams::new("provision_transfer").with_arguments(args))
+        .await
+        .expect("call provision_transfer");
+    let grant: Value = result.structured_content.expect("structured content");
+    let scopes = grant["scopes"].as_array().expect("scopes").clone();
+    let code = grant["code"].as_str().expect("a ticket").to_string();
+    let token = redeem(addr, &code)
+        .await
+        .text()
+        .await
+        .unwrap()
+        .trim()
+        .to_string();
+    (token, scopes)
+}
+
+#[tokio::test]
+async fn a_confined_grant_cannot_reach_outside_its_directory() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let http = reqwest::Client::new();
+
+    let (full, _) = provision(addr, true).await;
+    assert_eq!(
+        http.put(format!("http://{addr}/api/notes/inbox/one.md"))
+            .bearer_auth(&full)
+            .body("# One\n")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        201
+    );
+
+    let confined = provision_confined(addr, true, "inbox").await;
+
+    assert_eq!(
+        http.get(format!("http://{addr}/api/notes/inbox/one.md"))
+            .bearer_auth(&confined)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "inside its own directory it works normally"
+    );
+    assert_eq!(
+        http.get(format!("http://{addr}/api/notes/hello.md"))
+            .bearer_auth(&confined)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403,
+        "a confined credential is the only thing here that is a boundary rather \
+         than a speed bump"
+    );
+    assert_eq!(
+        http.put(format!("http://{addr}/api/notes/elsewhere.md"))
+            .bearer_auth(&confined)
+            .body("# No\n")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403,
+        "confinement has to hold for writes too"
+    );
+    assert_eq!(
+        http.get(format!("http://{addr}/api/notes?prefix=."))
+            .bearer_auth(&confined)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400,
+        "the index takes no parameters; a prefix would only restate or \
+         contradict what the grant already is"
+    );
+}
+
+#[tokio::test]
+async fn a_confined_grant_narrows_an_unqualified_index_to_itself() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let http = reqwest::Client::new();
+    let (full, _) = provision(addr, true).await;
+    for name in ["inbox/one.md", "inbox/two.md"] {
+        http.put(format!("http://{addr}/api/notes/{name}"))
+            .bearer_auth(&full)
+            .body("# x\n")
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let confined = provision_confined(addr, false, "inbox").await;
+    let response = http
+        .get(format!("http://{addr}/api/notes"))
+        .bearer_auth(&confined)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        200,
+        "a credential that can only see one subtree is already narrowed, so it \
+         has nothing to opt into"
+    );
+    assert_eq!(response.headers()["note-count"], "2");
+}
+
+#[tokio::test]
+async fn a_grant_can_be_confined_to_a_single_note() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let http = reqwest::Client::new();
+    let (full, _) = provision(addr, true).await;
+    for name in ["inbox/one.md", "inbox/two.md"] {
+        http.put(format!("http://{addr}/api/notes/{name}"))
+            .bearer_auth(&full)
+            .body("# x\n")
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let confined = provision_confined(addr, true, "inbox/one.md").await;
+
+    assert_eq!(
+        http.get(format!("http://{addr}/api/notes/inbox/one.md"))
+            .bearer_auth(&confined)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "the narrowest useful grant is one note, and a script that edits one \
+         note should be able to hold nothing more"
+    );
+    assert_eq!(
+        http.get(format!("http://{addr}/api/notes/inbox/two.md"))
+            .bearer_auth(&confined)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+
+    let listing = http
+        .get(format!("http://{addr}/api/notes"))
+        .bearer_auth(&confined)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        listing.status(),
+        200,
+        "a credential confined to a note still has a collection: it is that note"
+    );
+    assert_eq!(listing.headers()["note-count"], "1");
+}
+
+#[tokio::test]
+async fn a_directory_grant_is_not_mistaken_for_a_note_before_it_exists() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header("s3cret"),
+    );
+    let client = serve_client((), transport).await.expect("client handshake");
+    let mut args = serde_json::Map::new();
+    args.insert("write".into(), json!(true));
+    // A writing grant naturally aims at a directory that does not exist yet.
+    args.insert("prefix".into(), json!("inbox/not-yet"));
+    let grant = client
+        .call_tool(CallToolRequestParams::new("provision_transfer").with_arguments(args))
+        .await
+        .expect("call provision_transfer")
+        .structured_content
+        .expect("structured content");
+
+    let recipe = grant["recipe"].to_string();
+    assert!(
+        !recipe.contains("/api/notes/inbox/not-yet\""),
+        "classified by what the vault holds today, this grant was printed as \
+         a runnable note line naming a directory: {recipe}"
+    );
+    assert!(
+        recipe.contains("<path-from-the-index>"),
+        "a directory grant gets the substitution, like any other wide \
+         grant: {recipe}"
+    );
+}
+
+#[tokio::test]
+async fn two_grants_do_not_share_a_token_file() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+
+    let first = grant(addr, false).await;
+    let second = grant(addr, false).await;
+
+    assert_ne!(
+        first["token_file"], second["token_file"],
+        "collecting the second grant would overwrite the first token on disk \
+         without saying so"
+    );
+}
+
+/// Every grant shape against every path: an asymmetry — issued fine, writes
+/// fine, one path erroring — is exactly what single-finding tests keep
+/// missing, so the whole table is asserted at once.
+#[tokio::test]
+async fn every_grant_shape_answers_every_path() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let http = reqwest::Client::new();
+    let (full, _) = provision(addr, true).await;
+    for name in ["inbox/one.md", "inbox/two.md"] {
+        let put = http
+            .put(format!("http://{addr}/api/notes/{name}"))
+            .bearer_auth(&full)
+            .body("# x\n")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status(), 201);
+    }
+
+    // (prefix, notes the grant reaches today, a note inside the grant)
+    let shapes = [
+        ("inbox", 2, "inbox/one.md"),
+        ("not-yet", 0, "not-yet/probe.md"),
+        ("inbox/one.md", 1, "inbox/one.md"),
+        ("ghost.md", 0, "ghost.md"),
+    ];
+    for (prefix, count, note) in shapes {
+        let (token, _) = provision_confined_raw(addr, true, prefix).await;
+
+        let index = http
+            .get(format!("http://{addr}/api/notes"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            index.status(),
+            200,
+            "{prefix}: a grant whose universe is empty today — a directory \
+             about to be created — still has an index: the empty one"
+        );
+        assert_eq!(index.headers()["note-count"], count.to_string(), "{prefix}");
+        assert_eq!(
+            index.text().await.unwrap().lines().count(),
+            count,
+            "{prefix}"
+        );
+
+        let get = http
+            .get(format!("http://{addr}/api/notes/{note}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            get.status(),
+            if count == 0 { 404 } else { 200 },
+            "{prefix}: inside the grant, absence is 404 — never 403"
+        );
+
+        let put = http
+            .put(format!("http://{addr}/api/notes/{note}"))
+            .bearer_auth(&token)
+            .header("if-match", "*")
+            .body("# w\n")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            put.status(),
+            if count == 0 { 404 } else { 204 },
+            "{prefix}: `*` on an absent note refuses, a present one replaces"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_transfer_credential_is_refused_by_the_tool_surface() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let confined = provision_confined(addr, false, "inbox").await;
+
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header(confined),
+    );
+    let handshake =
+        tokio::time::timeout(Duration::from_secs(10), serve_client((), transport)).await;
+
+    assert!(
+        matches!(handshake, Ok(Err(_))),
+        "the tool surface does not read scopes, so a credential that reaches it \
+         is unconfined and may write the whole vault — every guarantee the \
+         transfer API enforces would be one request away from irrelevant. \
+         got {handshake:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_grant_confined_with_a_decomposed_name_still_reaches_its_own_notes() {
+    use unicode_normalization::UnicodeNormalization;
+
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let http = reqwest::Client::new();
+    let (full, _) = provision(addr, true).await;
+    http.put(format!("http://{addr}/api/notes/노트/one.md"))
+        .bearer_auth(&full)
+        .body("# x\n")
+        .send()
+        .await
+        .unwrap();
+
+    let decomposed: String = "노트".nfd().collect();
+    assert_ne!(decomposed, "노트", "the fixture must actually differ");
+    let (confined, _) = provision_confined_raw(addr, false, &decomposed).await;
+
+    assert_eq!(
+        http.get(format!("http://{addr}/api/notes/노트/one.md"))
+            .bearer_auth(&confined)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "the paths a grant is compared against are composed, so a grant spelled \
+         decomposed would be refused its own directory — and the recipe, which \
+         resolves the name through the vault, would look fine while every \
+         request it prints fails"
+    );
 }

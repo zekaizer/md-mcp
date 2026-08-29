@@ -34,6 +34,16 @@ const ACCESS_TTL_SECS: u64 = 60 * 60;
 const REFRESH_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 /// Authorization codes are single-use and short-lived.
 const CODE_TTL_SECS: u64 = 5 * 60;
+/// A transfer ticket is usually redeemed in the same turn it is handed out, so
+/// it lapses fast and what it leaves in a conversation transcript is dead text.
+/// Long enough, though, that a person reading the answer before running it is
+/// not racing a clock.
+pub(crate) const TRANSFER_CODE_TTL_SECS: u64 = 300;
+/// How long a transfer token stays usable. There is no renewal: a fresh grant
+/// is one tool call away, so the TTL alone bounds a forgotten credential.
+/// Short enough that one left in a sandbox stops mattering, long enough to
+/// survive the local work between fetching notes and pushing them back.
+pub(crate) const TRANSFER_TOKEN_TTL_SECS: u64 = 30 * 60;
 
 /// State schema version. Bump on a breaking change; an unreadable/old file starts empty,
 /// which forces a one-time re-auth.
@@ -70,11 +80,67 @@ impl Default for Persisted {
     }
 }
 
-/// An issued token: its expiry and the client it was issued to.
+/// What a credential is allowed to do. A token may hold less than the authority
+/// that issued it, never more.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scopes {
+    #[serde(default)]
+    pub read: bool,
+    #[serde(default)]
+    pub write: bool,
+    /// Minted for the transfer API rather than issued by the authorization
+    /// flow. The tool surface reads no scopes, so a delegated credential
+    /// reaching it would arrive unconfined and able to write the whole vault —
+    /// it is refused there instead. Absent on disk means a connector's own
+    /// token, which is what every record predating this field is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delegated: bool,
+    /// The only subtree this credential can reach. `None` is the whole vault —
+    /// which is what every token held before scopes existed, so absence has to
+    /// keep meaning that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+}
+
+impl Scopes {
+    /// Everything the static token can do.
+    pub fn full() -> Self {
+        Self {
+            read: true,
+            write: true,
+            delegated: false,
+            prefix: None,
+        }
+    }
+
+    /// Whether this credential may touch `path`. Compared by path segment, not
+    /// by string: `00-inbox-archive` merely starts with `00-inbox` and is a
+    /// different directory.
+    pub fn permits(&self, path: &str) -> bool {
+        let Some(prefix) = self.prefix.as_deref().map(|p| p.trim_matches('/')) else {
+            return true;
+        };
+        if prefix.is_empty() {
+            return true;
+        }
+        let path = path.trim_matches('/');
+        path == prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    }
+}
+
+/// An issued token: its expiry, its authority, and the client it was issued to.
 #[derive(Clone, Serialize, Deserialize)]
 struct TokenRec {
     /// Unix-seconds expiry.
     expires_at: u64,
+    /// Absent on disk means the record predates scopes, when every issued token
+    /// held the static token's full authority. Reading it as "no authority"
+    /// would 401 every live session the moment this version is deployed.
+    #[serde(default = "Scopes::full")]
+    scopes: Scopes,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_id: Option<String>,
 }
@@ -85,6 +151,14 @@ struct ClientRec {
     /// Unix-seconds registration time, for eviction order. `0` for legacy records.
     #[serde(default)]
     created_at: u64,
+}
+
+/// A one-time ticket for a transfer token. In-memory only: a restart should
+/// invalidate every outstanding ticket, and it holds the grant rather than the
+/// credential, so the token's own clock starts when it is actually collected.
+struct TransferCode {
+    scopes: Scopes,
+    expires_at: u64,
 }
 
 /// In-memory only (one-time, short-lived).
@@ -103,6 +177,7 @@ pub struct OAuthState {
     state_file: PathBuf,
     store: Mutex<Persisted>,
     codes: Mutex<HashMap<String, CodeRec>>,
+    transfer_codes: Mutex<HashMap<String, TransferCode>>,
 }
 
 impl OAuthState {
@@ -124,6 +199,7 @@ impl OAuthState {
             state_file,
             store: Mutex::new(store),
             codes: Mutex::new(HashMap::new()),
+            transfer_codes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -132,16 +208,17 @@ impl OAuthState {
         &self.static_token
     }
 
-    /// True if `token` is the static token or a live issued access token.
-    pub fn validate_bearer(&self, token: &str) -> bool {
+    /// The authority behind `token`, or `None` when it is not a live credential.
+    pub fn validate_bearer(&self, token: &str) -> Option<Scopes> {
         if token_matches(token, &self.static_token) {
-            return true;
+            return Some(Scopes::full());
         }
         let store = self.store.lock().unwrap();
         store
             .access
             .get(token)
-            .is_some_and(|rec| rec.expires_at > now_secs())
+            .filter(|rec| rec.expires_at > now_secs())
+            .map(|rec| rec.scopes.clone())
     }
 
     /// Atomically persist the store (owner-only, temp + rename, creating the state dir).
@@ -264,6 +341,62 @@ impl OAuthState {
         Some(self.issue_tokens(client_id))
     }
 
+    /// A one-time ticket that trades for a transfer token, so the credential
+    /// itself never has to be spoken aloud where it would be written down.
+    pub fn issue_transfer_code(&self, scopes: Scopes) -> String {
+        let code = random_token();
+        let now = now_secs();
+        let mut codes = self.transfer_codes.lock().unwrap();
+        codes.retain(|_, rec| rec.expires_at > now);
+        codes.insert(
+            code.clone(),
+            TransferCode {
+                scopes,
+                expires_at: now + TRANSFER_CODE_TTL_SECS,
+            },
+        );
+        code
+    }
+
+    /// Trade a ticket for the token it stands for. Consumes it either way: a
+    /// ticket that has been offered once is spent, redeemed or not.
+    pub fn redeem_transfer_code(&self, code: &str) -> Option<String> {
+        // Removed before it is examined, so two callers racing the same ticket
+        // cannot both walk away with a token.
+        let rec = self.transfer_codes.lock().unwrap().remove(code)?;
+        if rec.expires_at <= now_secs() {
+            return None;
+        }
+        Some(self.mint(rec.scopes, TRANSFER_TOKEN_TTL_SECS))
+    }
+
+    /// Mint a standalone access token holding no more than `scopes`, valid for
+    /// `ttl_secs`. It has no refresh token: a credential handed to a sandbox is
+    /// meant to lapse, not to renew itself.
+    pub fn mint(&self, scopes: Scopes, ttl_secs: u64) -> String {
+        let token = random_token();
+        // Minting is how a delegated credential comes into being; the flag is
+        // set here so no caller can forget to.
+        let scopes = Scopes {
+            delegated: true,
+            ..scopes
+        };
+        {
+            let expires_at = now_secs() + ttl_secs;
+            let mut store = self.store.lock().unwrap();
+            store.access.insert(
+                token.clone(),
+                TokenRec {
+                    expires_at,
+                    scopes,
+                    client_id: None,
+                },
+            );
+        }
+        self.persist();
+        token
+    }
+
     fn issue_tokens(&self, client_id: Option<String>) -> TokenResponse {
         let access = random_token();
         let refresh = random_token();
@@ -274,6 +407,7 @@ impl OAuthState {
                 access.clone(),
                 TokenRec {
                     expires_at: now + ACCESS_TTL_SECS,
+                    scopes: Scopes::full(),
                     client_id: client_id.clone(),
                 },
             );
@@ -281,6 +415,7 @@ impl OAuthState {
                 refresh.clone(),
                 TokenRec {
                     expires_at: now + REFRESH_TTL_SECS,
+                    scopes: Scopes::full(),
                     client_id,
                 },
             );
@@ -313,6 +448,7 @@ pub fn routes(state: Arc<OAuthState>) -> Router {
         .route("/register", post(register))
         .route("/authorize", get(authorize_get).post(authorize_post))
         .route("/token", post(token))
+        .route("/transfer/redeem", post(redeem))
         .with_state(state)
 }
 
@@ -512,6 +648,42 @@ fn validate_authorize(oauth: &OAuthState, q: &AuthorizeQuery) -> Result<(), &'st
     Ok(())
 }
 
+// --- transfer ticket ---------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RedeemRequest {
+    code: String,
+}
+
+/// Trade a one-time ticket for a transfer token.
+///
+/// The body is the bare token so a caller can `-o` it straight into a file: the
+/// credential then never appears on a command line, in shell history, or in the
+/// conversation that arranged it. Unauthenticated by necessity — the ticket is
+/// the only thing the holder has.
+async fn redeem(State(oauth): State<Arc<OAuthState>>, Form(req): Form<RedeemRequest>) -> Response {
+    match oauth.redeem_transfer_code(&req.code) {
+        Some(token) => {
+            tracing::info!("transfer: ticket redeemed");
+            (
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                // The exact token, no trailing newline: the file is read back
+                // verbatim, and not every consumer is a shell that trims.
+                token,
+            )
+                .into_response()
+        }
+        None => {
+            tracing::warn!("transfer: ticket rejected (unknown, spent, or lapsed)");
+            (
+                StatusCode::BAD_REQUEST,
+                "this ticket is spent or lapsed; call provision_transfer again for a fresh one\n",
+            )
+                .into_response()
+        }
+    }
+}
+
 // --- token -------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -602,12 +774,22 @@ fn oauth_error(status: StatusCode, error: &str) -> Response {
 
 /// Public base URL derived from the (tunnel-forwarded, allowlisted) `Host` header; HTTPS
 /// by posture (TLS terminates at the tunnel).
-fn base_url(headers: &HeaderMap) -> String {
+pub(crate) fn base_url(headers: &HeaderMap) -> String {
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("localhost");
     format!("https://{host}")
+}
+
+/// As [`percent_encode`], but a vault path stays a path: only the segments are
+/// escaped. A name with a space makes curl refuse the URL outright, and one
+/// with `?` or `#` silently cuts the path short.
+pub(crate) fn percent_encode_path(path: &str) -> String {
+    path.split('/')
+        .map(percent_encode)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn now_secs() -> u64 {
@@ -672,7 +854,7 @@ fn loopback_key(uri: &str) -> Option<(String, String, Option<String>)> {
 }
 
 /// Minimal percent-encoding for a query-string value (RFC 3986 unreserved pass through).
-fn percent_encode(value: &str) -> String {
+pub(crate) fn percent_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for b in value.bytes() {
         match b {
@@ -732,6 +914,231 @@ fn authorize_form(q: &AuthorizeQuery, error: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A state file as the server wrote it before scopes existed.
+    fn write_legacy_state(path: &std::path::Path, token: &str, expires_at: u64) {
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"v":1,"clients":{{}},"access":{{"{token}":{{"expires_at":{expires_at}}}}},"refresh":{{}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_stored_token_without_scopes_keeps_full_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("oauth-state.json");
+        write_legacy_state(&file, "live-token", now_secs() + 3600);
+
+        let oauth = OAuthState::load("static-token".to_string(), file);
+
+        assert_eq!(
+            oauth.validate_bearer("live-token"),
+            Some(Scopes::full()),
+            "a record written before scopes existed must not lose authority on upgrade: \
+             every connected session would 401 at once"
+        );
+    }
+
+    #[test]
+    fn a_minted_token_carries_only_the_authority_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
+        let reduced = Scopes {
+            read: true,
+            write: false,
+            delegated: false,
+            prefix: None,
+        };
+
+        let token = oauth.mint(reduced.clone(), 600);
+
+        assert_ne!(token, "static-token", "a child must not be its parent");
+        assert_eq!(
+            oauth.validate_bearer(&token),
+            Some(Scopes {
+                delegated: true,
+                ..reduced
+            }),
+            "a token handed to a sandbox has to be weaker than the one that minted \
+             it, and has to say it was minted"
+        );
+    }
+
+    #[test]
+    fn a_minted_token_lapses() {
+        let dir = tempfile::tempdir().unwrap();
+        let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
+
+        let token = oauth.mint(Scopes::full(), 0);
+
+        assert_eq!(oauth.validate_bearer(&token), None);
+    }
+
+    /// The shape a running deployment actually restarts from: access records
+    /// long expired, refresh records alive, none of them carrying scopes.
+    #[test]
+    fn a_stored_refresh_without_scopes_still_refreshes_into_full_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("oauth-state.json");
+        let expired = now_secs() - 1;
+        let live = now_secs() + 3600;
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"v":1,"clients":{{}},                   "access":{{"stale":{{"expires_at":{expired}}}}},                   "refresh":{{"live-refresh":{{"expires_at":{live}}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let oauth = OAuthState::load("static-token".to_string(), file);
+        let refreshed = oauth
+            .refresh("live-refresh")
+            .expect("a live refresh token predating scopes must still be redeemable");
+
+        assert_eq!(
+            oauth.validate_bearer(&refreshed.access_token),
+            Some(Scopes::full()),
+            "the connector holds a refresh token, not an access token, across a restart"
+        );
+    }
+
+    #[test]
+    fn a_transfer_code_trades_for_a_token_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
+        let granted = Scopes {
+            read: true,
+            write: false,
+            delegated: false,
+            prefix: None,
+        };
+
+        let code = oauth.issue_transfer_code(granted.clone());
+        assert_ne!(code, "", "a ticket has to be something");
+
+        let token = oauth
+            .redeem_transfer_code(&code)
+            .expect("the first redemption yields the token");
+        assert_eq!(
+            oauth.validate_bearer(&token),
+            Some(Scopes {
+                delegated: true,
+                ..granted
+            })
+        );
+        assert_ne!(token, code, "the ticket is not the credential");
+
+        assert_eq!(
+            oauth.redeem_transfer_code(&code),
+            None,
+            "a ticket left in a transcript must be worthless the moment it is used"
+        );
+    }
+
+    #[test]
+    fn a_lapsed_transfer_code_trades_for_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
+
+        let code = oauth.issue_transfer_code(Scopes::full());
+        // Reach in and age it past its window rather than sleeping two minutes.
+        oauth
+            .transfer_codes
+            .lock()
+            .unwrap()
+            .get_mut(&code)
+            .unwrap()
+            .expires_at = now_secs() - 1;
+
+        assert_eq!(oauth.redeem_transfer_code(&code), None);
+    }
+
+    #[test]
+    fn a_scoped_credential_reaches_only_its_own_subtree() {
+        let scoped = Scopes {
+            read: true,
+            write: false,
+            delegated: false,
+            prefix: Some("00-inbox".to_string()),
+        };
+
+        assert!(scoped.permits("00-inbox/a.md"));
+        assert!(scoped.permits("00-inbox/deep/b.md"));
+        assert!(
+            scoped.permits("00-inbox"),
+            "the directory itself is inside it"
+        );
+
+        assert!(!scoped.permits("01-projects/a.md"));
+        assert!(
+            !scoped.permits("a.md"),
+            "the vault root is outside a subtree"
+        );
+        assert!(
+            !scoped.permits("00-inbox-archive/a.md"),
+            "a sibling that merely starts with the same letters is outside: \
+             comparing strings rather than path segments is how this leaks"
+        );
+    }
+
+    #[test]
+    fn an_unscoped_credential_reaches_the_whole_vault() {
+        assert!(Scopes::full().permits("anywhere/at/all.md"));
+        assert!(Scopes::full().permits("root.md"));
+    }
+
+    #[test]
+    fn the_static_token_holds_full_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
+        assert_eq!(oauth.validate_bearer("static-token"), Some(Scopes::full()));
+    }
+
+    #[test]
+    fn an_unknown_or_expired_token_holds_no_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("oauth-state.json");
+        write_legacy_state(&file, "stale-token", now_secs() - 1);
+
+        let oauth = OAuthState::load("static-token".to_string(), file);
+
+        assert_eq!(oauth.validate_bearer("never-issued"), None);
+        assert_eq!(oauth.validate_bearer("stale-token"), None);
+    }
+
+    #[test]
+    fn a_reduced_scope_survives_a_persist_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("oauth-state.json");
+        let reduced = Scopes {
+            read: false,
+            write: true,
+            delegated: false,
+            prefix: None,
+        };
+
+        let oauth = OAuthState::load("static-token".to_string(), file.clone());
+        oauth.store.lock().unwrap().access.insert(
+            "child-token".to_string(),
+            TokenRec {
+                expires_at: now_secs() + 3600,
+                scopes: reduced.clone(),
+                client_id: None,
+            },
+        );
+        oauth.persist();
+        drop(oauth);
+
+        let reloaded = OAuthState::load("static-token".to_string(), file);
+        assert_eq!(
+            reloaded.validate_bearer("child-token"),
+            Some(reduced.clone()),
+            "a token minted weaker than its parent must not widen across a restart"
+        );
+    }
 
     #[test]
     fn pkce_s256_roundtrip() {
@@ -816,5 +1223,16 @@ mod tests {
     fn percent_encode_escapes_query_chars() {
         assert_eq!(percent_encode("a b&c"), "a%20b%26c");
         assert_eq!(percent_encode("safe-_.~"), "safe-_.~");
+        assert_eq!(
+            percent_encode_path("00-inbox/a b.md"),
+            "00-inbox/a%20b.md",
+            "a path keeps its separators and escapes everything else"
+        );
+        assert_eq!(percent_encode_path("노트.md"), "%EB%85%B8%ED%8A%B8.md");
+        assert_eq!(
+            percent_encode_path("q?x#y.md"),
+            "q%3Fx%23y.md",
+            "`?` and `#` would cut the path short"
+        );
     }
 }

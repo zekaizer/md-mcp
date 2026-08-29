@@ -133,7 +133,7 @@ pub struct SearchItem {
 impl MdServer {
     /// List notes (and optionally directories) by directory and glob.
     #[tool(
-        description = "List notes under a directory (default the whole vault), optionally filtered by a glob (e.g. daily/**/*.md). Returns path-sorted items with size and modified time; pass next_cursor to page. Directories (include_dirs) end with /.",
+        description = "List notes under a directory (default the whole vault), optionally filtered by a glob (e.g. daily/**/*.md). The glob selects notes only: with include_dirs, directories are listed whether or not they match it. Returns path-sorted items with size and modified time; pass next_cursor to page. Directories end with /.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub async fn list_notes(

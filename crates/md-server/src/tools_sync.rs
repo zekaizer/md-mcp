@@ -354,6 +354,68 @@ mod tests {
         assert!(status.contains("external.md"), "got: {status}");
     }
 
+    /// Pins a fact live verification twice mis-reported: an HTTP PUT rides
+    /// the same per-write auto-commit as a tool write. `pushed: N` after a
+    /// sync proves N commits existed — it is not evidence they were swept.
+    #[tokio::test]
+    async fn an_http_put_lands_the_same_auto_commit_as_a_tool_write() {
+        let (_root, vault_dir, _clone) = repo_fixture();
+        let s = server_with_sync(&vault_dir).await.with_auto_commit();
+
+        let app = crate::api::routes(s);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        let response = reqwest::Client::new()
+            .put(format!("http://{addr}/api/notes/probe.md"))
+            .body("# probe\n")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+
+        let out = Command::new("git")
+            .args(["log", "--format=%s", "-1"])
+            .current_dir(&vault_dir)
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            log.contains("mcp(put_note): 1 notes"),
+            "an HTTP write outside the commit trail would vanish into the \
+             next sweep, attributed to nobody: {log}"
+        );
+
+        // The second invariant live verification measured (5 PUTs, 4 commits):
+        // a PUT that changes no bytes adds no commit.
+        let commits = || {
+            let out = Command::new("git")
+                .args(["rev-list", "--count", "HEAD"])
+                .current_dir(&vault_dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let before = commits();
+        let etag = response.headers()["etag"].to_str().unwrap().to_string();
+        let noop = reqwest::Client::new()
+            .put(format!("http://{addr}/api/notes/probe.md"))
+            .header("if-match", etag)
+            .body("# probe\n")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(noop.status(), 204);
+        assert_eq!(
+            commits(),
+            before,
+            "a write that moved nothing has nothing to attribute"
+        );
+    }
+
     #[tokio::test]
     async fn auto_push_lands_commits_on_the_remote_after_the_quiet_window() {
         let (root, vault_dir, _clone) = repo_fixture();

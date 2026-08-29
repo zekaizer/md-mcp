@@ -29,7 +29,7 @@ use tokio::net::TcpListener;
 
 use crate::MdServer;
 use crate::config::HttpConfig;
-use crate::oauth::{self, OAuthState};
+use crate::oauth::{self, OAuthState, Scopes};
 
 /// How long an idle MCP session is kept before rmcp reaps it. rmcp's own default
 /// is 5 minutes, which a conversational client outlives all the time: the session
@@ -72,13 +72,26 @@ pub fn router(server: MdServer, cfg: &HttpConfig) -> Router {
         Some(origins) => sh_config = sh_config.with_allowed_origins(origins.clone()),
     }
 
+    // `provision_transfer` delegates from a bearer, so it exists only where one
+    // is required.
+    let server = if cfg.token.is_some() {
+        server.with_transfer()
+    } else {
+        server
+    };
+    let api = crate::api::routes(server.clone());
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(session_manager()),
         sh_config,
     );
 
-    let mcp = Router::new().route_service("/mcp", service);
+    // The guard sits on `/mcp` alone rather than inside the shared bearer
+    // middleware: the rule is about this surface, not about every request.
+    let mcp = Router::new()
+        .route_service("/mcp", service)
+        .layer(middleware::from_fn(deny_delegated))
+        .merge(api);
 
     // OAuth is enabled exactly when a static token is set (ADR-0014): the token is the
     // `/authorize` ownership gate and the Claude Code (CLI) bearer. Without it, the
@@ -242,6 +255,12 @@ const ACCESS_SNIFF_MAX: usize = 256 * 1024;
 async fn access_log(request: Request, next: Next) -> Response {
     let started = std::time::Instant::now();
     let http_method = request.method().clone();
+    // Path and query only: the bodies that carry secrets (a ticket, a bearer)
+    // never put them here.
+    let target = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| "/".to_string(), ToString::to_string);
 
     let (parts, body) = request.into_parts();
     let content_length = parts
@@ -270,8 +289,14 @@ async fn access_log(request: Request, next: Next) -> Response {
     let (rpc, tool) = call.map_or((None, None), |(rpc, tool)| (Some(rpc), tool));
     let meta = AccessMeta {
         method: http_method,
+        path: target,
         rpc,
         tool,
+        notes: response
+            .headers()
+            .get(crate::api::NOTE_COUNT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
         status: response.status().as_u16(),
         started,
     };
@@ -295,8 +320,14 @@ async fn access_log(request: Request, next: Next) -> Response {
 /// The access-log fields captured up front, emitted once at end-of-stream.
 struct AccessMeta {
     method: axum::http::Method,
+    /// Path and query. `/mcp` carries neither, but a transfer request says what
+    /// it reached for right here, and a whole-vault pull is otherwise
+    /// indistinguishable from fetching one note.
+    path: String,
     rpc: Option<String>,
     tool: Option<String>,
+    /// How many notes a transfer carried, from the response's own header.
+    notes: Option<String>,
     status: u16,
     started: std::time::Instant,
 }
@@ -307,8 +338,10 @@ impl AccessMeta {
         tracing::info!(
             target: "md_server::access",
             method = %self.method,
+            path = %self.path,
             rpc = self.rpc.as_deref(),
             tool = self.tool.as_deref(),
+            notes = self.notes.as_deref(),
             status = self.status,
             duration_ms,
             outcome,
@@ -379,7 +412,7 @@ fn parse_rpc_call(bytes: &[u8]) -> Option<(String, Option<String>)> {
 /// so the claude.ai connector can start the OAuth flow (ADR-0014).
 async fn require_bearer(
     State(oauth): State<Arc<OAuthState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let token = request
@@ -388,10 +421,43 @@ async fn require_bearer(
         .and_then(|v| v.to_str().ok())
         .and_then(parse_bearer)
         .map(str::to_owned);
-    match token {
-        Some(token) if oauth.validate_bearer(&token) => next.run(request).await,
-        _ => unauthorized(&request),
+    match token
+        .as_deref()
+        .and_then(|token| oauth.validate_bearer(token))
+    {
+        // Downstream handlers read the caller's authority from here; `/mcp` tools
+        // do not consult it yet, and every token they see still holds it all.
+        Some(scopes) => {
+            request.extensions_mut().insert(scopes);
+            // `provision_transfer` delegates from here; a tool sees this through
+            // the HTTP parts rmcp hands it.
+            request.extensions_mut().insert(oauth.clone());
+            next.run(request).await
+        }
+        None => unauthorized(&request),
     }
+}
+
+/// Refuse a transfer credential on the tool surface.
+///
+/// Tools read no scopes, so a delegated credential would arrive here holding
+/// everything its confinement and its read-only grant were meant to withhold.
+/// It is refused rather than widened.
+async fn deny_delegated(request: Request, next: Next) -> Response {
+    if request
+        .extensions()
+        .get::<Scopes>()
+        .is_some_and(|scopes| scopes.delegated)
+    {
+        tracing::warn!("mcp: refused a transfer credential on the tool surface");
+        return (
+            StatusCode::UNAUTHORIZED,
+            "this credential is for the transfer API; the tool surface needs the one the \
+             connector was authorised with\n",
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// `401` carrying the RFC 9728 `WWW-Authenticate` challenge pointing at this server's
@@ -404,9 +470,14 @@ fn unauthorized(request: &Request) -> Response {
         .unwrap_or("localhost");
     let challenge =
         format!("Bearer resource_metadata=\"https://{host}/.well-known/oauth-protected-resource\"");
+    // A transfer token lapses in ten minutes, so this is the failure a caller
+    // meets most often; every other refusal here explains itself, and this one
+    // answering with an empty body made it the only silent one.
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, challenge)],
+        "no credential, or one that has lapsed or was never issued; call \
+         provision_transfer for a fresh grant\n",
     )
         .into_response()
 }
@@ -414,7 +485,7 @@ fn unauthorized(request: &Request) -> Response {
 /// Extract the credential from an `Authorization` value. Per RFC 7235/6750 the
 /// scheme is case-insensitive and the separator is `1*SP`, so `Bearer`, `bearer`,
 /// and extra spaces all parse.
-fn parse_bearer(value: &str) -> Option<&str> {
+pub(crate) fn parse_bearer(value: &str) -> Option<&str> {
     let (scheme, credential) = value.split_once(char::is_whitespace)?;
     scheme
         .eq_ignore_ascii_case("bearer")

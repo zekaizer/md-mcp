@@ -512,13 +512,13 @@ impl MdServer {
         } else {
             // Full destination path, including the new basename.
             if is_dir {
-                if m.dest.ends_with(".md") {
+                if Vault::is_note_path(&m.dest) {
                     return Err(Error::new(
                         Code::Suffix,
                         "a directory's dest must not end with .md",
                     ));
                 }
-            } else if !m.dest.ends_with(".md") {
+            } else if !Vault::is_note_path(&m.dest) {
                 return Err(Error::new(
                     Code::Suffix,
                     "a note's dest must end with .md (end dest with '/' to move into a directory)",
@@ -1036,7 +1036,10 @@ mod tests {
         // on-disk spelling without overwrite and without a false CONFLICT.
         let nfd = "\u{1112}\u{1161}\u{11ab}.md"; // 한.md in NFD
         let nfc = "\u{d55c}.md"; // 한.md in NFC
-        let (_d, s) = server(&[(nfd, "content")]);
+        // Placed straight on disk: the vault composes what it creates, so this
+        // respelling repairs a name it did not choose.
+        let (dir, s) = server(&[]);
+        std::fs::write(dir.path().join(nfd), "content").unwrap();
 
         let ok = move_one(&s, nfd, nfc).await;
         assert!(ok.ok, "{:?}", ok.errors);
