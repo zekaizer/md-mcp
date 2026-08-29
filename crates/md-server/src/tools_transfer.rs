@@ -232,7 +232,8 @@ fn recipe(
     ];
     if let Some(directory) = directory {
         recipe.push(format!(
-            "# pull this directory into ./vault (the note-count response header says how many arrived)\ncurl -sS {auth} \"{base}?prefix={directory}\" | tar -xf - -C ./vault"
+            "# pull this directory into ./vault (the note-count response header says how many arrived)\ncurl -sS {auth} \"{base}?prefix={}\" | tar -xf - -C ./vault",
+            url_escape(directory)
         ));
     }
     // A confined grant has no wider pull to offer: everything it can reach is
@@ -244,13 +245,15 @@ fn recipe(
     }
     if let Some(note) = note {
         recipe.push(format!(
-            "# one note\ncurl -sS {auth} -o note.md \"{base}/{note}\""
+            "# one note\ncurl -sS {auth} -o note.md \"{base}/{}\"",
+            url_escape(note)
         ));
     }
 
     if write {
         if directory.is_some() || !confined {
-            let destination = directory.map_or_else(String::new, |dir| format!("?to={dir}"));
+            let destination =
+                directory.map_or_else(String::new, |dir| format!("?to={}", url_escape(dir)));
             let separator = if destination.is_empty() { "?" } else { "&" };
             recipe.push(format!(
                 "# push a directory (add {separator}overwrite=true to replace existing notes)\ntar -C ./vault -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}\""
@@ -258,7 +261,8 @@ fn recipe(
         }
         if let Some(note) = note {
             recipe.push(format!(
-                "# replace that note, only if it has not changed since you read it\ncurl -sS {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{note}\""
+                "# replace that note, only if it has not changed since you read it\ncurl -sS {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{}\"",
+            url_escape(note)
             ));
         }
     }
@@ -268,9 +272,61 @@ fn recipe(
     recipe
 }
 
+/// Percent-encode everything a URL does not leave alone, keeping `/` so a
+/// vault path stays a path. Without this a note named with a space makes curl
+/// refuse the URL outright — not a 404, a refusal to run — and one named with
+/// `?` or `#` silently truncates into something else.
+fn url_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                escaped.push(byte as char);
+            }
+            _ => escaped.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Example, recipe};
+    use super::{Example, recipe, url_escape};
+
+    #[test]
+    fn a_url_carries_any_name_this_vault_allows() {
+        assert_eq!(url_escape("00-inbox/a b.md"), "00-inbox/a%20b.md");
+        assert_eq!(
+            url_escape("노트.md"),
+            "%EB%85%B8%ED%8A%B8.md",
+            "a multi-byte name is escaped byte by byte"
+        );
+        assert_eq!(
+            url_escape("q?x#y.md"),
+            "q%3Fx%23y.md",
+            "`?` and `#` would silently cut the path short"
+        );
+        assert_eq!(url_escape("plain/path.md"), "plain/path.md");
+    }
+
+    #[test]
+    fn a_name_with_a_space_never_reaches_the_command_line_raw() {
+        let joined = lines(
+            true,
+            &Example::Directory {
+                path: "00-inbox".to_string(),
+                note: Some("00-inbox/Marp 프레젠테이션 테스트.md".to_string()),
+                confined: true,
+            },
+        )
+        .join("\n");
+
+        assert!(
+            !joined.contains("Marp 프레젠테이션"),
+            "curl rejects a URL with a raw space before it ever sends it: {joined}"
+        );
+        assert!(joined.contains("Marp%20"), "{joined}");
+    }
 
     fn lines(write: bool, example: &Example) -> Vec<String> {
         recipe(
@@ -298,9 +354,9 @@ mod tests {
         assert!(joined.contains("prefix=00-inbox"));
         assert!(joined.contains("to=00-inbox"));
         assert!(
-            joined.contains("00-inbox/a real note.md"),
-            "the one-note example has to be a note that exists, or the line \
-             404s as printed: {joined}"
+            joined.contains("00-inbox/a%20real%20note.md"),
+            "the one-note example names a note that exists, escaped so the \
+             command can carry it: {joined}"
         );
         assert!(
             !joined.contains("/note.md\""),
