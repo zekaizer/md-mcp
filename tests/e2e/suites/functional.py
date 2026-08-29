@@ -97,7 +97,8 @@ def run(c: MCPClient, t: Runner, vault: str) -> None:
     t.check("'..' traversal", sc(c.call("read_notes", {"paths": ["../outside.md"]}))["notes"][0].get("error", {}).get("code") == "TRAVERSAL")
     t.check("absolute traversal", sc(c.call("read_notes", {"paths": ["/etc/passwd"]}))["notes"][0].get("error", {}).get("code") == "TRAVERSAL")
     t.check("empty paths -> empty", sc(c.call("read_notes", {"paths": []}))["notes"] == [])
-    t.check("dir path -> error not crash", sc(c.call("read_notes", {"paths": ["daily/"]}))["notes"][0].get("error") is not None)
+    r = sc(c.call("read_notes", {"paths": ["daily/"]}))["notes"][0]
+    t.check("dir path -> absent, not a crash", r.get("exists") is False and r.get("error") is None)
     r = sc(c.call("read_notes", {"paths": ["한글노트.md"], "include_frontmatter": False}))["notes"][0]
     t.check("NFC path finds NFD file", r["exists"] and "유니코드" in r.get("content", ""))
     r = sc(c.call("read_notes", {"paths": ["empty.md", "fm-only.md"]}))["notes"]
