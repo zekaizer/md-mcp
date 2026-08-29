@@ -232,6 +232,73 @@ async fn a_wildcard_precondition_on_an_absent_note_is_refused() {
         "`*` asserts the note exists, so it must not quietly create one — and \
          there is no version to disagree about, which is what 412 would claim"
     );
+    let message = response.text().await.unwrap();
+    assert!(
+        message.contains("no if-match") || message.contains("without if-match"),
+        "this is the first error a caller creating notes in a loop meets, so \
+         it has to name the way out — omit the header: {message:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unquoted_tag_is_a_syntax_error_not_a_stale_one() {
+    let addr = spawn(None).await;
+    let quoted = current_tag(addr, "hello.md").await;
+    let bare = quoted.trim_matches('"').to_string();
+
+    let response = put(addr, "hello.md", "# new\n", Some(&bare)).await;
+
+    assert_eq!(
+        response.status(),
+        400,
+        "the tag is current, so `the note changed` would be a lie that sends \
+         the caller hunting a race that never happened"
+    );
+    let message = response.text().await.unwrap();
+    assert!(
+        message.contains("quoted"),
+        "the repair is quoting, so the error must say so: {message:?}"
+    );
+    assert_ne!(read_back(addr, "hello.md").await, "# new\n");
+}
+
+#[tokio::test]
+async fn an_oversize_note_is_refused_in_this_api_s_own_words() {
+    let addr = spawn(None).await;
+
+    let response = put(addr, "big.md", &"x".repeat(4 * 1024 * 1024 + 1), None).await;
+    assert_eq!(response.status(), 413);
+    let message = response.text().await.unwrap();
+    assert!(
+        message.contains("4194304"),
+        "an undocumented limit is learned by bisection; the refusal must name \
+         it: {message:?}"
+    );
+
+    let fits = put(addr, "big.md", &"x".repeat(4 * 1024 * 1024), None).await;
+    assert_eq!(
+        fits.status(),
+        201,
+        "the HTTP limit is MCP's limit: a note one surface accepts, the other \
+         must not refuse"
+    );
+}
+
+#[tokio::test]
+async fn a_directory_is_not_a_note() {
+    let addr = spawn_with_tree().await;
+
+    for path in ["inbox", "inbox/"] {
+        let response = reqwest::get(format!("http://{addr}/api/notes/{path}"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "{path:?} names no note");
+        let message = response.text().await.unwrap();
+        assert!(
+            !message.contains("os error"),
+            "an errno is the server's business, not an answer: {message:?}"
+        );
+    }
 }
 
 #[tokio::test]

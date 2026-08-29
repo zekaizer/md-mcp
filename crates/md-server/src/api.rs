@@ -6,7 +6,8 @@
 //! surface a model reads and writes through.
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::rejection::BytesRejection;
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -17,7 +18,7 @@ use md_core::text::nfc;
 use md_core::Vault;
 
 use crate::MdServer;
-use crate::envelope::{MAX_WRITE_BYTES, write_size_error};
+use crate::envelope::MAX_WRITE_BYTES;
 use crate::events::EventOp;
 use crate::oauth::Scopes;
 
@@ -38,7 +39,14 @@ pub(crate) const NOTE_COUNT: axum::http::HeaderName =
 pub(crate) fn routes(server: MdServer) -> Router {
     Router::new()
         .route("/api/notes", get(get_collection))
-        .route("/api/notes/{*path}", get(get_note).put(put_note))
+        .route(
+            "/api/notes/{*path}",
+            get(get_note)
+                .put(put_note)
+                // MCP's write limit, not axum's default 2 MiB: a note one
+                // surface accepts, the other must not refuse.
+                .layer(DefaultBodyLimit::max(MAX_WRITE_BYTES)),
+        )
         .with_state(server)
 }
 
@@ -194,19 +202,29 @@ async fn put_note(
     Path(path): Path<String>,
     scopes: Option<Extension<Scopes>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
     let authority = authority(scopes);
     if !authority.write {
         return forbidden("notes:write");
     }
-    if body.len() > MAX_WRITE_BYTES {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!("{}\n", write_size_error("note", body.len()).message),
-        )
-            .into_response();
-    }
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            // The cap fails inside the extractor, so the framework's words
+            // would be the answer; a caller bisecting an undocumented limit
+            // deserves the number instead.
+            let response = rejection.into_response();
+            if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+                return response;
+            }
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("this note is over the {MAX_WRITE_BYTES}-byte limit for a single write\n"),
+            )
+                .into_response();
+        }
+    };
 
     // Composed for the containment comparison below, which is a string test.
     // What lands on disk is composed by the vault (`Vault::resolve_rel`).
@@ -231,8 +249,22 @@ async fn put_note(
     match (&current, condition) {
         (Some(_), None) => return precondition_required(),
         (Some(note), Some(condition)) => {
-            if !if_match_satisfied(condition, &entity_tag(note.as_bytes())) {
-                return precondition_failed("the note changed since it was read");
+            match if_match_check(condition, &entity_tag(note.as_bytes())) {
+                IfMatch::Match => {}
+                // Told apart from a stale tag: answering "the note changed" to
+                // a tag that is merely unquoted sends a caller hunting a race
+                // that never happened.
+                IfMatch::Malformed => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "an entity-tag is quoted: if-match: \"<etag>\" or *, exactly as the \
+                         index and GET serve it\n",
+                    )
+                        .into_response();
+                }
+                IfMatch::Stale => {
+                    return precondition_failed("the note changed since it was read");
+                }
             }
         }
         // `If-Match` asserts a version of something that exists. There is no
@@ -241,7 +273,10 @@ async fn put_note(
         (None, Some(_)) => {
             return (
                 StatusCode::NOT_FOUND,
-                format!("no note at {path:?} to match against\n"),
+                format!(
+                    "no note at {path:?} to match against; creating a new note takes no \
+                     if-match header\n"
+                ),
             )
                 .into_response();
         }
@@ -302,12 +337,31 @@ fn none_match(headers: &HeaderMap, etag: &str) -> bool {
     })
 }
 
-/// `If-Match` uses strong comparison, so a weak tag never satisfies it.
-fn if_match_satisfied(condition: &str, etag: &str) -> bool {
-    condition
-        .split(',')
-        .map(str::trim)
-        .any(|candidate| candidate == "*" || candidate == etag)
+/// What an `If-Match` header amounts to against the current tag.
+enum IfMatch {
+    Match,
+    /// Syntactically an entity-tag, but not this note's: the copy is stale.
+    Stale,
+    /// Not an entity-tag at all — usually a tag whose quotes were stripped.
+    Malformed,
+}
+
+/// `If-Match` uses strong comparison, so a weak tag never satisfies it — but
+/// it is still an entity-tag, where an unquoted hash is not one.
+fn if_match_check(condition: &str, etag: &str) -> IfMatch {
+    let quoted = |tag: &str| tag.len() >= 2 && tag.starts_with('"') && tag.ends_with('"');
+    let mut any_valid = false;
+    for candidate in condition.split(',').map(str::trim) {
+        if candidate == "*" || candidate == etag {
+            return IfMatch::Match;
+        }
+        any_valid |= quoted(candidate.strip_prefix("W/").unwrap_or(candidate));
+    }
+    if any_valid {
+        IfMatch::Stale
+    } else {
+        IfMatch::Malformed
+    }
 }
 
 fn precondition_required() -> Response {

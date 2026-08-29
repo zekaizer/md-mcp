@@ -266,7 +266,13 @@ impl Vault {
         self.root
             .read_to_string(&clean)
             .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => Error::not_found(format!("note not found: {rel}")),
+                // A directory (or a path routed through one, `a.md/`) holds no
+                // note; the errno behind that is the server's business.
+                std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::IsADirectory
+                | std::io::ErrorKind::NotADirectory => {
+                    Error::not_found(format!("note not found: {rel}"))
+                }
                 _ => Error::io(format!("read {rel}: {e}")),
             })
     }
