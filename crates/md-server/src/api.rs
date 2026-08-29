@@ -18,7 +18,7 @@ use md_core::text::nfc;
 use md_core::Vault;
 
 use crate::MdServer;
-use crate::envelope::MAX_WRITE_BYTES;
+use crate::envelope::{MAX_WRITE_BYTES, write_size_error};
 use crate::events::EventOp;
 use crate::oauth::Scopes;
 
@@ -48,7 +48,8 @@ const MAX_UNCONFIRMED_NOTES: usize = 50;
 
 /// How many notes an archive carries, so a caller can tell "got nothing" from
 /// "got something" without unpacking it.
-const NOTE_COUNT: axum::http::HeaderName = axum::http::HeaderName::from_static("note-count");
+pub(crate) const NOTE_COUNT: axum::http::HeaderName =
+    axum::http::HeaderName::from_static("note-count");
 
 /// `/api/notes/...`, mounted beside `/mcp` and behind the same bearer guard.
 pub(crate) fn routes(server: MdServer) -> Router {
@@ -184,7 +185,7 @@ async fn post_collection(
             refused += 1;
             report.push_str(&line(serde_json::json!({
                 "path": path,
-                "error": format!("note is {} bytes, over the {MAX_WRITE_BYTES} limit", bytes.len()),
+                "error": write_size_error("note", bytes.len()).message,
             })));
             continue;
         }
@@ -443,7 +444,7 @@ fn index(server: &MdServer, paths: &[String]) -> Response {
     for path in paths {
         // A note that cannot be read costs its own line, never the listing: a
         // silently dropped path reads to a syncing client as a deletion.
-        let line = match server.vault().read_note(path) {
+        let entry = match server.vault().read_note(path) {
             Ok(note) => serde_json::json!({
                 "path": path,
                 "etag": entity_tag(note.as_bytes()),
@@ -454,8 +455,8 @@ fn index(server: &MdServer, paths: &[String]) -> Response {
                 "error": error.message,
             }),
         };
-        body.push_str(&line.to_string());
-        body.push('\n');
+        let entry = line(entry);
+        body.push_str(&entry);
     }
     ([(header::CONTENT_TYPE, NDJSON.to_string())], body).into_response()
 }
@@ -479,10 +480,7 @@ async fn put_note(
     if body.len() > MAX_WRITE_BYTES {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "note is {} bytes, over the {MAX_WRITE_BYTES} limit\n",
-                body.len()
-            ),
+            format!("{}\n", write_size_error("note", body.len()).message),
         )
             .into_response();
     }

@@ -294,7 +294,7 @@ async fn access_log(request: Request, next: Next) -> Response {
         tool,
         notes: response
             .headers()
-            .get("note-count")
+            .get(crate::api::NOTE_COUNT)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned),
         status: response.status().as_u16(),

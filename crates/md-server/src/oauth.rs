@@ -865,12 +865,22 @@ fn oauth_error(status: StatusCode, error: &str) -> Response {
 
 /// Public base URL derived from the (tunnel-forwarded, allowlisted) `Host` header; HTTPS
 /// by posture (TLS terminates at the tunnel).
-fn base_url(headers: &HeaderMap) -> String {
+pub(crate) fn base_url(headers: &HeaderMap) -> String {
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("localhost");
     format!("https://{host}")
+}
+
+/// As [`percent_encode`], but a vault path stays a path: only the segments are
+/// escaped. A name with a space makes curl refuse the URL outright, and one
+/// with `?` or `#` silently cuts the path short.
+pub(crate) fn percent_encode_path(path: &str) -> String {
+    path.split('/')
+        .map(percent_encode)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn now_secs() -> u64 {
@@ -935,7 +945,7 @@ fn loopback_key(uri: &str) -> Option<(String, String, Option<String>)> {
 }
 
 /// Minimal percent-encoding for a query-string value (RFC 3986 unreserved pass through).
-fn percent_encode(value: &str) -> String {
+pub(crate) fn percent_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for b in value.bytes() {
         match b {
@@ -1406,5 +1416,16 @@ mod tests {
     fn percent_encode_escapes_query_chars() {
         assert_eq!(percent_encode("a b&c"), "a%20b%26c");
         assert_eq!(percent_encode("safe-_.~"), "safe-_.~");
+        assert_eq!(
+            percent_encode_path("00-inbox/a b.md"),
+            "00-inbox/a%20b.md",
+            "a path keeps its separators and escapes everything else"
+        );
+        assert_eq!(percent_encode_path("노트.md"), "%EB%85%B8%ED%8A%B8.md");
+        assert_eq!(
+            percent_encode_path("q?x#y.md"),
+            "q%3Fx%23y.md",
+            "`?` and `#` would cut the path short"
+        );
     }
 }

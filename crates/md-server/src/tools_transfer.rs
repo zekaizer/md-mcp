@@ -6,7 +6,6 @@
 //! a line. The consent was given when the caller's own bearer was authorised,
 //! so nothing here asks a second time.
 
-use axum::http::header;
 use axum::http::request::Parts;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -17,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use md_core::text::nfc;
 
 use crate::MdServer;
-use crate::oauth::{OAuthState, Scopes};
+use crate::oauth::{self, OAuthState, Scopes, percent_encode, percent_encode_path};
 
 /// What the examples are written around, in values this vault actually holds.
 /// A recipe is a contract to be runnable as printed: a placeholder filename
@@ -116,7 +115,7 @@ impl MdServer {
         };
         let example = example_scope(self, req.prefix.as_deref()).await;
         let code = oauth.issue_transfer_code(scopes.clone());
-        let root = origin(&parts);
+        let root = oauth::base_url(&parts.headers);
         let base = format!("{root}/api/notes");
         let redeem = format!("{root}/transfer/redeem");
         let renew = format!("{root}/transfer/renew");
@@ -180,17 +179,6 @@ async fn example_scope(server: &MdServer, confined_to: Option<&str>) -> Example 
     }
 }
 
-/// The public origin this request arrived on. The tunnel terminates TLS, so the
-/// forwarded `Host` is the only thing that names the server a client can reach.
-fn origin(parts: &Parts) -> String {
-    let host = parts
-        .headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("localhost");
-    format!("https://{host}")
-}
-
 fn scope_names(scopes: &Scopes) -> Vec<String> {
     let mut names = Vec::new();
     if scopes.read {
@@ -239,7 +227,7 @@ fn recipe(
     if let Some(directory) = directory {
         recipe.push(format!(
             "# pull this directory into ./vault (the note-count response header says how many arrived)\ncurl -sS {auth} \"{base}?prefix={}\" | tar -xf - -C ./vault",
-            url_escape(directory)
+            percent_encode(directory)
         ));
     }
     // A confined grant has no wider pull to offer: everything it can reach is
@@ -252,14 +240,14 @@ fn recipe(
     if let Some(note) = note {
         recipe.push(format!(
             "# one note\ncurl -sS {auth} -o note.md \"{base}/{}\"",
-            url_escape(note)
+            percent_encode_path(note)
         ));
     }
 
     if write {
         if directory.is_some() || !confined {
             let destination =
-                directory.map_or_else(String::new, |dir| format!("?to={}", url_escape(dir)));
+                directory.map_or_else(String::new, |dir| format!("?to={}", percent_encode(dir)));
             let separator = if destination.is_empty() { "?" } else { "&" };
             recipe.push(format!(
                 "# push a directory (add {separator}overwrite=true to replace existing notes; 207 means some entries were refused, and the lines above say which)\ntar -C ./vault -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}\" -w \"\\nHTTP %{{http_code}}\\n\""
@@ -268,7 +256,7 @@ fn recipe(
         if let Some(note) = note {
             recipe.push(format!(
                 "# replace that note, only if it has not changed since you read it\ncurl -sS {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{}\"",
-            url_escape(note)
+            percent_encode_path(note)
             ));
         }
     }
@@ -278,42 +266,9 @@ fn recipe(
     recipe
 }
 
-/// Percent-encode everything a URL does not leave alone, keeping `/` so a
-/// vault path stays a path. Without this a note named with a space makes curl
-/// refuse the URL outright — not a 404, a refusal to run — and one named with
-/// `?` or `#` silently truncates into something else.
-fn url_escape(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
-                escaped.push(byte as char);
-            }
-            _ => escaped.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    escaped
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Example, recipe, url_escape};
-
-    #[test]
-    fn a_url_carries_any_name_this_vault_allows() {
-        assert_eq!(url_escape("00-inbox/a b.md"), "00-inbox/a%20b.md");
-        assert_eq!(
-            url_escape("노트.md"),
-            "%EB%85%B8%ED%8A%B8.md",
-            "a multi-byte name is escaped byte by byte"
-        );
-        assert_eq!(
-            url_escape("q?x#y.md"),
-            "q%3Fx%23y.md",
-            "`?` and `#` would silently cut the path short"
-        );
-        assert_eq!(url_escape("plain/path.md"), "plain/path.md");
-    }
+    use super::{Example, recipe};
 
     #[test]
     fn a_name_with_a_space_never_reaches_the_command_line_raw() {
