@@ -40,8 +40,21 @@ enum Example {
 
 /// Where the recipe parks the collected token. Never interpolated into a
 /// command, only read back through `$(cat …)`, so it stays out of shell history
-/// and out of `ps`.
-const TOKEN_FILE: &str = "/tmp/md-token";
+/// and out of `ps`. Named by what it may do, so collecting a writing grant
+/// while a reading one is in use does not silently replace it.
+fn token_file(write: bool) -> &'static str {
+    if write {
+        "/tmp/md-token-rw"
+    } else {
+        "/tmp/md-token-ro"
+    }
+}
+
+/// Where a pull unpacks to, and where a push is staged from. Deliberately not
+/// the same directory: a recipe run top to bottom would otherwise push back
+/// everything it had just pulled.
+const PULL_DIR: &str = "./vault";
+const PUSH_DIR: &str = "./outbox";
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -132,7 +145,7 @@ impl MdServer {
             code_expires_in_seconds: TRANSFER_CODE_TTL_SECS,
             token_expires_in_seconds: TRANSFER_TOKEN_TTL_SECS,
             token_max_lifetime_seconds: TRANSFER_MAX_LIFETIME_SECS,
-            token_file: TOKEN_FILE.to_string(),
+            token_file: token_file(req.write).to_string(),
             scopes: scope_names(&scopes),
         }))
     }
@@ -206,9 +219,14 @@ fn recipe(
     write: bool,
     example: &Example,
 ) -> Vec<String> {
+    let token_file = token_file(write);
     // Read back from the file rather than interpolated: the token then never
     // reaches a command line, shell history, or this conversation.
-    let auth = format!("-H \"authorization: Bearer $(cat {TOKEN_FILE})\"");
+    let auth = format!("-H \"authorization: Bearer $(cat {token_file})\"");
+    // Never `curl … | tar -xf -`: a refusal is a plain-text explanation, and
+    // piping it into tar turns "pass confirm=true" into "this does not look
+    // like a tar archive". Landing it in a file keeps the message readable.
+    let fetch = format!("curl -sS --fail-with-body {auth}");
     let (directory, note, confined) = match example {
         Example::Vault { note } => (None, note.as_deref(), false),
         Example::Directory {
@@ -221,7 +239,7 @@ fn recipe(
 
     let mut recipe = vec![
         format!(
-            "# 1. run this first: trade the one-time ticket for the token (single use)\ncurl -sSf -X POST -d \"code={code}\" \"{redeem}\" -o {TOKEN_FILE}"
+            "# 1. run this first: trade the one-time ticket for the token (single use)\ncurl -sSf -X POST -d \"code={code}\" \"{redeem}\" -o {token_file}"
         ),
         format!(
             "# 2. see what is there and how much of it, without moving any content.\n#    etag is blake3 of the note's exact bytes, quoted -- recompute it locally to find what changed\ncurl -sS {auth} \"{base}?format=index\""
@@ -229,7 +247,7 @@ fn recipe(
     ];
     if let Some(directory) = directory {
         recipe.push(format!(
-            "# pull this directory into ./vault (the note-count response header says how many arrived)\ncurl -sS {auth} \"{base}?prefix={}\" | tar -xf - -C ./vault",
+            "# pull this directory (on refusal the message is in notes.tar, not lost to tar)\n{fetch} -o notes.tar \"{base}?prefix={}\" && mkdir -p {PULL_DIR} && tar -xf notes.tar -C {PULL_DIR}",
             percent_encode(directory)
         ));
     }
@@ -237,12 +255,12 @@ fn recipe(
     // already what the line above fetched.
     if !confined {
         recipe.push(format!(
-            "# the whole vault (past a few dozen notes the server asks you to confirm, and says how many)\ncurl -sS {auth} \"{base}\" | tar -xf - -C ./vault"
+            "# the whole vault (past a few dozen notes this is refused until you say you mean it; the refusal says how many there are and how to)\n{fetch} -o notes.tar \"{base}\" && mkdir -p {PULL_DIR} && tar -xf notes.tar -C {PULL_DIR}"
         ));
     }
     if let Some(note) = note {
         recipe.push(format!(
-            "# one note\ncurl -sS {auth} -o note.md \"{base}/{}\"",
+            "# one note\n{fetch} -o note.md \"{base}/{}\"",
             percent_encode_path(note)
         ));
     }
@@ -254,21 +272,21 @@ fn recipe(
             let separator = if destination.is_empty() { "?" } else { "&" };
             let and = if destination.is_empty() { "?" } else { "&" };
             recipe.push(format!(
-                "# check the push first -- `tar -cf - .` sends whatever the directory holds, not only what you meant\ntar -C ./vault -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}{and}dry_run=true\""
+                "# stage what you mean to send in {PUSH_DIR} -- NOT {PULL_DIR}, which holds what you just pulled -- then check it\n#    `tar -cf - .` sends whatever the directory holds, so run this before the line below\nmkdir -p {PUSH_DIR} && tar -C {PUSH_DIR} -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}{and}dry_run=true\""
             ));
             recipe.push(format!(
-                "# then make it (add {separator}overwrite=true to replace existing notes; 207 means some entries were refused, and the lines above say which)\ntar -C ./vault -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}\" -w \"\\nHTTP %{{http_code}}\\n\""
+                "# then make it (add {separator}overwrite=true to replace existing notes; 207 means some entries were refused, and the lines above say which)\ntar -C {PUSH_DIR} -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}\" -w \"\\nHTTP %{{http_code}}\\n\""
             ));
         }
         if let Some(note) = note {
             recipe.push(format!(
                 "# replace that note, only if it has not changed since you read it\ncurl -sS {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{}\"",
-            percent_encode_path(note)
+                percent_encode_path(note)
             ));
         }
     }
     recipe.push(format!(
-        "# renew before it lapses; into a temp file first because curl -o truncates before it writes. The old token keeps working for a minute, so a lost replacement can be asked for again\ncurl -sSf -X POST {auth} \"{renew}\" -o {TOKEN_FILE}.new && mv {TOKEN_FILE}.new {TOKEN_FILE}"
+        "# renew before it lapses; into a temp file first because curl -o truncates before it writes. The old token keeps working for a minute, so a lost replacement can be asked for again\ncurl -sSf -X POST {auth} \"{renew}\" -o {token_file}.new && mv {token_file}.new {token_file}"
     ));
     recipe
 }
@@ -313,6 +331,67 @@ mod tests {
             note: Some("00-inbox/a real note.md".to_string()),
             confined,
         }
+    }
+
+    #[test]
+    fn a_refusal_reaches_the_caller_instead_of_reaching_tar() {
+        let joined = lines(false, &example_directory(false)).join("\n");
+
+        assert!(
+            !joined.contains("| tar -xf"),
+            "a refusal is a plain-text explanation; piping it into tar turns \
+             `pass confirm=true` into `this does not look like a tar archive` \
+             and loses the one thing the caller needed: {joined}"
+        );
+        assert!(
+            joined.contains("--fail-with-body"),
+            "the body has to survive the failure it explains: {joined}"
+        );
+    }
+
+    #[test]
+    fn a_push_is_staged_somewhere_other_than_what_was_pulled() {
+        let lines = lines(true, &example_directory(false));
+        let pull = lines
+            .iter()
+            .find(|l| l.contains("tar -xf"))
+            .expect("a pull line");
+        let push = lines
+            .iter()
+            .find(|l| l.contains("-cf -") && !l.contains("dry_run"))
+            .expect("a push line");
+
+        let target = if pull.contains("./vault") {
+            "./vault"
+        } else {
+            ""
+        };
+        assert!(!target.is_empty(), "{pull}");
+        assert!(
+            !push.contains(&format!("-C {target} -cf")),
+            "running the recipe in order would push back everything it just \
+             pulled: {push}"
+        );
+    }
+
+    #[test]
+    fn a_reading_grant_and_a_writing_one_do_not_share_a_token_file() {
+        let reading = lines(false, &Example::Vault { note: None }).join("\n");
+        let writing = lines(true, &Example::Vault { note: None }).join("\n");
+        let file = |recipe: &str| {
+            recipe
+                .split("/tmp/md-token")
+                .nth(1)
+                .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
+                .expect("a token file")
+        };
+
+        assert_ne!(
+            file(&reading),
+            file(&writing),
+            "collecting a writing grant while a reading one is in use would \
+             replace it without saying so"
+        );
     }
 
     #[test]

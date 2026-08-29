@@ -95,6 +95,14 @@ does not justify a second surface, and `delete_notes` already covers it with
 all-or-nothing batching. The tool that opens this API says so, since a caller
 told to work in scripts will otherwise discover the gap by meeting a 405.
 
+A bulk push carries no per-entry precondition, and will not gain one. The
+conditional write is expressible over a whole request, not over an entry inside
+a tar: naming an expected hash per entry would need PAX extended headers, which
+`tar` the command cannot be asked to write, and the format was chosen precisely
+so that a client needs nothing but `curl` and `tar`. Replacing a note whose
+version matters therefore goes through `PUT` with `If-Match`; a bulk push is for
+notes whose current state the caller does not need to have agreed with.
+
 A bulk push will accept `dry_run=true` and answer with the same per-entry report
 having written nothing. `tar -cf - .` carries whatever a directory happens to
 hold rather than what the caller meant to send, and a push is the one operation
