@@ -386,6 +386,38 @@ async fn a_query_parameter_is_refused_rather_than_ignored() {
 }
 
 #[tokio::test]
+async fn the_index_carries_a_url_a_shell_can_paste_raw() {
+    let addr = spawn(None).await;
+    assert_eq!(
+        put(addr, "inbox/한글 노트.md", "# x\n", None)
+            .await
+            .status(),
+        201
+    );
+
+    let entries = index_lines(addr).await;
+    let entry = entries
+        .iter()
+        .find(|e| e["path"] == "inbox/한글 노트.md")
+        .expect("the note is indexed");
+    let url = entry["url"].as_str().expect("a url field");
+
+    assert!(
+        url.is_ascii() && !url.contains(' '),
+        "curl rejects a raw space or non-ASCII before it ever sends the \
+         request, and the index is the one place a loop gets its paths: {url}"
+    );
+    assert_eq!(
+        reqwest::get(format!("http://{addr}/api/notes/{url}"))
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "the url must resolve to the note it stands for"
+    );
+}
+
+#[tokio::test]
 async fn an_indexed_tag_is_the_one_the_note_endpoint_serves() {
     let addr = spawn_with_tree().await;
     let entries = index_lines(addr).await;

@@ -22,14 +22,14 @@ use crate::oauth::{
 
 /// Where the recipe parks the collected token. Never interpolated into a
 /// command, only read back through `$(cat …)`, so it stays out of shell history
-/// and out of `ps`. Named by what it may do, so collecting a writing grant
-/// while a reading one is in use does not silently replace it.
-fn token_file(write: bool) -> &'static str {
-    if write {
-        "/tmp/md-token-rw"
-    } else {
-        "/tmp/md-token-ro"
-    }
+/// and out of `ps`. Named by what it may do and by its ticket, so neither a
+/// second grant nor one of the other mode silently replaces a token still in
+/// use. The ticket is already printed in full in the recipe, so its first
+/// characters name the file without exposing anything new.
+fn token_file(write: bool, code: &str) -> String {
+    let mode = if write { "rw" } else { "ro" };
+    let tag = &code[..8.min(code.len())];
+    format!("/tmp/md-token-{mode}-{tag}")
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -103,38 +103,33 @@ impl MdServer {
             // composed, so a decomposed spelling would refuse its own notes.
             prefix: req.prefix.as_deref().map(|p| nfc(p).into_owned()),
         };
-        let example = example_note(self, req.prefix.as_deref()).await;
+        let example = confined_note(req.prefix.as_deref());
         let code = oauth.issue_transfer_code(scopes.clone());
         let root = oauth::base_url(&parts.headers);
         let base = format!("{root}/api/notes");
         let redeem = format!("{root}/transfer/redeem");
 
         Ok(Json(ProvisionTransferResponse {
-            recipe: recipe(&base, &redeem, &code, req.write, example.as_deref()),
+            recipe: recipe(&base, &redeem, &code, req.write, example),
+            token_file: token_file(req.write, &code),
             base,
             redeem,
             code,
             code_expires_in_seconds: TRANSFER_CODE_TTL_SECS,
             token_expires_in_seconds: TRANSFER_TOKEN_TTL_SECS,
-            token_file: token_file(req.write).to_string(),
             scopes: scope_names(&scopes),
         }))
     }
 }
 
 /// The note the note-level examples name. Only a grant confined to a single
-/// note names a real one — there the note *is* the grant, not an example.
-/// Anything wider gets [`NOTE_PLACEHOLDER`]: naming a real note invites
-/// running the line as printed against whatever happened to be first, and the
-/// paths a caller actually wants come from the index anyway.
-async fn example_note(server: &MdServer, confined_to: Option<&str>) -> Option<String> {
-    let scope = confined_to?;
-    let _guard = server.lock().read().await;
-    if server.vault().is_dir(scope).unwrap_or(false) {
-        None
-    } else {
-        Some(scope.to_string())
-    }
+/// note names a real one — there the note *is* the grant, not an example —
+/// and a prefix is a note by the vault's own law: it ends in `.md`. Asking
+/// the vault what exists instead would misread a writing grant, which
+/// naturally aims at a directory not created yet, and print that directory
+/// as a runnable note line.
+fn confined_note(prefix: Option<&str>) -> Option<&str> {
+    prefix.filter(|p| p.ends_with(".md"))
 }
 
 /// Unmistakably not a path, so the one substitution the recipe asks for is
@@ -160,7 +155,7 @@ fn scope_names(scopes: &Scopes) -> Vec<String> {
 /// the note path is the deliberate exception, because a real note printed
 /// here reads as the target rather than an example.
 fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>) -> Vec<String> {
-    let token_file = token_file(write);
+    let token_file = token_file(write, code);
     // Read back from the file rather than interpolated: the token then never
     // reaches a command line, shell history, or this conversation.
     let auth = format!("-H \"authorization: Bearer $(cat {token_file})\"");
@@ -184,9 +179,11 @@ fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>)
             "# put it back, only if it did not change since you read it (etag from the index or the GET);\n#    to create a note that does not exist yet, send no if-match header at all.\n#    201 created, 204 replaced -- the reply carries the new etag, so a second edit needs no fresh GET -- 412 it changed underneath you, 428 replacing needs if-match\ncurl -sS -D - {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{target}\""
         ));
     }
+    recipe.push(format!(
+        "# many notes: pull the index once, then loop -- its url field is the path already percent-encoded, so it pastes into the URL raw\ncurl -sS --fail-with-body {auth} \"{base}\" | sed -n 's/.*\"url\":\"\\([^\"]*\\)\".*/\\1/p' | while IFS= read -r u; do curl -sS --fail-with-body {auth} --create-dirs -o \"notes/$u\" \"{base}/$u\"; done"
+    ));
     recipe.push(
-        "# many notes are the same two commands in a loop over the index paths. Deleting and \
-         moving are not part of this API: use the delete_notes and move_notes tools"
+        "# deleting and moving are not part of this API: use the delete_notes and move_notes tools"
             .to_string(),
     );
     recipe
@@ -310,8 +307,9 @@ mod tests {
         for note in [None, Some("00-inbox/a real note.md")] {
             let joined = lines(true, note).join("\n");
             assert!(
-                joined.contains("loop over the index paths"),
-                "bulk work has to be discoverable from the recipe alone: {joined}"
+                joined.contains("while IFS= read"),
+                "bulk work has to be discoverable from the recipe alone, as a \
+                 loop that runs, not a promise that one exists: {joined}"
             );
         }
     }

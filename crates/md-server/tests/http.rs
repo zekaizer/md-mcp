@@ -583,6 +583,52 @@ async fn a_grant_can_be_confined_to_a_single_note() {
 }
 
 #[tokio::test]
+async fn a_directory_grant_is_not_mistaken_for_a_note_before_it_exists() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header("s3cret"),
+    );
+    let client = serve_client((), transport).await.expect("client handshake");
+    let mut args = serde_json::Map::new();
+    args.insert("write".into(), json!(true));
+    // A writing grant naturally aims at a directory that does not exist yet.
+    args.insert("prefix".into(), json!("inbox/not-yet"));
+    let grant = client
+        .call_tool(CallToolRequestParams::new("provision_transfer").with_arguments(args))
+        .await
+        .expect("call provision_transfer")
+        .structured_content
+        .expect("structured content");
+
+    let recipe = grant["recipe"].to_string();
+    assert!(
+        !recipe.contains("/api/notes/inbox/not-yet\""),
+        "classified by what the vault holds today, this grant was printed as \
+         a runnable note line naming a directory: {recipe}"
+    );
+    assert!(
+        recipe.contains("<path-from-the-index>"),
+        "a directory grant gets the substitution, like any other wide \
+         grant: {recipe}"
+    );
+}
+
+#[tokio::test]
+async fn two_grants_do_not_share_a_token_file() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+
+    let first = grant(addr, false).await;
+    let second = grant(addr, false).await;
+
+    assert_ne!(
+        first["token_file"], second["token_file"],
+        "collecting the second grant would overwrite the first token on disk \
+         without saying so"
+    );
+}
+
+#[tokio::test]
 async fn a_transfer_credential_is_refused_by_the_tool_surface() {
     let (addr, _handle) = spawn_server(Some("s3cret")).await;
     let confined = provision_confined(addr, false, "inbox").await;

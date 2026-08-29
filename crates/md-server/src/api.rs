@@ -20,7 +20,7 @@ use md_core::Vault;
 use crate::MdServer;
 use crate::envelope::MAX_WRITE_BYTES;
 use crate::events::EventOp;
-use crate::oauth::Scopes;
+use crate::oauth::{Scopes, percent_encode_path};
 
 /// `text/markdown` is the vault's only content type; the charset is explicit so
 /// a client does not have to guess at non-ASCII note bodies.
@@ -163,7 +163,10 @@ fn entries_under(
 
 /// Every note's path, entity tag and size, without its content — so a caller
 /// can work out what changed and fetch only that. The tags are the same values
-/// the note endpoint serves, and so can be replayed as `If-Match`.
+/// the note endpoint serves, and so can be replayed as `If-Match`. `url` is
+/// the path percent-encoded: the one failure the server cannot teach through
+/// an error is the request `curl` refuses to send, so the index hands every
+/// loop a path that pastes into a URL raw.
 fn index(server: &MdServer, paths: &[String]) -> Response {
     let mut body = String::new();
     for path in paths {
@@ -172,11 +175,13 @@ fn index(server: &MdServer, paths: &[String]) -> Response {
         let entry = match server.vault().read_note(path) {
             Ok(note) => serde_json::json!({
                 "path": path,
+                "url": percent_encode_path(path),
                 "etag": entity_tag(note.as_bytes()),
                 "size": note.len(),
             }),
             Err(error) => serde_json::json!({
                 "path": path,
+                "url": percent_encode_path(path),
                 "error": error.message,
             }),
         };
