@@ -14,6 +14,8 @@ use rmcp::schemars::JsonSchema;
 use rmcp::{ErrorData, tool, tool_router};
 use serde::{Deserialize, Serialize};
 
+use md_core::text::nfc;
+
 use crate::MdServer;
 use crate::oauth::{OAuthState, Scopes};
 
@@ -108,7 +110,9 @@ impl MdServer {
             write: req.write,
             // `mint` stamps this; naming it here keeps the struct exhaustive.
             delegated: true,
-            prefix: req.prefix.clone(),
+            // Composed here, once: the paths a grant is compared against are
+            // composed, so a decomposed spelling would refuse its own notes.
+            prefix: req.prefix.as_deref().map(|p| nfc(p).into_owned()),
         };
         let example = example_scope(self, req.prefix.as_deref()).await;
         let code = oauth.issue_transfer_code(scopes.clone());

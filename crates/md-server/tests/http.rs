@@ -409,8 +409,25 @@ async fn the_grant_can_be_asked_for_with_no_arguments_at_all() {
     );
 }
 
-/// A grant confined to one directory.
+/// A grant confined to one directory, checking it says what it is confined to.
 async fn provision_confined(addr: SocketAddr, write: bool, prefix: &str) -> String {
+    let (token, scopes) = provision_confined_raw(addr, write, prefix).await;
+    assert!(
+        scopes
+            .iter()
+            .any(|s| s == &json!(format!("under:{prefix}"))),
+        "the grant must say what it is confined to: {scopes:?}"
+    );
+    token
+}
+
+/// As [`provision_confined`], handing back the scopes rather than checking how
+/// they are spelled — the server composes a name it was given decomposed.
+async fn provision_confined_raw(
+    addr: SocketAddr,
+    write: bool,
+    prefix: &str,
+) -> (String, Vec<Value>) {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
             .auth_header("s3cret"),
@@ -424,22 +441,16 @@ async fn provision_confined(addr: SocketAddr, write: bool, prefix: &str) -> Stri
         .await
         .expect("call provision_transfer");
     let grant: Value = result.structured_content.expect("structured content");
-    assert!(
-        grant["scopes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|s| s == &json!(format!("under:{prefix}"))),
-        "the grant must say what it is confined to: {grant}"
-    );
+    let scopes = grant["scopes"].as_array().expect("scopes").clone();
     let code = grant["code"].as_str().expect("a ticket").to_string();
-    redeem(addr, &code)
+    let token = redeem(addr, &code)
         .await
         .text()
         .await
         .unwrap()
         .trim()
-        .to_string()
+        .to_string();
+    (token, scopes)
 }
 
 #[tokio::test]
@@ -605,5 +616,38 @@ async fn a_transfer_credential_is_refused_by_the_tool_surface() {
          is unconfined and may write the whole vault — every guarantee the \
          transfer API enforces would be one request away from irrelevant. \
          got {handshake:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_grant_confined_with_a_decomposed_name_still_reaches_its_own_notes() {
+    use unicode_normalization::UnicodeNormalization;
+
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let http = reqwest::Client::new();
+    let (full, _) = provision(addr, true).await;
+    http.put(format!("http://{addr}/api/notes/노트/one.md"))
+        .bearer_auth(&full)
+        .body("# x\n")
+        .send()
+        .await
+        .unwrap();
+
+    let decomposed: String = "노트".nfd().collect();
+    assert_ne!(decomposed, "노트", "the fixture must actually differ");
+    let (confined, _) = provision_confined_raw(addr, false, &decomposed).await;
+
+    assert_eq!(
+        http.get(format!("http://{addr}/api/notes/노트/one.md"))
+            .bearer_auth(&confined)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "the paths a grant is compared against are composed, so a grant spelled \
+         decomposed would be refused its own directory — and the recipe, which \
+         resolves the name through the vault, would look fine while every \
+         request it prints fails"
     );
 }
