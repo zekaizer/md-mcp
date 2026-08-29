@@ -29,8 +29,14 @@ use crate::oauth::{
 /// process — a different audience than the conversation the recipe sits in.
 fn token_file(write: bool, code: &str) -> String {
     let mode = if write { "rw" } else { "ro" };
-    let hash = blake3::hash(code.as_bytes()).to_hex();
-    format!("/tmp/md-token-{mode}-{}", &hash.as_str()[..8])
+    format!("/tmp/md-token-{mode}-{}", grant_tag(code))
+}
+
+/// Eight hex characters naming this grant, derived from its ticket by hash.
+/// Shared by the token file and the pull directory, so everything one grant
+/// touches carries the same name — and two grants never collide.
+fn grant_tag(code: &str) -> String {
+    blake3::hash(code.as_bytes()).to_hex().as_str()[..8].to_string()
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -157,6 +163,10 @@ fn scope_names(scopes: &Scopes) -> Vec<String> {
 /// here reads as the target rather than an example.
 fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>) -> Vec<String> {
     let token_file = token_file(write, code);
+    // Its own landing zone per grant: a shared `notes/` merged a fetch into
+    // whatever an earlier grant left behind — silently, and looking exactly
+    // like a confinement breach to whoever counted the files.
+    let pull_dir = format!("notes-{}", grant_tag(code));
     // Read back from the file rather than interpolated: the token then never
     // reaches a command line, shell history, or this conversation.
     let auth = format!("-H \"authorization: Bearer $(cat {token_file})\"");
@@ -169,7 +179,7 @@ fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>)
             "# 1. run this first: trade the one-time ticket for the token (single use)\ncurl -sSf -X POST -d \"code={code}\" \"{redeem}\" -o {token_file}"
         ),
         format!(
-            "# 2. the index: every note this grant reaches -- path, etag, size -- one JSON object per line, no content.\n#    etag is blake3 of the note's exact bytes, quoted; recompute it locally to find what changed.\n#    to poll for changes, repeat this GET with if-none-match: <its etag header> -- 304 means nothing did\ncurl -sS --fail-with-body {auth} \"{base}\""
+            "# 2. the index: every note this grant reaches -- path, etag, size -- one JSON object per line, no content.\n#    etag is blake3 of the note's exact bytes, quoted; recompute it locally (b3sum) to find what changed.\n#    to poll for changes, repeat this GET with if-none-match: <its etag header> -- 304 means nothing did\ncurl -sS --fail-with-body {auth} \"{base}\""
         ),
         format!(
             "# one note, verbatim, to a file -- work on it with your tools instead of reading it into context\ncurl -sS --fail-with-body {auth} -o note.md \"{base}/{target}\""
@@ -177,12 +187,12 @@ fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>)
     ];
     if write {
         recipe.push(format!(
-            "# put it back, only if it did not change since you read it (etag from the index or the GET);\n#    to create a note that does not exist yet, send no if-match header at all.\n#    201 created, 204 replaced -- the reply carries the new etag, so a second edit needs no fresh GET -- 412 it changed underneath you, 428 replacing needs if-match\ncurl -sS -D - {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{target}\""
+            "# put it back, only if it did not change since you read it (etag from the index or the GET);\n#    to create a note that does not exist yet, send no if-match header at all; if-match: * replaces whatever is there, knowingly.\n#    201 created, 204 replaced -- the reply carries the new etag, so a second edit needs no fresh GET -- 412 it changed underneath you, 428 replacing needs if-match\ncurl -sS -D - {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{target}\""
         ));
     }
     recipe.push(format!(
         "# many notes: pull the index once, then fetch in parallel -- sequential outruns the token's TTL on a big vault, and whitespace-split args shred paths; NUL-delimited pairs survive both.\n#    curl is the floor, not the contract -- python or jq parses real JSON instead of this sed, whose naive extraction truncates a name containing a quote or backslash (the url stays authoritative)\ncurl -sS --fail-with-body {auth} \"{base}\" | sed -n 's/.*\"path\":\"\\([^\"]*\\)\".*\"url\":\"\\([^\"]*\\)\".*/\\1\\
-\\2/p' | tr '\\n' '\\0' | xargs -0 -n2 -P8 sh -c 'curl -sS --fail-with-body -H \"authorization: Bearer $(cat {token_file})\" --create-dirs -o \"notes/$0\" \"{base}/$1\"'"
+\\2/p' | tr '\\n' '\\0' | xargs -0 -n2 -P8 sh -c 'curl -sS --fail-with-body -H \"authorization: Bearer $(cat {token_file})\" --create-dirs -o \"{pull_dir}/$0\" \"{base}/$1\"'"
     ));
     recipe.push(
         "# deleting and moving are not part of this API: use the delete_notes and move_notes tools"
@@ -196,10 +206,14 @@ mod tests {
     use super::{recipe, token_file};
 
     fn lines(write: bool, note: Option<&str>) -> Vec<String> {
+        lines_for("TICKET", write, note)
+    }
+
+    fn lines_for(code: &str, write: bool, note: Option<&str>) -> Vec<String> {
         recipe(
             "https://host/api/notes",
             "https://host/transfer/redeem",
-            "TICKET",
+            code,
             write,
             note,
         )
@@ -376,6 +390,50 @@ mod tests {
             file,
             token_file(true, "TICKETXYZ1234567890abcdef"),
             "nor may the two modes of one ticket"
+        );
+    }
+
+    #[test]
+    fn two_grants_do_not_pull_into_the_same_directory() {
+        let dir = |code: &str| {
+            let joined = lines_for(code, false, None).join("\n");
+            let start = joined.find("notes-").expect("a per-grant pull directory");
+            joined[start..start + 14].to_string()
+        };
+
+        assert_ne!(
+            dir("TICKET-A"),
+            dir("TICKET-B"),
+            "a shared pull directory merges this grant's fetch into whatever \
+             an earlier one left behind — silently, and looking exactly like \
+             a confinement breach"
+        );
+        assert!(
+            !lines_for("TICKET-A", false, None)
+                .join("\n")
+                .contains("notes/$0"),
+            "the bare notes/ landing zone is what collided"
+        );
+    }
+
+    #[test]
+    fn overwriting_knowingly_is_taught_where_replacing_is() {
+        let joined = lines(true, Some("00-inbox/a real note.md")).join("\n");
+        assert!(
+            joined.contains("if-match: *"),
+            "the server supports it and only the 428 body mentioned it; a \
+             recipe that hides a primitive teaches a caller to rediscover it \
+             the hard way: {joined}"
+        );
+    }
+
+    #[test]
+    fn the_local_recompute_names_a_tool() {
+        let joined = lines(false, None).join("\n");
+        assert!(
+            joined.contains("b3sum"),
+            "advice to recompute a hash without naming what computes it \
+             strands a bare container: {joined}"
         );
     }
 }
