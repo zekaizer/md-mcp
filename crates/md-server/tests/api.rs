@@ -534,39 +534,6 @@ async fn an_archive_says_how_many_notes_it_carries() {
 }
 
 #[tokio::test]
-async fn taking_the_whole_vault_has_to_be_asked_for() {
-    let addr = spawn_with_tree().await;
-
-    let response = reqwest::get(format!("http://{addr}/api/notes"))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        response.status(),
-        400,
-        "a pull with nothing narrowing it takes everything; that has to be a \
-         choice, the way replacing notes in bulk is"
-    );
-    let message = response.text().await.unwrap();
-    assert!(
-        message.contains("prefix") && message.contains("all=true"),
-        "the refusal has to name both ways forward: {message}"
-    );
-}
-
-#[tokio::test]
-async fn the_whole_vault_is_served_when_it_is_asked_for() {
-    let addr = spawn_with_tree().await;
-
-    let response = reqwest::get(format!("http://{addr}/api/notes?all=true"))
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.headers()["note-count"], "3");
-}
-
-#[tokio::test]
 async fn the_index_needs_no_such_asking() {
     let addr = spawn_with_tree().await;
 
@@ -581,4 +548,92 @@ async fn the_index_needs_no_such_asking() {
          caller should do before deciding to take it all"
     );
     assert_eq!(response.text().await.unwrap().lines().count(), 3);
+}
+
+/// Seed `count` notes so a transfer is big enough to be worth questioning.
+async fn spawn_with_many(count: usize) -> SocketAddr {
+    let (addr, root) = spawn_with_root(None).await;
+    std::fs::create_dir_all(root.join("bulk")).unwrap();
+    for i in 0..count {
+        std::fs::write(root.join(format!("bulk/note-{i:03}.md")), "# x\n").unwrap();
+    }
+    addr
+}
+
+#[tokio::test]
+async fn a_small_transfer_needs_no_ceremony() {
+    let addr = spawn_with_tree().await;
+
+    let response = reqwest::get(format!("http://{addr}/api/notes"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        200,
+        "three notes is not a bulk exfiltration; gating on whether a prefix was \
+         typed measures the wrong thing"
+    );
+    assert_eq!(response.headers()["note-count"], "3");
+}
+
+#[tokio::test]
+async fn a_large_transfer_states_its_size_and_asks() {
+    let addr = spawn_with_many(60).await;
+
+    let response = reqwest::get(format!("http://{addr}/api/notes"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 400);
+    let message = response.text().await.unwrap();
+    assert!(
+        message.contains("61") && message.contains("confirm=true"),
+        "the refusal has to name the real size and the one way forward, so the \
+         caller needs no second guess: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_narrowed_transfer_is_gated_by_its_own_size() {
+    let addr = spawn_with_many(60).await;
+
+    let response = reqwest::get(format!("http://{addr}/api/notes?prefix=bulk"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        400,
+        "naming a directory says nothing about how much is in it"
+    );
+}
+
+#[tokio::test]
+async fn a_confirmed_large_transfer_is_served() {
+    let addr = spawn_with_many(60).await;
+
+    let response = reqwest::get(format!("http://{addr}/api/notes?confirm=true"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["note-count"], "61");
+}
+
+#[tokio::test]
+async fn the_index_is_never_gated_however_large_the_vault() {
+    let addr = spawn_with_many(60).await;
+
+    let response = reqwest::get(format!("http://{addr}/api/notes?format=index"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        200,
+        "the index moves no content and is how a caller learns the size it is \
+         being asked to confirm"
+    );
+    assert_eq!(response.text().await.unwrap().lines().count(), 61);
 }

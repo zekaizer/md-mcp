@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
 use md_core::Code;
+use md_core::listing::Entry;
 use md_core::text::nfc;
 
 use crate::MdServer;
@@ -36,6 +37,13 @@ const TAR: &str = "application/x-tar";
 /// vault of notes and well below memory pressure. The default 2 MiB limit that
 /// guards every other route would refuse an ordinary bulk import.
 const MAX_TAR_BYTES: usize = 32 * 1024 * 1024;
+
+/// How many notes a transfer may carry before the server asks whether that was
+/// meant. Gating on whether a prefix was typed measures syntax; a named
+/// directory can hold the whole vault and an unnamed one can hold five notes.
+/// Reading is where this matters — a copy cannot be taken back, while a bad
+/// write is in git.
+const MAX_UNCONFIRMED_NOTES: usize = 50;
 
 /// How many notes an archive carries, so a caller can tell "got nothing" from
 /// "got something" without unpacking it.
@@ -237,16 +245,7 @@ fn line(value: serde_json::Value) -> String {
 }
 
 /// A subtree as one tar, so a whole vault crosses the wire in one round trip.
-async fn tar_of_subtree(server: &MdServer, prefix: Option<&str>) -> Response {
-    let _guard = server.lock().read().await;
-    let entries = match server
-        .vault()
-        .list_entries(prefix.unwrap_or(""), true, None, false)
-    {
-        Ok(entries) => entries,
-        Err(error) => return core_error(&error),
-    };
-
+fn tar_of(server: &MdServer, entries: &[Entry]) -> Response {
     let count = entries.len();
     let mut builder = tar::Builder::new(Vec::new());
     for entry in entries {
@@ -294,10 +293,9 @@ struct CollectionQuery {
     prefix: Option<String>,
     #[serde(default)]
     format: Option<String>,
-    /// Say out loud that a pull with nothing narrowing it is meant to take
-    /// everything, the way `overwrite=true` says so for a bulk write.
+    /// Acknowledge a transfer large enough that the server asks first.
     #[serde(default)]
-    all: bool,
+    confirm: bool,
 }
 
 async fn get_collection(
@@ -324,23 +322,33 @@ async fn get_collection(
         .map(str::to_owned)
         .or_else(|| authority.prefix.clone());
 
-    // An empty archive and a mistyped prefix look identical to a caller, and
-    // one of them means the command they ran did nothing.
-    if let Some(missing) = unknown_prefix(&server, prefix.as_deref()).await {
-        return missing;
-    }
+    // One guard over listing and reading, so a transfer is a consistent
+    // snapshot rather than a walk through a moving vault.
+    let _guard = server.lock().read().await;
+    let entries = match entries_under(&server, prefix.as_deref()) {
+        Ok(entries) => entries,
+        Err(refusal) => return refusal.into_response(),
+    };
+
     match query.format.as_deref() {
-        Some("index") => index(&server, prefix.as_deref()).await,
+        // The index moves no content, and is how a caller learns the size it is
+        // being asked to confirm. Gating it would discourage the one step worth
+        // encouraging.
+        Some("index") => index(&server, &entries),
         None | Some("tar") => {
-            if prefix.is_none() && !query.all {
+            if entries.len() > MAX_UNCONFIRMED_NOTES && !query.confirm {
                 return (
                     StatusCode::BAD_REQUEST,
-                    "this would take the whole vault; pass prefix=<directory> to narrow it, \
-                     or all=true to say you mean all of it\n",
+                    format!(
+                        "this would transfer {} notes, over the {MAX_UNCONFIRMED_NOTES} that go \
+                         without asking; pass confirm=true to take them, or narrow it with \
+                         prefix=<directory>\n",
+                        entries.len()
+                    ),
                 )
                     .into_response();
             }
-            tar_of_subtree(&server, prefix.as_deref()).await
+            tar_of(&server, &entries)
         }
         Some(other) => (
             StatusCode::BAD_REQUEST,
@@ -350,39 +358,36 @@ async fn get_collection(
     }
 }
 
-/// `Some(404)` when `prefix` names nothing in the vault. A directory that
-/// exists and holds no notes is a real, empty answer and passes.
-async fn unknown_prefix(server: &MdServer, prefix: Option<&str>) -> Option<Response> {
-    let prefix = prefix?.trim_matches('/');
+/// The notes a request covers, or the response explaining why there are none to
+/// speak of. An empty archive and a mistyped prefix look identical to a caller,
+/// and one of them means the command they ran did nothing.
+fn entries_under(
+    server: &MdServer,
+    prefix: Option<&str>,
+) -> Result<Vec<Entry>, (StatusCode, String)> {
+    let prefix = prefix.map(|p| p.trim_matches('/')).unwrap_or_default();
     if prefix.is_empty() {
-        return None;
+        return server
+            .vault()
+            .list_entries("", true, None, false)
+            .map_err(|error| core_status(&error));
     }
-    let _guard = server.lock().read().await;
     match server.vault().is_dir(prefix) {
-        Ok(true) => None,
-        _ => Some(
-            (
-                StatusCode::NOT_FOUND,
-                format!("no directory {prefix:?} in this vault\n"),
-            )
-                .into_response(),
-        ),
+        Ok(true) => server
+            .vault()
+            .list_entries(prefix, true, None, false)
+            .map_err(|error| core_status(&error)),
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            format!("no directory {prefix:?} in this vault\n"),
+        )),
     }
 }
 
 /// Every note's path, entity tag and size, without its content — so a caller
 /// can work out what changed and fetch only that. The tags are the same values
 /// the note endpoint serves, and so can be replayed as `If-Match`.
-async fn index(server: &MdServer, prefix: Option<&str>) -> Response {
-    let _guard = server.lock().read().await;
-    let entries = match server
-        .vault()
-        .list_entries(prefix.unwrap_or(""), true, None, false)
-    {
-        Ok(entries) => entries,
-        Err(error) => return core_error(&error),
-    };
-
+fn index(server: &MdServer, entries: &[Entry]) -> Response {
     let mut body = String::new();
     for entry in entries {
         // A note that cannot be read costs its own line, never the listing: a
@@ -557,10 +562,14 @@ fn forbidden(scope: &str) -> Response {
 }
 
 fn core_error(error: &md_core::Error) -> Response {
+    core_status(error).into_response()
+}
+
+fn core_status(error: &md_core::Error) -> (StatusCode, String) {
     let status = match error.code {
         Code::NotFound => StatusCode::NOT_FOUND,
         Code::Conflict => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     };
-    (status, format!("{}\n", error.message)).into_response()
+    (status, format!("{}\n", error.message))
 }

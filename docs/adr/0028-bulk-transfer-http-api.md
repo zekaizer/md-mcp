@@ -44,11 +44,13 @@ behind the same bearer guard, whose request and response bodies are note bytes
 rather than an envelope:
 
 - `GET /api/notes/{path}` — one note, verbatim.
-- `GET /api/notes?prefix=…` — a subtree as a tar stream, one round trip. A pull
-  with nothing narrowing it takes the whole vault and must say `all=true`, the
-  same way a bulk write must say `overwrite=true`; the index is exempt, because
-  learning the size of a vault moves none of it and is what a caller should do
-  before deciding to take it all.
+- `GET /api/notes?prefix=…` — a subtree as a tar stream, one round trip. A transfer
+  past a few dozen notes is refused until the caller says `confirm=true`, and
+  the refusal states how many there are. The question is asked about the size a
+  request actually reaches, not about whether a prefix was typed: a named
+  directory can hold a whole vault and an unnamed one can hold five notes. The
+  index is exempt — it moves no content and is how a caller learns the size it
+  is being asked to confirm.
 - `GET /api/notes?format=index` — path, content hash and size per line, so a
   caller can learn what changed without transferring content.
 - `PUT /api/notes/{path}` — one note, request body verbatim.

@@ -196,7 +196,7 @@ fn recipe(
         ));
     }
     recipe.push(format!(
-        "# the whole vault, when you do mean all of it\ncurl -sS {auth} \"{base}?all=true\" | tar -xf - -C ./vault"
+        "# the whole vault (past a few dozen notes the server asks you to confirm, and says how many)\ncurl -sS {auth} \"{base}\" | tar -xf - -C ./vault"
     ));
     recipe.push(format!(
         "# one note\ncurl -sS {auth} -o note.md \"{base}/{note}\""
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn the_recipe_reaches_for_the_whole_vault_last_and_says_so() {
+    fn the_recipe_reaches_for_the_narrow_thing_first() {
         let lines = recipe(
             "https://host/api/notes",
             "https://host/transfer/redeem",
@@ -263,16 +263,13 @@ mod tests {
             "knowing the size comes before deciding to move it"
         );
         assert!(
-            at("prefix=00-inbox") < at("all=true"),
+            at("prefix=00-inbox") < lines.iter().rposition(|l| l.contains("tar -xf")),
             "the narrowed pull is the one to reach for first: {lines:?}"
         );
         assert!(
-            lines
-                .iter()
-                .filter(|l| l.contains("tar -xf"))
-                .all(|l| l.contains("prefix=") || l.contains("all=true")),
-            "a pull with nothing narrowing it and nothing asking for everything \
-             is refused by the server, so it must not appear here: {lines:?}"
+            lines.iter().all(|l| !l.contains("confirm=")),
+            "the server names the flag only when a transfer is large enough to \
+             need it; printing it here would make it a reflex: {lines:?}"
         );
     }
 
