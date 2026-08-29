@@ -238,7 +238,12 @@ async fn post_collection(
 }
 
 /// Join a pushed entry's name onto the destination prefix.
+///
+/// A tar may name an entry absolutely; the jail rejects the escape either way,
+/// but a leading slash left in place doubles up in the reported path, and a
+/// script that feeds that path back into the next request gets a different one.
 fn prefixed(to: Option<&str>, name: &str) -> String {
+    let name = name.trim_start_matches('/');
     let joined = match to {
         Some(to) if !to.trim_matches('/').is_empty() => {
             format!("{}/{name}", to.trim_matches('/'))

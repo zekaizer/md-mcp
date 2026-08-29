@@ -673,3 +673,22 @@ async fn a_pushed_tar_refuses_what_is_not_a_note_and_keeps_the_rest() {
     );
     assert_eq!(read_back(addr, "keep.md").await, "# Keep\n");
 }
+
+#[tokio::test]
+async fn a_reported_path_can_be_used_as_given() {
+    let addr = spawn(None).await;
+    let body = hostile_tar(&[("/absolute.md", "# Abs\n")]);
+
+    let report = post_tar(addr, "to=landing", body)
+        .await
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        !report.contains("//"),
+        "a script feeds the reported path into its next request; a doubled \
+         separator makes that a different path: {report}"
+    );
+    assert!(report.contains("landing/absolute.md"), "{report}");
+}
