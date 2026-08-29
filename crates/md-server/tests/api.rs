@@ -778,3 +778,24 @@ async fn a_directory_entry_is_skipped_without_counting_as_a_refusal() {
     );
     assert!(!response.text().await.unwrap().contains("error"));
 }
+
+#[tokio::test]
+async fn a_refused_credential_says_what_to_do_about_it() {
+    let addr = spawn(Some("secret")).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/api/notes/hello.md"))
+        .bearer_auth("stale-or-forged")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 401);
+    let message = response.text().await.unwrap();
+    assert!(
+        message.contains("provision_transfer"),
+        "a transfer token lapses in ten minutes, so this is the failure a caller \
+         meets most often; answering with an empty body makes it the only one \
+         that explains nothing: {message:?}"
+    );
+}

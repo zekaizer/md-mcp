@@ -470,9 +470,14 @@ fn unauthorized(request: &Request) -> Response {
         .unwrap_or("localhost");
     let challenge =
         format!("Bearer resource_metadata=\"https://{host}/.well-known/oauth-protected-resource\"");
+    // A transfer token lapses in ten minutes, so this is the failure a caller
+    // meets most often; every other refusal here explains itself, and this one
+    // answering with an empty body made it the only silent one.
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, challenge)],
+        "no credential, or one that has lapsed or was never issued; call \
+         provision_transfer for a fresh grant\n",
     )
         .into_response()
 }
