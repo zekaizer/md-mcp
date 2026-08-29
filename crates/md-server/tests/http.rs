@@ -318,7 +318,7 @@ async fn the_static_token_is_not_what_gets_handed_out() {
 }
 
 #[tokio::test]
-async fn a_collected_token_renews_itself_and_the_old_one_stops_working() {
+async fn a_collected_token_renews_itself_and_the_old_one_still_answers() {
     let (addr, _handle) = spawn_server(Some("s3cret")).await;
     let (token, _) = provision(addr, false).await;
     let http = reqwest::Client::new();
@@ -351,8 +351,9 @@ async fn a_collected_token_renews_itself_and_the_old_one_stops_working() {
             .await
             .unwrap()
             .status(),
-        401,
-        "renewal replaces a credential; it must not multiply them"
+        200,
+        "a script that renewed and then lost the replacement — a failed move, an \
+         interrupted run — can still ask again inside the grace window"
     );
 }
 

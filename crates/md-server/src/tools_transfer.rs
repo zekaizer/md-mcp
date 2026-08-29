@@ -227,7 +227,7 @@ fn recipe(
             "# 1. run this first: trade the one-time ticket for the token (single use)\ncurl -sSf -X POST -d \"code={code}\" \"{redeem}\" -o {TOKEN_FILE}"
         ),
         format!(
-            "# 2. see what is there and how much of it, without moving any content\ncurl -sS {auth} \"{base}?format=index\""
+            "# 2. see what is there and how much of it, without moving any content.\n#    etag is blake3 of the note's exact bytes, quoted -- recompute it locally to find what changed\ncurl -sS {auth} \"{base}?format=index\""
         ),
     ];
     if let Some(directory) = directory {
@@ -267,7 +267,7 @@ fn recipe(
         }
     }
     recipe.push(format!(
-        "# renew before it lapses; writing to a temp file first so a failed renewal cannot destroy a live token\ncurl -sSf -X POST {auth} \"{renew}\" -o {TOKEN_FILE}.new && mv {TOKEN_FILE}.new {TOKEN_FILE}"
+        "# renew before it lapses; into a temp file first because curl -o truncates before it writes. The old token keeps working for a minute, so a lost replacement can be asked for again\ncurl -sSf -X POST {auth} \"{renew}\" -o {TOKEN_FILE}.new && mv {TOKEN_FILE}.new {TOKEN_FILE}"
     ));
     recipe
 }

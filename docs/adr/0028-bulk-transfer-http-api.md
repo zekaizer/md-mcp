@@ -52,7 +52,9 @@ rather than an envelope:
   index is exempt — it moves no content and is how a caller learns the size it
   is being asked to confirm.
 - `GET /api/notes?format=index` — path, content hash and size per line, so a
-  caller can learn what changed without transferring content.
+  caller can learn what changed without transferring content. The hash is named
+  where a caller reads it: an opaque digest cannot be recomputed locally, which
+  is the one thing an index is for.
 - `PUT /api/notes/{path}` — one note, request body verbatim.
 - `POST /api/notes` — a tar stream, for writing many notes in one round trip.
 
@@ -113,7 +115,10 @@ A transfer token lapses quickly when idle and renews by presenting itself while
 it still works, so a long job does not die halfway and a forgotten token stops
 mattering within minutes. Renewal carries no second credential to protect —
 holding a working token is the proof — and cannot resurrect a lapsed one, so the
-idle window bounds something real. Every chain also stops at a ceiling counted
+idle window bounds something real. A renewed token's predecessor is cut back to
+a grace window rather than revoked: losing the replacement, to an interrupted
+script or a failed move, should cost a retry rather than the whole remaining
+lifetime. Every chain also stops at a ceiling counted
 from its first token: a sliding window without one is a permanent credential in
 disguise. A token issued through the ordinary authorization flow is refused
 here; it renews through its refresh token, and admitting it would launder it

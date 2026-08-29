@@ -43,6 +43,11 @@ const TRANSFER_TOKEN_TTL_SECS: u64 = 10 * 60;
 /// The ceiling a renewal chain cannot pass, counted from the first token. A
 /// sliding window with no ceiling is a permanent credential wearing a disguise.
 const TRANSFER_MAX_LIFETIME_SECS: u64 = 60 * 60;
+/// How long a renewed token's predecessor keeps working. Revoking it outright
+/// makes losing the replacement — an interrupted script, a failed move, a
+/// second shell — cost the whole remaining lifetime; keeping it forever would
+/// make renewal multiply credentials. It gets just enough to try again.
+const TRANSFER_RENEWAL_GRACE_SECS: u64 = 60;
 
 /// State schema version. Bump on a breaking change; an unreadable/old file starts empty,
 /// which forces a one-time re-auth.
@@ -388,10 +393,14 @@ impl OAuthState {
         TRANSFER_MAX_LIFETIME_SECS
     }
 
-    /// Trade a live transfer token for a fresh one, revoking the old. Renewal
-    /// needs no second credential to protect: holding a working token is the
-    /// proof. A lapsed one cannot be resurrected, so the idle window is a real
-    /// bound, and the chain still dies at its ceiling.
+    /// Trade a live transfer token for a fresh one. Renewal needs no second
+    /// credential to protect: holding a working token is the proof. A lapsed
+    /// one cannot be resurrected, so the idle window is a real bound, and the
+    /// chain still dies at its ceiling.
+    ///
+    /// The predecessor is cut back to a grace window rather than revoked, so a
+    /// caller that loses the replacement can ask again instead of losing the
+    /// rest of its lifetime.
     pub fn renew_transfer(&self, token: &str) -> Option<String> {
         let now = now_secs();
         let (scopes, not_after) = {
@@ -402,7 +411,9 @@ impl OAuthState {
             if rec.expires_at <= now || not_after <= now {
                 return None;
             }
-            store.access.remove(token);
+            if let Some(previous) = store.access.get_mut(token) {
+                previous.expires_at = previous.expires_at.min(now + TRANSFER_RENEWAL_GRACE_SECS);
+            }
             (rec.scopes, not_after)
         };
         // `mint` persists, so the revocation lands with the replacement.
@@ -1107,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn a_live_transfer_token_renews_itself_and_revokes_its_predecessor() {
+    fn a_live_transfer_token_renews_itself_and_leaves_a_way_back() {
         let dir = tempfile::tempdir().unwrap();
         let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
         let granted = Scopes {
@@ -1122,11 +1133,17 @@ mod tests {
             .expect("a working token is its own proof");
 
         assert_ne!(second, first);
-        assert_eq!(oauth.validate_bearer(&second), Some(granted));
+        assert_eq!(oauth.validate_bearer(&second), Some(granted.clone()));
         assert_eq!(
             oauth.validate_bearer(&first),
-            None,
-            "leaving the old token live would make renewal a way to multiply credentials"
+            Some(granted),
+            "losing the replacement — a failed move, an interrupted script — must \
+             not cost the whole remaining lifetime"
+        );
+        let cutback = oauth.store.lock().unwrap().access[&first].expires_at;
+        assert!(
+            cutback <= now_secs() + TRANSFER_RENEWAL_GRACE_SECS,
+            "the predecessor gets enough to try again, not its full window"
         );
     }
 
