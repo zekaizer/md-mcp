@@ -765,3 +765,52 @@ async fn a_weak_tag_names_its_cause_instead_of_lying() {
     );
     assert_ne!(read_back(addr, "hello.md").await, "# new\n");
 }
+
+#[tokio::test]
+async fn the_index_answers_304_to_the_tag_it_served() {
+    // Polling the index for changes is the sync workflow's first request;
+    // without a tag it re-downloads the whole listing every time.
+    let addr = spawn_with_tree().await;
+    let http = reqwest::Client::new();
+    let url = format!("http://{addr}/api/notes");
+
+    let first = http.get(&url).send().await.unwrap();
+    assert_eq!(first.status(), 200);
+    let etag = first.headers()["etag"].to_str().unwrap().to_string();
+
+    let unchanged = http
+        .get(&url)
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unchanged.status(),
+        304,
+        "nothing changed, so the poll should cost headers, not the listing"
+    );
+    assert!(unchanged.text().await.unwrap().is_empty());
+
+    assert_eq!(
+        put(addr, "inbox/three.md", "# Three\n", None)
+            .await
+            .status(),
+        201
+    );
+    let changed = http
+        .get(&url)
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        changed.status(),
+        200,
+        "a write anywhere in the universe moves the aggregate tag"
+    );
+    assert_ne!(
+        changed.headers()["etag"].to_str().unwrap(),
+        etag,
+        "the fresh answer carries the fresh tag"
+    );
+}

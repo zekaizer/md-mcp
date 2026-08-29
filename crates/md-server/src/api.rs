@@ -112,6 +112,7 @@ fn push_line(report: &mut String, value: &serde_json::Value) {
 async fn get_collection(
     State(server): State<MdServer>,
     scopes: Option<Extension<Scopes>>,
+    headers: HeaderMap,
     uri: Uri,
 ) -> Response {
     // Nothing a caller can pass: the grant already decides what the index
@@ -132,10 +133,30 @@ async fn get_collection(
     // One guard over listing and hashing, so the index is a consistent
     // snapshot rather than a walk through a moving vault.
     let _guard = server.lock().read().await;
-    match entries_under(&server, authority.prefix.as_deref()) {
-        Ok(entries) => index(&server, &entries),
-        Err(refusal) => refusal.into_response(),
+    let entries = match entries_under(&server, authority.prefix.as_deref()) {
+        Ok(entries) => entries,
+        Err(refusal) => return refusal.into_response(),
+    };
+
+    // The aggregate tag: polling for changes is the sync workflow's first
+    // request, and without one every poll re-downloads the whole listing.
+    // Hashing the exact body keeps the note endpoints' contract — any note
+    // written, gone, or renamed anywhere in this credential's universe moves
+    // the tag.
+    let body = index(&server, &entries);
+    let etag = entity_tag(body.as_bytes());
+    if none_match(&headers, &etag) {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
     }
+    (
+        [
+            (header::ETAG, etag),
+            (header::CONTENT_TYPE, NDJSON.to_string()),
+            (NOTE_COUNT, entries.len().to_string()),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// The note paths a credential covers today. A confinement that matches
@@ -180,7 +201,7 @@ fn entries_under(
 /// the path percent-encoded: the one failure the server cannot teach through
 /// an error is the request `curl` refuses to send, so the index hands every
 /// loop a path that pastes into a URL raw.
-fn index(server: &MdServer, paths: &[String]) -> Response {
+fn index(server: &MdServer, paths: &[String]) -> String {
     let mut body = String::new();
     for path in paths {
         // A note that cannot be read costs its own line, never the listing: a
@@ -200,14 +221,7 @@ fn index(server: &MdServer, paths: &[String]) -> Response {
         };
         push_line(&mut body, &entry);
     }
-    (
-        [
-            (header::CONTENT_TYPE, NDJSON.to_string()),
-            (NOTE_COUNT, paths.len().to_string()),
-        ],
-        body,
-    )
-        .into_response()
+    body
 }
 
 /// Replace or create one note from the request body, verbatim.
