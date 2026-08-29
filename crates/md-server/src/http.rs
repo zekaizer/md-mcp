@@ -260,7 +260,7 @@ async fn access_log(request: Request, next: Next) -> Response {
     let target = request
         .uri()
         .path_and_query()
-        .map_or_else(|| request.uri().path().to_string(), ToString::to_string);
+        .map_or_else(|| "/".to_string(), ToString::to_string);
 
     let (parts, body) = request.into_parts();
     let content_length = parts

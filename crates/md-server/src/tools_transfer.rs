@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use md_core::text::nfc;
 
 use crate::MdServer;
-use crate::oauth::{self, OAuthState, Scopes, percent_encode, percent_encode_path};
+use crate::oauth::{
+    self, OAuthState, Scopes, TRANSFER_CODE_TTL_SECS, TRANSFER_MAX_LIFETIME_SECS,
+    TRANSFER_TOKEN_TTL_SECS, percent_encode, percent_encode_path,
+};
 
 /// What the examples are written around, in values this vault actually holds.
 /// A recipe is a contract to be runnable as printed: a placeholder filename
@@ -126,9 +129,9 @@ impl MdServer {
             redeem,
             renew,
             code,
-            code_expires_in_seconds: OAuthState::transfer_code_ttl_secs(),
-            token_expires_in_seconds: OAuthState::transfer_token_ttl_secs(),
-            token_max_lifetime_seconds: OAuthState::transfer_max_lifetime_secs(),
+            code_expires_in_seconds: TRANSFER_CODE_TTL_SECS,
+            token_expires_in_seconds: TRANSFER_TOKEN_TTL_SECS,
+            token_max_lifetime_seconds: TRANSFER_MAX_LIFETIME_SECS,
             token_file: TOKEN_FILE.to_string(),
             scopes: scope_names(&scopes),
         }))

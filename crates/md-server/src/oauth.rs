@@ -36,13 +36,13 @@ const REFRESH_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 const CODE_TTL_SECS: u64 = 5 * 60;
 /// A transfer code is redeemed in the same turn it is handed out, so it lapses
 /// fast: what it leaves behind in a conversation transcript is dead text.
-const TRANSFER_CODE_TTL_SECS: u64 = 120;
+pub(crate) const TRANSFER_CODE_TTL_SECS: u64 = 120;
 /// How long a transfer token stays usable without being renewed. Short, so a
 /// token forgotten in a sandbox stops mattering quickly.
-const TRANSFER_TOKEN_TTL_SECS: u64 = 10 * 60;
+pub(crate) const TRANSFER_TOKEN_TTL_SECS: u64 = 10 * 60;
 /// The ceiling a renewal chain cannot pass, counted from the first token. A
 /// sliding window with no ceiling is a permanent credential wearing a disguise.
-const TRANSFER_MAX_LIFETIME_SECS: u64 = 60 * 60;
+pub(crate) const TRANSFER_MAX_LIFETIME_SECS: u64 = 60 * 60;
 /// How long a renewed token's predecessor keeps working. Revoking it outright
 /// makes losing the replacement — an interrupted script, a failed move, a
 /// second shell — cost the whole remaining lifetime; keeping it forever would
@@ -86,7 +86,7 @@ impl Default for Persisted {
 
 /// What a credential is allowed to do. A token may hold less than the authority
 /// that issued it, never more.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scopes {
     #[serde(default)]
     pub read: bool,
@@ -381,24 +381,6 @@ impl OAuthState {
             TRANSFER_TOKEN_TTL_SECS,
             Some(now_secs() + TRANSFER_MAX_LIFETIME_SECS),
         ))
-    }
-
-    /// How long a ticket stays redeemable.
-    #[must_use]
-    pub fn transfer_code_ttl_secs() -> u64 {
-        TRANSFER_CODE_TTL_SECS
-    }
-
-    /// How long a collected transfer token lasts before it must be renewed.
-    #[must_use]
-    pub fn transfer_token_ttl_secs() -> u64 {
-        TRANSFER_TOKEN_TTL_SECS
-    }
-
-    /// The ceiling a renewal chain cannot pass, from the first token.
-    #[must_use]
-    pub fn transfer_max_lifetime_secs() -> u64 {
-        TRANSFER_MAX_LIFETIME_SECS
     }
 
     /// Trade a live transfer token for a fresh one. Renewal needs no second

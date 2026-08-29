@@ -764,7 +764,9 @@ async fn a_directory_entry_is_skipped_without_counting_as_a_refusal() {
     note.set_size(7);
     note.set_mode(0o644);
     note.set_cksum();
-    builder.append_data(&mut note, "sub/a.md", &b"# A\n\nx"[..]).unwrap();
+    builder
+        .append_data(&mut note, "sub/a.md", &b"# A\n\nx"[..])
+        .unwrap();
 
     let response = post_tar(addr, "", builder.into_inner().unwrap()).await;
 
