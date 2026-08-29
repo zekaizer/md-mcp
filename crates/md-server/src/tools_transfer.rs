@@ -17,15 +17,21 @@ use serde::{Deserialize, Serialize};
 use crate::MdServer;
 use crate::oauth::{OAuthState, Scopes};
 
-/// What the examples should be written around. A directory and a note are not
-/// interchangeable here: appending a filename to a note yields a path that does
-/// not exist, and narrowing a grant that is already one note is meaningless.
-#[derive(Clone, Copy)]
-enum Example<'a> {
-    /// Nothing to name — the examples take the whole vault.
-    Vault,
-    Directory(&'a str),
-    Note(&'a str),
+/// What the examples are written around, in values this vault actually holds.
+/// A recipe is a contract to be runnable as printed: a placeholder filename
+/// 404s, and a directory that is the whole grant is not "the whole vault".
+enum Example {
+    /// Unconfined, with no directory worth naming.
+    Vault { note: Option<String> },
+    Directory {
+        path: String,
+        note: Option<String>,
+        /// The grant reaches nothing outside this directory, so it has no
+        /// wider pull to offer and nothing to narrow from.
+        confined: bool,
+    },
+    /// The grant is exactly one note.
+    Note(String),
 }
 
 /// Where the recipe parks the collected token. Never interpolated into a
@@ -110,22 +116,7 @@ impl MdServer {
         let renew = format!("{root}/transfer/renew");
 
         Ok(Json(ProvisionTransferResponse {
-            recipe: recipe(
-                &base,
-                &redeem,
-                &renew,
-                &code,
-                req.write,
-                // A confined credential makes its own scope the example;
-                // anything else in the recipe would be refused as printed.
-                example.as_ref().map_or(Example::Vault, |(path, is_dir)| {
-                    if *is_dir {
-                        Example::Directory(path)
-                    } else {
-                        Example::Note(path)
-                    }
-                }),
-            ),
+            recipe: recipe(&base, &redeem, &renew, &code, req.write, &example),
             base,
             redeem,
             renew,
@@ -139,23 +130,48 @@ impl MdServer {
     }
 }
 
-/// What the examples should name, and whether it is a directory. A confined
-/// grant names its own scope; otherwise a directory this vault actually has,
-/// since a recipe naming one that is not there unpacks nothing on a pull and
-/// creates a stray one on a push, reporting success either way.
-async fn example_scope(server: &MdServer, confined_to: Option<&str>) -> Option<(String, bool)> {
+/// The values to write the examples around. A confined grant describes its own
+/// scope; otherwise a directory this vault has, since naming one it does not
+/// unpacks nothing on a pull and creates a stray one on a push, reporting
+/// success either way.
+async fn example_scope(server: &MdServer, confined_to: Option<&str>) -> Example {
     let _guard = server.lock().read().await;
+    let first_note = |directory: &str| {
+        server
+            .vault()
+            .list_entries(directory, true, None, false)
+            .ok()
+            .and_then(|entries| entries.into_iter().next())
+            .map(|entry| entry.path)
+    };
+
     if let Some(scope) = confined_to {
-        let is_dir = server.vault().is_dir(scope).unwrap_or(false);
-        return Some((scope.to_string(), is_dir));
+        return if server.vault().is_dir(scope).unwrap_or(false) {
+            Example::Directory {
+                note: first_note(scope),
+                path: scope.to_string(),
+                confined: true,
+            }
+        } else {
+            Example::Note(scope.to_string())
+        };
     }
-    server
+    match server
         .vault()
         .list_entries("", false, None, true)
-        .ok()?
-        .into_iter()
-        .find(|entry| entry.is_dir)
-        .map(|entry| (entry.path.trim_end_matches('/').to_string(), true))
+        .ok()
+        .and_then(|entries| entries.into_iter().find(|entry| entry.is_dir))
+        .map(|entry| entry.path.trim_end_matches('/').to_string())
+    {
+        Some(path) => Example::Directory {
+            note: first_note(&path),
+            path,
+            confined: false,
+        },
+        None => Example::Vault {
+            note: first_note(""),
+        },
+    }
 }
 
 /// The public origin this request arrived on. The tunnel terminates TLS, so the
@@ -191,15 +207,19 @@ fn recipe(
     renew: &str,
     code: &str,
     write: bool,
-    example: Example<'_>,
+    example: &Example,
 ) -> Vec<String> {
     // Read back from the file rather than interpolated: the token then never
     // reaches a command line, shell history, or this conversation.
     let auth = format!("-H \"authorization: Bearer $(cat {TOKEN_FILE})\"");
-    let note = match example {
-        Example::Note(note) => note.to_string(),
-        Example::Directory(dir) => format!("{dir}/note.md"),
-        Example::Vault => "note.md".to_string(),
+    let (directory, note, confined) = match example {
+        Example::Vault { note } => (None, note.as_deref(), false),
+        Example::Directory {
+            path,
+            note,
+            confined,
+        } => (Some(path.as_str()), note.as_deref(), *confined),
+        Example::Note(note) => (None, Some(note.as_str()), true),
     };
 
     let mut recipe = vec![
@@ -210,36 +230,37 @@ fn recipe(
             "# 2. see what is there and how much of it, without moving any content\ncurl -sS {auth} \"{base}?format=index\""
         ),
     ];
-    // A grant that is already one note has no subtree to narrow to, and no
-    // whole-vault pull to offer: everything it can reach is that note.
-    if let Example::Directory(dir) = example {
+    if let Some(directory) = directory {
         recipe.push(format!(
-            "# pull one directory into ./vault (the note-count response header says how many arrived)\ncurl -sS {auth} \"{base}?prefix={dir}\" | tar -xf - -C ./vault"
+            "# pull this directory into ./vault (the note-count response header says how many arrived)\ncurl -sS {auth} \"{base}?prefix={directory}\" | tar -xf - -C ./vault"
         ));
     }
-    if !matches!(example, Example::Note(_)) {
+    // A confined grant has no wider pull to offer: everything it can reach is
+    // already what the line above fetched.
+    if !confined {
         recipe.push(format!(
             "# the whole vault (past a few dozen notes the server asks you to confirm, and says how many)\ncurl -sS {auth} \"{base}\" | tar -xf - -C ./vault"
         ));
     }
-    recipe.push(format!(
-        "# one note\ncurl -sS {auth} -o note.md \"{base}/{note}\""
-    ));
+    if let Some(note) = note {
+        recipe.push(format!(
+            "# one note\ncurl -sS {auth} -o note.md \"{base}/{note}\""
+        ));
+    }
 
     if write {
-        let destination = match example {
-            Example::Directory(dir) => format!("?to={dir}"),
-            _ => String::new(),
-        };
-        let separator = if destination.is_empty() { "?" } else { "&" };
-        if !matches!(example, Example::Note(_)) {
+        if directory.is_some() || !confined {
+            let destination = directory.map_or_else(String::new, |dir| format!("?to={dir}"));
+            let separator = if destination.is_empty() { "?" } else { "&" };
             recipe.push(format!(
                 "# push a directory (add {separator}overwrite=true to replace existing notes)\ntar -C ./vault -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}\""
             ));
         }
-        recipe.push(format!(
-            "# replace one note, only if it has not changed since you read it\ncurl -sS {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{note}\""
-        ));
+        if let Some(note) = note {
+            recipe.push(format!(
+                "# replace that note, only if it has not changed since you read it\ncurl -sS {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{note}\""
+            ));
+        }
     }
     recipe.push(format!(
         "# renew before it lapses; writing to a temp file first so a failed renewal cannot destroy a live token\ncurl -sSf -X POST {auth} \"{renew}\" -o {TOKEN_FILE}.new && mv {TOKEN_FILE}.new {TOKEN_FILE}"
@@ -251,41 +272,45 @@ fn recipe(
 mod tests {
     use super::{Example, recipe};
 
-    #[test]
-    fn the_examples_name_a_directory_this_vault_actually_has() {
-        let lines = recipe(
+    fn lines(write: bool, example: &Example) -> Vec<String> {
+        recipe(
             "https://host/api/notes",
             "https://host/transfer/redeem",
             "https://host/transfer/renew",
             "TICKET",
-            true,
-            Example::Directory("00-inbox"),
-        );
-        let joined = lines.join("\n");
+            write,
+            example,
+        )
+    }
+
+    fn example_directory(confined: bool) -> Example {
+        Example::Directory {
+            path: "00-inbox".to_string(),
+            note: Some("00-inbox/a real note.md".to_string()),
+            confined,
+        }
+    }
+
+    #[test]
+    fn the_examples_name_things_this_vault_actually_holds() {
+        let joined = lines(true, &example_directory(false)).join("\n");
+
+        assert!(joined.contains("prefix=00-inbox"));
+        assert!(joined.contains("to=00-inbox"));
         assert!(
-            joined.contains("prefix=00-inbox"),
-            "the pull example must be runnable as printed: {joined}"
+            joined.contains("00-inbox/a real note.md"),
+            "the one-note example has to be a note that exists, or the line \
+             404s as printed: {joined}"
         );
         assert!(
-            joined.contains("to=00-inbox"),
-            "a push to a directory that is not there quietly creates a stray one: {joined}"
-        );
-        assert!(
-            !joined.contains("/inbox/") && !joined.contains("=inbox"),
-            "no invented directory may survive in the recipe: {joined}"
+            !joined.contains("/note.md\""),
+            "no placeholder filename may survive: {joined}"
         );
     }
 
     #[test]
     fn the_recipe_reaches_for_the_narrow_thing_first() {
-        let lines = recipe(
-            "https://host/api/notes",
-            "https://host/transfer/redeem",
-            "https://host/transfer/renew",
-            "TICKET",
-            false,
-            Example::Directory("00-inbox"),
-        );
+        let lines = lines(false, &example_directory(false));
         let at = |needle: &str| lines.iter().position(|l| l.contains(needle));
 
         assert!(
@@ -304,51 +329,20 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_vault_gets_examples_without_a_prefix() {
-        let joined = recipe(
-            "https://host/api/notes",
-            "https://host/transfer/redeem",
-            "https://host/transfer/renew",
-            "TICKET",
-            true,
-            Example::Vault,
-        )
-        .join("\n");
-        assert!(
-            !joined.contains("prefix=") && !joined.contains("to="),
-            "with no directory to name, the examples take the whole vault: {joined}"
-        );
-    }
+    fn a_directory_confined_grant_offers_no_wider_pull() {
+        let lines = lines(false, &example_directory(true));
 
-    #[test]
-    fn the_index_example_does_not_promise_note_tags() {
-        let joined = recipe(
-            "https://host/api/notes",
-            "https://host/transfer/redeem",
-            "https://host/transfer/renew",
-            "TICKET",
-            false,
-            Example::Vault,
-        )
-        .join("\n");
-        assert!(
-            !joined.contains("tags"),
-            "in a notes vault `tags` means frontmatter tags, which this does not \
-             return: {joined}"
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("tar -xf")).count(),
+            1,
+            "everything this grant can reach is the one directory; a second \
+             line calling that the whole vault says something untrue: {lines:?}"
         );
     }
 
     #[test]
     fn a_grant_that_is_one_note_names_that_note_and_nothing_else() {
-        let lines = recipe(
-            "https://host/api/notes",
-            "https://host/transfer/redeem",
-            "https://host/transfer/renew",
-            "TICKET",
-            true,
-            Example::Note("00-inbox/README.md"),
-        );
-        let joined = lines.join("\n");
+        let joined = lines(true, &Example::Note("00-inbox/README.md".to_string())).join("\n");
 
         assert!(
             joined.contains("\"https://host/api/notes/00-inbox/README.md\""),
@@ -356,13 +350,32 @@ mod tests {
         );
         assert!(
             !joined.contains("README.md/note.md"),
-            "treating the note as a directory invents a path that does not \
+            "treating the note as a directory invents a path that cannot \
              exist: {joined}"
         );
         assert!(
-            !joined.contains("prefix=") && !joined.contains("to="),
+            !joined.contains("prefix=") && !joined.contains("to=") && !joined.contains("tar -xf"),
             "a grant that is one note has no subtree to narrow to or push \
              into: {joined}"
+        );
+    }
+
+    #[test]
+    fn an_empty_vault_gets_examples_without_a_prefix() {
+        let joined = lines(true, &Example::Vault { note: None }).join("\n");
+        assert!(
+            !joined.contains("prefix=") && !joined.contains("to="),
+            "with nothing to name, the examples take the whole vault: {joined}"
+        );
+    }
+
+    #[test]
+    fn the_index_example_does_not_promise_note_tags() {
+        let joined = lines(false, &Example::Vault { note: None }).join("\n");
+        assert!(
+            !joined.contains("tags"),
+            "in a notes vault `tags` means frontmatter tags, which this does not \
+             return: {joined}"
         );
     }
 }
