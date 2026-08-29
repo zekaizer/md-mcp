@@ -122,24 +122,24 @@ impl MdServer {
     }
 }
 
-/// The note the examples name, in a value this vault actually holds. A recipe
-/// is a contract to be runnable as printed, and a placeholder filename 404s.
-/// A grant confined to one note names that note; anything wider names the
-/// first note it reaches, or nothing in an empty scope.
+/// The note the note-level examples name. Only a grant confined to a single
+/// note names a real one — there the note *is* the grant, not an example.
+/// Anything wider gets [`NOTE_PLACEHOLDER`]: naming a real note invites
+/// running the line as printed against whatever happened to be first, and the
+/// paths a caller actually wants come from the index anyway.
 async fn example_note(server: &MdServer, confined_to: Option<&str>) -> Option<String> {
+    let scope = confined_to?;
     let _guard = server.lock().read().await;
-    if let Some(scope) = confined_to
-        && !server.vault().is_dir(scope).unwrap_or(false)
-    {
-        return Some(scope.to_string());
+    if server.vault().is_dir(scope).unwrap_or(false) {
+        None
+    } else {
+        Some(scope.to_string())
     }
-    server
-        .vault()
-        .list_entries(confined_to.unwrap_or(""), true, None, false)
-        .ok()
-        .and_then(|entries| entries.into_iter().next())
-        .map(|entry| entry.path)
 }
+
+/// Unmistakably not a path, so the one substitution the recipe asks for is
+/// visible in the line itself.
+const NOTE_PLACEHOLDER: &str = "<path-from-the-index>";
 
 fn scope_names(scopes: &Scopes) -> Vec<String> {
     let mut names = Vec::new();
@@ -155,13 +155,18 @@ fn scope_names(scopes: &Scopes) -> Vec<String> {
     names
 }
 
-/// Commands with the values already substituted: a model should run a line,
-/// not assemble one.
+/// Commands with the values already substituted — except the one value that
+/// is the caller's to choose. A model should run a line, not assemble one;
+/// the note path is the deliberate exception, because a real note printed
+/// here reads as the target rather than an example.
 fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>) -> Vec<String> {
     let token_file = token_file(write);
     // Read back from the file rather than interpolated: the token then never
     // reaches a command line, shell history, or this conversation.
     let auth = format!("-H \"authorization: Bearer $(cat {token_file})\"");
+    // A confined-to-one-note grant names its note; a wider grant names the
+    // substitution it wants instead.
+    let target = note.map_or_else(|| NOTE_PLACEHOLDER.to_string(), percent_encode_path);
 
     let mut recipe = vec![
         format!(
@@ -170,18 +175,14 @@ fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>)
         format!(
             "# 2. the index: every note this grant reaches -- path, etag, size -- one JSON object per line, no content.\n#    etag is blake3 of the note's exact bytes, quoted; recompute it locally to find what changed\ncurl -sS --fail-with-body {auth} \"{base}\""
         ),
+        format!(
+            "# one note, verbatim, to a file -- work on it with your tools instead of reading it into context\ncurl -sS --fail-with-body {auth} -o note.md \"{base}/{target}\""
+        ),
     ];
-    if let Some(note) = note {
+    if write {
         recipe.push(format!(
-            "# one note, verbatim, to a file -- work on it with your tools instead of reading it into context\ncurl -sS --fail-with-body {auth} -o note.md \"{base}/{}\"",
-            percent_encode_path(note)
+            "# put it back, only if it did not change since you read it (etag from the index or the GET);\n#    to create a note that does not exist yet, send no if-match header at all.\n#    201 created, 204 replaced -- the reply carries the new etag, so a second edit needs no fresh GET -- 412 it changed underneath you, 428 replacing needs if-match\ncurl -sS -D - {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{target}\""
         ));
-        if write {
-            recipe.push(format!(
-                "# put it back, only if it did not change since you read it (etag from the index or the GET).\n#    201 created, 204 replaced -- the reply carries the new etag, so a second edit needs no fresh GET -- 412 it changed underneath you, 428 the if-match is missing\ncurl -sS -D - {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{}\"",
-                percent_encode_path(note)
-            ));
-        }
     }
     recipe.push(
         "# many notes are the same two commands in a loop over the index paths. Deleting and \
@@ -247,17 +248,29 @@ mod tests {
     }
 
     #[test]
-    fn the_examples_name_things_this_vault_actually_holds() {
+    fn a_grant_that_is_one_note_names_that_note() {
         let joined = lines(true, Some("00-inbox/a real note.md")).join("\n");
 
         assert!(
             joined.contains("00-inbox/a%20real%20note.md"),
-            "the one-note example names a note that exists, escaped so the \
-             command can carry it: {joined}"
+            "confined to one note, the note is the grant rather than an \
+             example, so the line is runnable as printed: {joined}"
         );
         assert!(
-            !joined.contains("/note.md\""),
-            "no placeholder filename may survive: {joined}"
+            !joined.contains("<path-from-the-index>"),
+            "asking for a substitution the grant already made is noise: {joined}"
+        );
+    }
+
+    #[test]
+    fn a_wider_grant_names_a_substitution_not_a_real_note() {
+        let joined = lines(true, None).join("\n");
+
+        assert!(
+            joined.contains("/<path-from-the-index>\""),
+            "a real note printed here reads as the target rather than an \
+             example, and etag-in-hand a caller can replace one it never \
+             meant to touch: {joined}"
         );
     }
 
@@ -293,16 +306,23 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_scope_still_teaches_the_loop() {
-        let lines = lines(true, None);
-        let joined = lines.join("\n");
+    fn the_loop_is_taught_whatever_the_grant() {
+        for note in [None, Some("00-inbox/a real note.md")] {
+            let joined = lines(true, note).join("\n");
+            assert!(
+                joined.contains("loop over the index paths"),
+                "bulk work has to be discoverable from the recipe alone: {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn creating_without_a_precondition_is_taught_where_replacing_is() {
+        let joined = lines(true, None).join("\n");
         assert!(
-            !joined.contains("note.md"),
-            "with no note to name there is no note line to print: {joined}"
-        );
-        assert!(
-            joined.contains("loop over the index paths"),
-            "bulk work has to be discoverable from the recipe alone: {joined}"
+            joined.contains("no if-match"),
+            "a caller creating notes in a loop meets the 404 first unless the \
+             recipe says the header is only for replacing: {joined}"
         );
     }
 
