@@ -106,6 +106,8 @@ impl MdServer {
         let scopes = Scopes {
             read: true,
             write: req.write,
+            // `mint` stamps this; naming it here keeps the struct exhaustive.
+            delegated: true,
             prefix: req.prefix.clone(),
         };
         let example = example_scope(self, req.prefix.as_deref()).await;

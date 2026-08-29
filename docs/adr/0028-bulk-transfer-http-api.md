@@ -98,9 +98,11 @@ credential that cannot name a path cannot reach it however the request is
 phrased. It confines to a path, not to a directory, so the narrowest grant is a
 single note — and a credential confined to one still has a collection, which is
 that note. An unqualified request from a confined credential is narrowed to what
-it can see rather than refused. It bounds accidents, not intent — the
-human's consent at connector authorisation is already vault-wide, and MCP can
-already read every note. Containment compares path segments, never string
+it can see rather than refused. A delegated credential is refused on the tool
+surface, which reads no scopes and would therefore hand it back everything its
+confinement withheld. It bounds accidents, not intent — the human's consent at
+connector authorisation is already vault-wide, and MCP can already read every
+note. Containment compares path segments, never string
 prefixes.
 
 We will surface the API to models through **one MCP tool**, which answers not

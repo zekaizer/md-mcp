@@ -29,7 +29,7 @@ use tokio::net::TcpListener;
 
 use crate::MdServer;
 use crate::config::HttpConfig;
-use crate::oauth::{self, OAuthState};
+use crate::oauth::{self, OAuthState, Scopes};
 
 /// How long an idle MCP session is kept before rmcp reaps it. rmcp's own default
 /// is 5 minutes, which a conversational client outlives all the time: the session
@@ -86,7 +86,12 @@ pub fn router(server: MdServer, cfg: &HttpConfig) -> Router {
         sh_config,
     );
 
-    let mcp = Router::new().route_service("/mcp", service).merge(api);
+    // The guard sits on `/mcp` alone rather than inside the shared bearer
+    // middleware: the rule is about this surface, not about every request.
+    let mcp = Router::new()
+        .route_service("/mcp", service)
+        .layer(middleware::from_fn(deny_delegated))
+        .merge(api);
 
     // OAuth is enabled exactly when a static token is set (ADR-0014): the token is the
     // `/authorize` ownership gate and the Claude Code (CLI) bearer. Without it, the
@@ -431,6 +436,28 @@ async fn require_bearer(
         }
         None => unauthorized(&request),
     }
+}
+
+/// Refuse a transfer credential on the tool surface.
+///
+/// Tools read no scopes, so a delegated credential would arrive here holding
+/// everything its confinement and its read-only grant were meant to withhold.
+/// It is refused rather than widened.
+async fn deny_delegated(request: Request, next: Next) -> Response {
+    if request
+        .extensions()
+        .get::<Scopes>()
+        .is_some_and(|scopes| scopes.delegated)
+    {
+        tracing::warn!("mcp: refused a transfer credential on the tool surface");
+        return (
+            StatusCode::UNAUTHORIZED,
+            "this credential is for the transfer API; the tool surface needs the one the \
+             connector was authorised with\n",
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// `401` carrying the RFC 9728 `WWW-Authenticate` challenge pointing at this server's

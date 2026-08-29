@@ -586,3 +586,24 @@ async fn a_grant_can_be_confined_to_a_single_note() {
     );
     assert_eq!(listing.headers()["note-count"], "1");
 }
+
+#[tokio::test]
+async fn a_transfer_credential_is_refused_by_the_tool_surface() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let confined = provision_confined(addr, false, "inbox").await;
+
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header(confined),
+    );
+    let handshake =
+        tokio::time::timeout(Duration::from_secs(10), serve_client((), transport)).await;
+
+    assert!(
+        matches!(handshake, Ok(Err(_))),
+        "the tool surface does not read scopes, so a credential that reaches it \
+         is unconfined and may write the whole vault — every guarantee the \
+         transfer API enforces would be one request away from irrelevant. \
+         got {handshake:?}"
+    );
+}

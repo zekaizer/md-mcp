@@ -92,6 +92,13 @@ pub struct Scopes {
     pub read: bool,
     #[serde(default)]
     pub write: bool,
+    /// Minted for the transfer API rather than issued by the authorization
+    /// flow. The tool surface reads no scopes, so a delegated credential
+    /// reaching it would arrive unconfined and able to write the whole vault —
+    /// it is refused there instead. Absent on disk means a connector's own
+    /// token, which is what every record predating this field is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delegated: bool,
     /// The only subtree this credential can reach. `None` is the whole vault —
     /// which is what every token held before scopes existed, so absence has to
     /// keep meaning that.
@@ -105,6 +112,7 @@ impl Scopes {
         Self {
             read: true,
             write: true,
+            delegated: false,
             prefix: None,
         }
     }
@@ -425,6 +433,12 @@ impl OAuthState {
     /// meant to lapse, not to renew itself.
     pub fn mint(&self, scopes: Scopes, ttl_secs: u64, not_after: Option<u64>) -> String {
         let token = random_token();
+        // Minting is how a delegated credential comes into being; the flag is
+        // set here so no caller can forget to.
+        let scopes = Scopes {
+            delegated: true,
+            ..scopes
+        };
         {
             let expires_at = (now_secs() + ttl_secs).min(not_after.unwrap_or(u64::MAX));
             let mut store = self.store.lock().unwrap();
@@ -1016,6 +1030,7 @@ mod tests {
         let reduced = Scopes {
             read: true,
             write: false,
+            delegated: false,
             prefix: None,
         };
 
@@ -1024,8 +1039,12 @@ mod tests {
         assert_ne!(token, "static-token", "a child must not be its parent");
         assert_eq!(
             oauth.validate_bearer(&token),
-            Some(reduced),
-            "a token handed to a sandbox has to be weaker than the one that minted it"
+            Some(Scopes {
+                delegated: true,
+                ..reduced
+            }),
+            "a token handed to a sandbox has to be weaker than the one that minted \
+             it, and has to say it was minted"
         );
     }
 
@@ -1074,6 +1093,7 @@ mod tests {
         let granted = Scopes {
             read: true,
             write: false,
+            delegated: false,
             prefix: None,
         };
 
@@ -1083,7 +1103,13 @@ mod tests {
         let token = oauth
             .redeem_transfer_code(&code)
             .expect("the first redemption yields the token");
-        assert_eq!(oauth.validate_bearer(&token), Some(granted));
+        assert_eq!(
+            oauth.validate_bearer(&token),
+            Some(Scopes {
+                delegated: true,
+                ..granted
+            })
+        );
         assert_ne!(token, code, "the ticket is not the credential");
 
         assert_eq!(
@@ -1124,6 +1150,7 @@ mod tests {
         let granted = Scopes {
             read: true,
             write: true,
+            delegated: false,
             prefix: None,
         };
         let first = collect(&oauth, granted.clone());
@@ -1132,11 +1159,15 @@ mod tests {
             .renew_transfer(&first)
             .expect("a working token is its own proof");
 
+        let delegated = Scopes {
+            delegated: true,
+            ..granted
+        };
         assert_ne!(second, first);
-        assert_eq!(oauth.validate_bearer(&second), Some(granted.clone()));
+        assert_eq!(oauth.validate_bearer(&second), Some(delegated.clone()));
         assert_eq!(
             oauth.validate_bearer(&first),
-            Some(granted),
+            Some(delegated),
             "losing the replacement — a failed move, an interrupted script — must \
              not cost the whole remaining lifetime"
         );
@@ -1212,6 +1243,7 @@ mod tests {
         let scoped = Scopes {
             read: true,
             write: false,
+            delegated: false,
             prefix: Some("00-inbox".to_string()),
         };
 
@@ -1266,6 +1298,7 @@ mod tests {
         let reduced = Scopes {
             read: false,
             write: true,
+            delegated: false,
             prefix: None,
         };
 
