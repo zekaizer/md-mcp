@@ -667,7 +667,9 @@ async fn redeem(State(oauth): State<Arc<OAuthState>>, Form(req): Form<RedeemRequ
             tracing::info!("transfer: ticket redeemed");
             (
                 [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                format!("{token}\n"),
+                // The exact token, no trailing newline: the file is read back
+                // verbatim, and not every consumer is a shell that trims.
+                token,
             )
                 .into_response()
         }

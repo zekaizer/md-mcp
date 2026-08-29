@@ -257,6 +257,21 @@ async fn a_ticket_is_spent_by_its_first_use() {
 }
 
 #[tokio::test]
+async fn the_collected_token_is_exactly_the_token() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let grant = grant(addr, false).await;
+    let code = grant["code"].as_str().unwrap().to_string();
+
+    let body = redeem(addr, &code).await.text().await.unwrap();
+    assert_eq!(
+        body,
+        body.trim(),
+        "the recipe reads the file back verbatim; a stray newline is invisible \
+         in a shell and fatal to every other consumer"
+    );
+}
+
+#[tokio::test]
 async fn an_unknown_ticket_buys_nothing() {
     let (addr, _handle) = spawn_server(Some("s3cret")).await;
     assert_eq!(redeem(addr, "not-a-ticket").await.status(), 400);
