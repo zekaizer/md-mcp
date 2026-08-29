@@ -534,3 +534,54 @@ async fn a_confined_grant_narrows_an_unqualified_pull_to_itself() {
     );
     assert_eq!(response.headers()["note-count"], "2");
 }
+
+#[tokio::test]
+async fn a_grant_can_be_confined_to_a_single_note() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let http = reqwest::Client::new();
+    let (full, _) = provision(addr, true).await;
+    for name in ["inbox/one.md", "inbox/two.md"] {
+        http.put(format!("http://{addr}/api/notes/{name}"))
+            .bearer_auth(&full)
+            .body("# x\n")
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let confined = provision_confined(addr, true, "inbox/one.md").await;
+
+    assert_eq!(
+        http.get(format!("http://{addr}/api/notes/inbox/one.md"))
+            .bearer_auth(&confined)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200,
+        "the narrowest useful grant is one note, and a script that edits one \
+         note should be able to hold nothing more"
+    );
+    assert_eq!(
+        http.get(format!("http://{addr}/api/notes/inbox/two.md"))
+            .bearer_auth(&confined)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+
+    let listing = http
+        .get(format!("http://{addr}/api/notes"))
+        .bearer_auth(&confined)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        listing.status(),
+        200,
+        "a credential confined to a note still has a collection: it is that note"
+    );
+    assert_eq!(listing.headers()["note-count"], "1");
+}

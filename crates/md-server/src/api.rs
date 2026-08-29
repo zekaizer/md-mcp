@@ -13,8 +13,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
 use md_core::Code;
-use md_core::listing::Entry;
 use md_core::text::nfc;
+
+use md_core::Vault;
 
 use crate::MdServer;
 use crate::envelope::MAX_WRITE_BYTES;
@@ -245,22 +246,22 @@ fn line(value: serde_json::Value) -> String {
 }
 
 /// A subtree as one tar, so a whole vault crosses the wire in one round trip.
-fn tar_of(server: &MdServer, entries: &[Entry]) -> Response {
-    let count = entries.len();
+fn tar_of(server: &MdServer, paths: &[String]) -> Response {
+    let count = paths.len();
     let mut builder = tar::Builder::new(Vec::new());
-    for entry in entries {
+    for path in paths {
         // A transfer that silently drops a note it could not read would read as
         // a deletion on the far side, so one failure fails the export.
-        let note = match server.vault().read_note(&entry.path) {
+        let note = match server.vault().read_note(path) {
             Ok(note) => note,
-            Err(error) => return export_failed(&entry.path, &error.message),
+            Err(error) => return export_failed(path, &error.message),
         };
         let mut header = tar::Header::new_gnu();
         header.set_size(note.len() as u64);
         header.set_mode(0o644);
         header.set_cksum();
-        if let Err(error) = builder.append_data(&mut header, &entry.path, note.as_bytes()) {
-            return export_failed(&entry.path, &error.to_string());
+        if let Err(error) = builder.append_data(&mut header, path, note.as_bytes()) {
+            return export_failed(path, &error.to_string());
         }
     }
     match builder.into_inner() {
@@ -358,48 +359,57 @@ async fn get_collection(
     }
 }
 
-/// The notes a request covers, or the response explaining why there are none to
-/// speak of. An empty archive and a mistyped prefix look identical to a caller,
-/// and one of them means the command they ran did nothing.
+/// The note paths a request covers, or why there are none to speak of. An empty
+/// archive and a mistyped prefix look identical to a caller, and one of them
+/// means the command they ran did nothing.
+///
+/// A prefix may name one note rather than a directory: the narrowest useful
+/// grant is a single note, and a credential confined to one still has a
+/// collection — it is that note.
 fn entries_under(
     server: &MdServer,
     prefix: Option<&str>,
-) -> Result<Vec<Entry>, (StatusCode, String)> {
+) -> Result<Vec<String>, (StatusCode, String)> {
+    let listing = |directory: &str| {
+        server
+            .vault()
+            .list_entries(directory, true, None, false)
+            .map(|entries| entries.into_iter().map(|entry| entry.path).collect())
+            .map_err(|error| core_status(&error))
+    };
+
     let prefix = prefix.map(|p| p.trim_matches('/')).unwrap_or_default();
     if prefix.is_empty() {
-        return server
-            .vault()
-            .list_entries("", true, None, false)
-            .map_err(|error| core_status(&error));
+        return listing("");
     }
-    match server.vault().is_dir(prefix) {
-        Ok(true) => server
-            .vault()
-            .list_entries(prefix, true, None, false)
-            .map_err(|error| core_status(&error)),
-        _ => Err((
-            StatusCode::NOT_FOUND,
-            format!("no directory {prefix:?} in this vault\n"),
-        )),
+    if server.vault().is_dir(prefix).unwrap_or(false) {
+        return listing(prefix);
     }
+    if !Vault::is_internal_path(prefix) && server.vault().exists(prefix).unwrap_or(false) {
+        return Ok(vec![prefix.to_string()]);
+    }
+    Err((
+        StatusCode::NOT_FOUND,
+        format!("nothing at {prefix:?} in this vault\n"),
+    ))
 }
 
 /// Every note's path, entity tag and size, without its content — so a caller
 /// can work out what changed and fetch only that. The tags are the same values
 /// the note endpoint serves, and so can be replayed as `If-Match`.
-fn index(server: &MdServer, entries: &[Entry]) -> Response {
+fn index(server: &MdServer, paths: &[String]) -> Response {
     let mut body = String::new();
-    for entry in entries {
+    for path in paths {
         // A note that cannot be read costs its own line, never the listing: a
         // silently dropped path reads to a syncing client as a deletion.
-        let line = match server.vault().read_note(&entry.path) {
+        let line = match server.vault().read_note(path) {
             Ok(note) => serde_json::json!({
-                "path": entry.path,
+                "path": path,
                 "etag": entity_tag(note.as_bytes()),
                 "size": note.len(),
             }),
             Err(error) => serde_json::json!({
-                "path": entry.path,
+                "path": path,
                 "error": error.message,
             }),
         };
