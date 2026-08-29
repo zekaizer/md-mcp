@@ -275,12 +275,12 @@ fn recipe(
                 "# stage what you mean to send in {PUSH_DIR} -- NOT {PULL_DIR}, which holds what you just pulled -- then check it\n#    `tar -cf - .` sends whatever the directory holds, so run this before the line below\nmkdir -p {PUSH_DIR} && tar -C {PUSH_DIR} -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}{and}dry_run=true\""
             ));
             recipe.push(format!(
-                "# then make it. {separator}overwrite=true replaces existing notes with no version check -- unlike the single-note PUT below, a bulk push cannot ask whether they changed since you read them.\n#    207 means some entries were refused, and the lines above say which\ntar -C {PUSH_DIR} -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}\" -w \"\\nHTTP %{{http_code}}\\n\""
+                "# then make it. {separator}overwrite=true replaces existing notes with no version check -- unlike the single-note PUT below, a bulk push cannot ask whether they changed since you read them.\n#    200 all landed, 207 some did and the lines say which, 422 none did. Deleting is not part of this API: use the delete_notes tool\ntar -C {PUSH_DIR} -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}\" -w \"\\nHTTP %{{http_code}}\\n\""
             ));
         }
         if let Some(note) = note {
             recipe.push(format!(
-                "# replace that note, only if it has not changed since you read it\ncurl -sS {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{}\"",
+                "# replace that note, only if it has not changed since you read it. The reply carries the new etag, so a second edit needs no fresh GET\ncurl -sS -D - {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{}\"",
                 percent_encode_path(note)
             ));
         }

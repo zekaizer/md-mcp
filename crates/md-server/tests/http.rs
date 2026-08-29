@@ -651,3 +651,24 @@ async fn a_grant_confined_with_a_decomposed_name_still_reaches_its_own_notes() {
          request it prints fails"
     );
 }
+
+#[tokio::test]
+async fn a_destination_outside_the_grant_is_refused_before_the_upload() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let confined = provision_confined(addr, true, "inbox").await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/notes?to=elsewhere"))
+        .bearer_auth(&confined)
+        .body(Vec::new())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        403,
+        "the destination alone settles this, so a large tar should not be read \
+         and refused entry by entry to reach the same answer"
+    );
+}

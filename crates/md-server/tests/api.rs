@@ -418,7 +418,11 @@ async fn a_posted_tar_does_not_clobber_by_default() {
 
     let response = post_tar(addr, "", body).await;
 
-    assert_eq!(response.status(), 207, "refusing an entry is not a success");
+    assert_eq!(
+        response.status(),
+        422,
+        "the only entry was refused, so nothing landed at all"
+    );
     let report = response.text().await.unwrap();
     assert!(
         report.contains("hello.md") && report.contains("error"),
@@ -914,4 +918,31 @@ async fn a_destination_outside_the_vault_is_refused_outright() {
         !root.join("etc").exists(),
         "and it must not have been created"
     );
+}
+
+#[tokio::test]
+async fn a_push_that_landed_nothing_is_not_a_partial_success() {
+    let addr = spawn(None).await;
+
+    let nothing_landed = post_tar(addr, "", tar_of(&[("hello.md", "# clobber\n")])).await;
+
+    assert_eq!(
+        nothing_landed.status(),
+        422,
+        "207 says `some of it worked`; a script gating on the status cannot \
+         tell that from a push that wrote nothing at all"
+    );
+
+    let partly = post_tar(
+        addr,
+        "",
+        tar_of(&[("new.md", "# New\n"), ("hello.md", "# clobber\n")]),
+    )
+    .await;
+    assert_eq!(
+        partly.status(),
+        207,
+        "and a real partial is still a partial"
+    );
+    assert_eq!(read_back(addr, "hello.md").await, NOTE);
 }

@@ -134,17 +134,22 @@ async fn post_collection(
     // A destination is a vault-relative directory. Quietly dropping a leading
     // slash would land a top-level `etc/` in the vault, which is one typo away
     // from a structure growing a directory nobody chose.
-    if let Some(to) = query.to.as_deref().filter(|to| !to.trim().is_empty())
-        && let Err(error) = md_core::Vault::validate_rel(to)
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "destination {to:?} is not a vault directory: {}\n",
-                error.message
-            ),
-        )
-            .into_response();
+    if let Some(to) = query.to.as_deref().filter(|to| !to.trim().is_empty()) {
+        if let Err(error) = Vault::validate_rel(to) {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "destination {to:?} is not a vault directory: {}\n",
+                    error.message
+                ),
+            )
+                .into_response();
+        }
+        // Settled by the destination alone, so a large tar is not read and
+        // refused entry by entry to arrive at the same answer.
+        if !authority.permits(&nfc(to)) {
+            return outside_grant(to);
+        }
     }
 
     let _guard = server.lock().write().await;
@@ -163,12 +168,15 @@ async fn post_collection(
     let mut report = String::new();
     let mut ops = Vec::new();
     let mut refused = 0usize;
+    // Counted apart from `ops`, which a dry run deliberately leaves empty.
+    let mut report_wrote = 0usize;
     let mut buffer = Vec::new();
     for entry in entries {
         match write_entry(&server, &authority, &query, entry, &mut buffer) {
             // A directory is structure, not content, and nothing to report.
             Ok(None) => {}
             Ok(Some(written)) => {
+                report_wrote += 1;
                 let path = written.path;
                 if query.dry_run {
                     push_line(
@@ -217,12 +225,12 @@ async fn post_collection(
         )
         .await;
 
-    // A push that refused something is not a success, and a script gating on
-    // the exit status has only the code to go on.
-    let status = if refused == 0 {
-        StatusCode::OK
-    } else {
-        StatusCode::MULTI_STATUS
+    // A script gating on the status has only the code to go on, so the three
+    // outcomes are three codes: all of it, some of it, none of it.
+    let status = match (ops.is_empty() && report_wrote == 0, refused) {
+        (_, 0) => StatusCode::OK,
+        (true, _) => StatusCode::UNPROCESSABLE_ENTITY,
+        (false, _) => StatusCode::MULTI_STATUS,
     };
     (status, [(header::CONTENT_TYPE, NDJSON.to_string())], report).into_response()
 }

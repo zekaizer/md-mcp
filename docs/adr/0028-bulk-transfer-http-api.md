@@ -103,7 +103,10 @@ so that a client needs nothing but `curl` and `tar`. Replacing a note whose
 version matters therefore goes through `PUT` with `If-Match`; a bulk push is for
 notes whose current state the caller does not need to have agreed with.
 
-A bulk push will accept `dry_run=true` and answer with the same per-entry report
+A bulk push answers with a line per entry, and with a status separating the
+three outcomes a caller can act on: all of it landed, some of it did, none of it
+did. A script gating on the code should not have to parse the body to learn
+which. It will also accept `dry_run=true` and answer with the same report
 having written nothing. `tar -cf - .` carries whatever a directory happens to
 hold rather than what the caller meant to send, and a push is the one operation
 here that cannot be undone by repeating it.
