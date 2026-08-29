@@ -139,10 +139,12 @@ async fn post_collection(
 
     let mut report = String::new();
     let mut ops = Vec::new();
+    let mut refused = 0usize;
     for entry in entries {
         let mut entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
+                refused += 1;
                 report.push_str(&line(serde_json::json!({ "error": error.to_string() })));
                 continue;
             }
@@ -155,6 +157,7 @@ async fn post_collection(
             continue;
         }
         if !kind.is_file() {
+            refused += 1;
             report.push_str(&line(serde_json::json!({ "error": "not a regular file" })));
             continue;
         }
@@ -170,12 +173,14 @@ async fn post_collection(
 
         let mut bytes = Vec::new();
         if let Err(error) = entry.read_to_end(&mut bytes) {
+            refused += 1;
             report.push_str(&line(
                 serde_json::json!({ "path": path, "error": error.to_string() }),
             ));
             continue;
         }
         if bytes.len() > MAX_WRITE_BYTES {
+            refused += 1;
             report.push_str(&line(serde_json::json!({
                 "path": path,
                 "error": format!("note is {} bytes, over the {MAX_WRITE_BYTES} limit", bytes.len()),
@@ -184,6 +189,7 @@ async fn post_collection(
         }
 
         if !authority.permits(&path) {
+            refused += 1;
             report.push_str(&line(serde_json::json!({
                 "path": path,
                 "error": "outside this credential's directory",
@@ -191,6 +197,7 @@ async fn post_collection(
             continue;
         }
         if not_a_note(&path).is_some() {
+            refused += 1;
             report.push_str(&line(serde_json::json!({
                 "path": path,
                 "error": "not a Markdown note; this vault holds only .md files",
@@ -199,6 +206,7 @@ async fn post_collection(
         }
         let existed = server.vault().exists(&path).unwrap_or(false);
         if existed && !query.overwrite {
+            refused += 1;
             report.push_str(&line(serde_json::json!({
                 "path": path,
                 "error": "note exists; pass overwrite=true to replace it",
@@ -220,9 +228,12 @@ async fn post_collection(
                     "replaced": existed,
                 })));
             }
-            Err(error) => report.push_str(&line(
-                serde_json::json!({ "path": path, "error": error.message }),
-            )),
+            Err(error) => {
+                refused += 1;
+                report.push_str(&line(
+                    serde_json::json!({ "path": path, "error": error.message }),
+                ));
+            }
         }
     }
 
@@ -234,7 +245,14 @@ async fn post_collection(
             &serde_json::json!({ "to": query.to, "overwrite": query.overwrite }),
         )
         .await;
-    ([(header::CONTENT_TYPE, NDJSON.to_string())], report).into_response()
+    // A push that refused something is not a success, and a script gating on
+    // the exit status has only the code to go on.
+    let status = if refused == 0 {
+        StatusCode::OK
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+    (status, [(header::CONTENT_TYPE, NDJSON.to_string())], report).into_response()
 }
 
 /// Join a pushed entry's name onto the destination prefix.

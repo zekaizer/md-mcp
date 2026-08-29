@@ -256,7 +256,7 @@ fn recipe(
                 directory.map_or_else(String::new, |dir| format!("?to={}", url_escape(dir)));
             let separator = if destination.is_empty() { "?" } else { "&" };
             recipe.push(format!(
-                "# push a directory (add {separator}overwrite=true to replace existing notes)\ntar -C ./vault -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}\""
+                "# push a directory (add {separator}overwrite=true to replace existing notes; 207 means some entries were refused, and the lines above say which)\ntar -C ./vault -cf - . | curl -sS {auth} -X POST --data-binary @- \"{base}{destination}\" -w \"\\nHTTP %{{http_code}}\\n\""
             ));
         }
         if let Some(note) = note {

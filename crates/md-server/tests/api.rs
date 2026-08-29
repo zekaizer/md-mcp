@@ -417,7 +417,7 @@ async fn a_posted_tar_does_not_clobber_by_default() {
 
     let response = post_tar(addr, "", body).await;
 
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), 207, "refusing an entry is not a success");
     let report = response.text().await.unwrap();
     assert!(
         report.contains("hello.md") && report.contains("error"),
@@ -462,7 +462,7 @@ async fn a_posted_tar_cannot_escape_the_vault() {
 
     let response = post_tar(addr, "", body).await;
 
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), 207, "refusing an entry is not a success");
     let report = response.text().await.unwrap();
     assert!(
         report.contains("error"),
@@ -691,4 +691,27 @@ async fn a_reported_path_can_be_used_as_given() {
          separator makes that a different path: {report}"
     );
     assert!(report.contains("landing/absolute.md"), "{report}");
+}
+
+#[tokio::test]
+async fn a_push_that_refused_something_does_not_report_success() {
+    let addr = spawn(None).await;
+
+    let all_written = post_tar(addr, "", tar_of(&[("fresh.md", "# F\n")])).await;
+    assert_eq!(all_written.status(), 200);
+
+    let partly_refused = post_tar(
+        addr,
+        "",
+        tar_of(&[("other.md", "# O\n"), ("hello.md", "# clobber\n")]),
+    )
+    .await;
+
+    assert_eq!(
+        partly_refused.status(),
+        207,
+        "`curl -sSf … && echo ok` on a push that wrote nothing must not print ok"
+    );
+    assert_eq!(read_back(addr, "hello.md").await, NOTE);
+    assert_eq!(read_back(addr, "other.md").await, "# O\n");
 }
