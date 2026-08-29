@@ -162,9 +162,9 @@ fn recipe(
     // Read back from the file rather than interpolated: the token then never
     // reaches a command line, shell history, or this conversation.
     let auth = format!("-H \"authorization: Bearer $(cat {TOKEN_FILE})\"");
-    // With no directory to name, every example takes the whole vault rather than
-    // inventing a path that would unpack nothing and push into the wrong place.
-    let scope = example_dir.map_or_else(String::new, |dir| format!("?prefix={dir}"));
+    // A directory this vault does not have would unpack nothing on a pull and
+    // push into the wrong place, so the narrowing examples appear only when
+    // there is a real one to name.
     let note = example_dir.map_or_else(|| "note.md".to_string(), |dir| format!("{dir}/note.md"));
 
     let mut recipe = vec![
@@ -172,13 +172,20 @@ fn recipe(
             "# 1. run this first: trade the one-time ticket for the token (single use)\ncurl -sSf -X POST -d \"code={code}\" \"{redeem}\" -o {TOKEN_FILE}"
         ),
         format!(
-            "# pull into ./vault (the note-count response header says how many arrived)\ncurl -sS {auth} \"{base}{scope}\" | tar -xf - -C ./vault"
+            "# 2. see what is there and how much of it, without transferring content\ncurl -sS {auth} \"{base}?format=index\""
         ),
         format!(
-            "# what exists, with each note's hash and size, without the content\ncurl -sS {auth} \"{base}?format=index\""
+            "# pull the whole vault into ./vault (the note-count response header says how many arrived)\ncurl -sS {auth} \"{base}\" | tar -xf - -C ./vault"
         ),
-        format!("# one note\ncurl -sS {auth} -o note.md \"{base}/{note}\""),
     ];
+    if let Some(dir) = example_dir {
+        recipe.push(format!(
+            "# or just one directory\ncurl -sS {auth} \"{base}?prefix={dir}\" | tar -xf - -C ./vault"
+        ));
+    }
+    recipe.push(format!(
+        "# one note\ncurl -sS {auth} -o note.md \"{base}/{note}\""
+    ));
     if write {
         let destination = example_dir.map_or_else(String::new, |dir| format!("?to={dir}"));
         let separator = if destination.is_empty() { "?" } else { "&" };
@@ -221,6 +228,36 @@ mod tests {
         assert!(
             !joined.contains("/inbox/") && !joined.contains("=inbox"),
             "no invented directory may survive in the recipe: {joined}"
+        );
+    }
+
+    #[test]
+    fn the_recipe_shows_the_whole_vault_before_a_slice_of_it() {
+        let lines = recipe(
+            "https://host/api/notes",
+            "https://host/transfer/redeem",
+            "https://host/transfer/renew",
+            "TICKET",
+            false,
+            Some("00-inbox"),
+        );
+        let pulls: Vec<&String> = lines.iter().filter(|l| l.contains("tar -xf")).collect();
+
+        assert!(
+            pulls.iter().any(|l| !l.contains("prefix=")),
+            "a recipe that only ever pulls one directory reads as a whole-vault \
+             pull and quietly delivers a fraction of it: {pulls:?}"
+        );
+        assert!(
+            pulls.iter().any(|l| l.contains("prefix=00-inbox")),
+            "narrowing still has to be shown: {pulls:?}"
+        );
+
+        let index = lines.iter().position(|l| l.contains("format=index"));
+        let whole = lines.iter().position(|l| l.contains("tar -xf"));
+        assert!(
+            index < whole,
+            "knowing the size comes before deciding to pull it all"
         );
     }
 

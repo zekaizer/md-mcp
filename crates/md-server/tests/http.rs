@@ -373,3 +373,37 @@ async fn the_connector_bearer_cannot_renew_through_the_transfer_path() {
         "letting the parent bearer in here would launder it into an endless chain"
     );
 }
+
+#[tokio::test]
+async fn the_grant_can_be_asked_for_with_no_arguments_at_all() {
+    let (addr, _handle) = spawn_server(Some("s3cret")).await;
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .auth_header("s3cret"),
+    );
+    let client = serve_client((), transport).await.expect("client handshake");
+
+    // Every field has a default, so a caller that passes nothing is asking for
+    // the default grant, not making a mistake.
+    let bare = client
+        .call_tool(CallToolRequestParams::new("provision_transfer"))
+        .await
+        .expect("a tool whose arguments are all optional must accept none");
+    assert!(
+        bare.structured_content.expect("structured content")["code"]
+            .as_str()
+            .is_some()
+    );
+
+    let empty = client
+        .call_tool(
+            CallToolRequestParams::new("provision_transfer").with_arguments(serde_json::Map::new()),
+        )
+        .await
+        .expect("an empty argument object is the same request");
+    assert!(
+        empty.structured_content.expect("structured content")["code"]
+            .as_str()
+            .is_some()
+    );
+}
