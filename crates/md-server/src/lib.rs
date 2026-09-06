@@ -313,7 +313,10 @@ impl ServerHandler for MdServer {
             "md-mcp v",
             env!("CARGO_PKG_VERSION"),
             " manages a single vault of pure-Markdown notes (.md + YAML frontmatter). \
-             Address notes by vault-relative path. Notes over ~10 KB (size_bytes in \
+             Address notes by vault-relative path; every '/' in a path is a \
+             directory separator and cannot be escaped, so a title such as \
+             \"I/O\" splits into a folder \"I\" and a note \"O …\" — write it \
+             \"I∕O\" (U+2215) or \"IO\" instead. Notes over ~10 KB (size_bytes in \
              list_notes) are cheaper section-wise: read_outlines first, then \
              read_sections for the sections you need; read smaller notes whole via \
              read_notes. Destructive batches are all-or-nothing. These tools are \

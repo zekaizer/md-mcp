@@ -48,6 +48,9 @@ pub struct CreateNotesRequest {
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct NoteInput {
+    /// Vault-relative path ending in `.md`. Every `/` is a directory separator
+    /// (missing directories are created) and cannot be escaped: a title like
+    /// `I/O` becomes folder `I` + note `O …`; use `I∕O` (U+2215) or `IO`.
     pub path: String,
     /// The note body (no leading `---` frontmatter block — pass frontmatter
     /// separately). Required unless `base` is given.
