@@ -25,6 +25,8 @@ pub enum Code {
     HeadingLevel,
     /// A path suffix convention was violated (`.md` for notes, `/` for directories).
     Suffix,
+    /// A path segment is empty, `.`/`..`, or contains a separator or NUL.
+    Segment,
     /// A relocate destination is not a directory.
     DestNotDir,
     /// Two batch items collide on a source or destination (e.g. a swap).
@@ -59,6 +61,7 @@ impl Code {
             Code::CountMismatch => "COUNT_MISMATCH",
             Code::HeadingLevel => "HEADING_LEVEL",
             Code::Suffix => "SUFFIX",
+            Code::Segment => "SEGMENT",
             Code::DestNotDir => "DEST_NOT_DIR",
             Code::BatchCollision => "BATCH_COLLISION",
             Code::MissingContent => "MISSING_CONTENT",
