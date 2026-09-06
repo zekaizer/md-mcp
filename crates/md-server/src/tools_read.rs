@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::MdServer;
 use crate::envelope::{ApiError, batch_limit, enforce_content_budget};
+use crate::vault_path::VaultPath;
 
 fn default_true() -> bool {
     true
@@ -52,9 +53,9 @@ impl ScopeArg {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct ReadNotesRequest {
-    /// Vault-relative note paths to read.
+    /// Notes to read, each as path segments root to leaf (`["dir", "note.md"]`).
     #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
-    pub paths: Vec<String>,
+    pub paths: Vec<VaultPath>,
     /// Include the note body (frontmatter block excluded).
     #[serde(default = "default_true")]
     pub include_body: bool,
@@ -76,7 +77,7 @@ pub struct ReadNotesResponse {
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct NoteRead {
-    pub path: String,
+    pub path: VaultPath,
     /// `true`/`false` when known; omitted when the read failed for a reason
     /// other than absence (e.g. TRAVERSAL), where existence is unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,12 +90,17 @@ pub struct NoteRead {
     pub error: Option<ApiError>,
 }
 
-fn read_one_note(vault: &Vault, path: &str, include_body: bool, include_fm: bool) -> NoteRead {
-    let raw = match vault.read_note(path) {
+fn read_one_note(
+    vault: &Vault,
+    path: &VaultPath,
+    include_body: bool,
+    include_fm: bool,
+) -> NoteRead {
+    let raw = match path.rel().and_then(|rel| vault.read_note(&rel)) {
         Ok(raw) => raw,
         Err(e) if e.code == md_core::Code::NotFound => {
             return NoteRead {
-                path: path.to_string(),
+                path: path.clone(),
                 exists: Some(false),
                 content: None,
                 frontmatter: None,
@@ -103,7 +109,7 @@ fn read_one_note(vault: &Vault, path: &str, include_body: bool, include_fm: bool
         }
         Err(e) => {
             return NoteRead {
-                path: path.to_string(),
+                path: path.clone(),
                 exists: None,
                 content: None,
                 frontmatter: None,
@@ -130,7 +136,7 @@ fn read_one_note(vault: &Vault, path: &str, include_body: bool, include_fm: bool
     };
 
     NoteRead {
-        path: path.to_string(),
+        path: path.clone(),
         exists: Some(true),
         content,
         frontmatter,
@@ -144,7 +150,7 @@ fn read_one_note(vault: &Vault, path: &str, include_body: bool, include_fm: bool
 #[schemars(crate = "rmcp::schemars")]
 pub struct ReadOutlinesRequest {
     #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
-    pub paths: Vec<String>,
+    pub paths: Vec<VaultPath>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -161,7 +167,7 @@ pub struct ReadOutlinesResponse {
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct NoteOutline {
-    pub path: String,
+    pub path: VaultPath,
     /// `true`/`false` when known; omitted when the read failed for a reason
     /// other than absence, where existence is unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,26 +216,26 @@ fn render_outline(entries: &[md_core::OutlineEntry]) -> String {
     rows.join("\n")
 }
 
-fn read_one_outline(vault: &Vault, path: &str) -> NoteOutline {
-    match vault.read_note(path) {
+fn read_one_outline(vault: &Vault, path: &VaultPath) -> NoteOutline {
+    match path.rel().and_then(|rel| vault.read_note(&rel)) {
         Ok(raw) => {
             let normalized = md_core::text::normalize_newlines(&raw).into_owned();
             let outline = render_outline(&Document::parse(&normalized).outline());
             NoteOutline {
-                path: path.to_string(),
+                path: path.clone(),
                 exists: Some(true),
                 outline: Some(outline),
                 error: None,
             }
         }
         Err(e) if e.code == md_core::Code::NotFound => NoteOutline {
-            path: path.to_string(),
+            path: path.clone(),
             exists: Some(false),
             outline: None,
             error: None,
         },
         Err(e) => NoteOutline {
-            path: path.to_string(),
+            path: path.clone(),
             exists: None,
             outline: None,
             error: Some(ApiError::from_core(&e)),
@@ -249,7 +255,7 @@ pub struct ReadSectionsRequest {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct SectionTarget {
-    pub path: String,
+    pub path: VaultPath,
     /// Heading path; empty addresses the root (whole body).
     pub heading_path: Vec<String>,
     #[serde(default)]
@@ -271,7 +277,7 @@ pub struct ReadSectionsResponse {
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct SectionRead {
-    pub path: String,
+    pub path: VaultPath,
     pub heading_path: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub occurrence: Option<usize>,
@@ -303,7 +309,7 @@ fn read_one_section(vault: &Vault, t: &SectionTarget) -> SectionRead {
         error: None,
     };
 
-    let raw = match vault.read_note(&t.path) {
+    let raw = match t.path.rel().and_then(|rel| vault.read_note(&rel)) {
         Ok(raw) => raw,
         Err(e) if e.code == md_core::Code::NotFound => return base,
         // A non-absence failure (e.g. TRAVERSAL): existence is unknown and the
@@ -353,7 +359,7 @@ fn read_one_section(vault: &Vault, t: &SectionTarget) -> SectionRead {
 impl MdServer {
     /// Read one or more notes in full (body and/or frontmatter).
     #[tool(
-        description = "Read one or more notes by vault-relative path. Returns each note's body (frontmatter excluded) and/or parsed frontmatter. Missing notes are reported with exists:false rather than failing the call.",
+        description = "Read one or more notes by path (segments root to leaf). Returns each note's body (frontmatter excluded) and/or parsed frontmatter. Missing notes are reported with exists:false rather than failing the call.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub async fn read_notes(
@@ -466,7 +472,7 @@ mod tests {
     #[test]
     fn read_note_returns_body_without_frontmatter() {
         let (_d, v) = vault_with(&[("n.md", "---\ntitle: T\n---\n# Body\ntext\n")]);
-        let r = read_one_note(&v, "n.md", true, true);
+        let r = read_one_note(&v, &"n.md".into(), true, true);
         assert_eq!(r.exists, Some(true));
         assert_eq!(r.content.as_deref(), Some("# Body\ntext\n"));
         assert_eq!(r.frontmatter.unwrap()["title"], serde_json::json!("T"));
@@ -475,22 +481,22 @@ mod tests {
     #[test]
     fn read_note_missing_reports_exists_false() {
         let (_d, v) = vault_with(&[]);
-        let r = read_one_note(&v, "nope.md", true, true);
+        let r = read_one_note(&v, &"nope.md".into(), true, true);
         assert_eq!(r.exists, Some(false));
         assert!(r.error.is_none());
     }
 
     #[test]
     fn read_error_without_absence_leaves_existence_unknown() {
-        // A TRAVERSAL failure says nothing about existence: don't claim true.
+        // A SEGMENT failure says nothing about existence: don't claim true.
         let (_d, v) = vault_with(&[]);
-        let r = read_one_note(&v, "../outside.md", true, true);
+        let r = read_one_note(&v, &"../outside.md".into(), true, true);
         assert_eq!(r.exists, None);
-        assert_eq!(r.error.unwrap().code, "TRAVERSAL");
+        assert_eq!(r.error.unwrap().code, "SEGMENT");
 
-        let o = read_one_outline(&v, "../outside.md");
+        let o = read_one_outline(&v, &"../outside.md".into());
         assert_eq!(o.exists, None);
-        assert_eq!(o.error.unwrap().code, "TRAVERSAL");
+        assert_eq!(o.error.unwrap().code, "SEGMENT");
 
         // read_sections used to swallow the error entirely and report
         // note_exists:false — indistinguishable from a missing note.
@@ -502,13 +508,13 @@ mod tests {
         };
         let s = read_one_section(&v, &t);
         assert_eq!(s.note_exists, None);
-        assert_eq!(s.error.unwrap().code, "TRAVERSAL");
+        assert_eq!(s.error.unwrap().code, "SEGMENT");
     }
 
     #[test]
     fn read_note_broken_frontmatter_reports_error() {
         let (_d, v) = vault_with(&[("b.md", "---\nx: : :\n bad\n---\nbody\n")]);
-        let r = read_one_note(&v, "b.md", true, true);
+        let r = read_one_note(&v, &"b.md".into(), true, true);
         assert_eq!(r.exists, Some(true));
         assert_eq!(r.error.unwrap().code, "FRONTMATTER_PARSE");
     }
@@ -516,21 +522,21 @@ mod tests {
     #[test]
     fn outline_renders_one_text_row_per_heading() {
         let (_d, v) = vault_with(&[("o.md", "# A\n## B\n# C\n")]);
-        let o = read_one_outline(&v, "o.md");
+        let o = read_one_outline(&v, &"o.md".into());
         assert_eq!(o.outline.as_deref(), Some("1 # A\n2 ## B\n3 # C"));
     }
 
     #[test]
     fn outline_right_aligns_line_numbers() {
         let (_d, v) = vault_with(&[("o.md", &format!("# A\n{}## B\n", "x\n".repeat(10)))]);
-        let o = read_one_outline(&v, "o.md");
+        let o = read_one_outline(&v, &"o.md".into());
         assert_eq!(o.outline.as_deref(), Some(" 1 # A\n12 ## B"));
     }
 
     #[test]
     fn outline_marks_shadowed_titles_with_address_row() {
         let (_d, v) = vault_with(&[("o.md", "# Q1\n## Status\n# Q2\n## Status\n")]);
-        let o = read_one_outline(&v, "o.md");
+        let o = read_one_outline(&v, &"o.md".into());
         assert_eq!(
             o.outline.as_deref(),
             Some(
@@ -545,7 +551,7 @@ mod tests {
     #[test]
     fn outline_appends_occurrence_for_identical_chains() {
         let (_d, v) = vault_with(&[("o.md", "# A\n# A\n")]);
-        let o = read_one_outline(&v, "o.md");
+        let o = read_one_outline(&v, &"o.md".into());
         assert_eq!(
             o.outline.as_deref(),
             Some(
@@ -558,7 +564,7 @@ mod tests {
     #[test]
     fn outline_of_headingless_note_is_empty_string() {
         let (_d, v) = vault_with(&[("o.md", "just text\n")]);
-        let o = read_one_outline(&v, "o.md");
+        let o = read_one_outline(&v, &"o.md".into());
         assert_eq!(o.outline.as_deref(), Some(""));
     }
 

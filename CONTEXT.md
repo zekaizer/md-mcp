@@ -23,7 +23,9 @@ wikilinks, block ids, a backlink graph, tags-as-graph — stay out of scope.
 
 **vault**:
 The single root directory md-mcp serves — the whole managed note tree. Every path
-an agent gives is vault-relative.
+an agent gives or receives is vault-relative and spelled as an array of segments,
+root to leaf (`["dir", "note.md"]`; `[]` is the root) — a segment can never hold
+a separator ([ADR-0029](docs/adr/0029-path-segments.md)).
 _Avoid_: repository, workspace, folder.
 
 **note**:
@@ -105,14 +107,16 @@ _Avoid_: etag, checksum, version.
 
 **move**:
 Relocating and/or renaming a note or directory in one step. The `move_notes`
-tool; an item's `dest` ending in `/` targets a directory keeping the basename
-(N notes → 1 directory), otherwise it is the full destination path including
-the new basename ([ADR-0024](docs/adr/0024-unified-move-primitive.md)).
+tool; an item's `into` names a directory to move into keeping the basename
+(N notes → 1 directory), its `dest` the full destination path including the new
+basename — exactly one of the two ([ADR-0024](docs/adr/0024-unified-move-primitive.md),
+[ADR-0029](docs/adr/0029-path-segments.md)).
 _Avoid_: rename, relocate (as separate operations).
 
 **path suffix convention**:
-A note path ends in `.md`, a directory path ends in `/` — the suffix alone tells
-note from directory, across every tool.
+A note path's last segment ends in `.md`. Nothing else is read from the spelling:
+whether a path is a directory comes from the disk on input and from `kind` in a
+listing.
 
 ## Failure model & durability
 

@@ -20,6 +20,7 @@ use crate::MdServer;
 use crate::envelope::{ApiError, MAX_WRITE_BYTES, batch_limit, write_size_error};
 use crate::events::EventOp;
 use crate::tools_read::ScopeArg;
+use crate::vault_path::VaultPath;
 
 /// Distinguish an omitted `value` (remove) from an explicit `null` (set null).
 fn deserialize_some<'de, D>(d: D) -> Result<Option<Value>, D::Error>
@@ -48,10 +49,10 @@ pub struct CreateNotesRequest {
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct NoteInput {
-    /// Vault-relative path ending in `.md`. Every `/` is a directory separator
-    /// (missing directories are created) and cannot be escaped: a title like
-    /// `I/O` becomes folder `I` + note `O …`; use `I∕O` (U+2215) or `IO`.
-    pub path: String,
+    /// Path segments root to leaf, the last ending in `.md`:
+    /// `["dir", "note.md"]`. Missing directories are created. A segment may not
+    /// contain `/` (SEGMENT): a title like `I/O` needs `I∕O` (U+2215) or `IO`.
+    pub path: VaultPath,
     /// The note body (no leading `---` frontmatter block — pass frontmatter
     /// separately). Required unless `base` is given.
     #[serde(default)]
@@ -64,7 +65,7 @@ pub struct NoteInput {
     /// `content` and `frontmatter`.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub base: Option<String>,
+    pub base: Option<VaultPath>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -80,7 +81,7 @@ pub struct CreateNotesResponse {
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct CreateResult {
-    pub path: String,
+    pub path: VaultPath,
     pub created: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ApiError>,
@@ -98,7 +99,7 @@ pub struct AppendNotesRequest {
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct AppendInput {
-    pub path: String,
+    pub path: VaultPath,
     pub content: String,
     #[serde(default)]
     pub create_if_missing: bool,
@@ -116,7 +117,7 @@ pub struct AppendNotesResponse {
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct AppendResult {
-    pub path: String,
+    pub path: VaultPath,
     pub appended: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ApiError>,
@@ -147,7 +148,7 @@ pub struct EditSectionsRequest {
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct EditItem {
-    pub path: String,
+    pub path: VaultPath,
     pub heading_path: Vec<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,7 +206,7 @@ pub struct EditSectionsResponse {
 #[schemars(crate = "rmcp::schemars")]
 pub struct AppliedEdit {
     pub index: usize,
-    pub path: String,
+    pub path: VaultPath,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_heading_path: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -310,7 +311,7 @@ pub struct ReplaceTextRequest {
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct ReplaceItem {
-    pub path: String,
+    pub path: VaultPath,
     /// The text to find, matched literally (byte-for-byte), never as a pattern.
     pub find: String,
     /// What each match becomes; empty deletes the match.
@@ -349,7 +350,7 @@ pub struct ReplaceTextResponse {
 #[schemars(crate = "rmcp::schemars")]
 pub struct AppliedReplace {
     pub index: usize,
-    pub path: String,
+    pub path: VaultPath,
     /// How many matches were replaced — may exceed the reported `hits`.
     pub replaced: usize,
     /// The first few changed lines, addressed in the resulting note.
@@ -402,7 +403,7 @@ pub struct EditPropertiesRequest {
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct PropertyEdit {
-    pub path: String,
+    pub path: VaultPath,
     pub key: String,
     /// Present (even `null`) sets the key; omitted removes it. Serialization
     /// mirrors that (`None` omitted), so a condensed commit-body call reads
@@ -432,7 +433,7 @@ pub struct EditPropertiesResponse {
 #[schemars(crate = "rmcp::schemars")]
 pub struct PropertyApplied {
     pub index: usize,
-    pub path: String,
+    pub path: VaultPath,
     pub key: String,
 }
 
@@ -457,18 +458,31 @@ impl MdServer {
             .notes
             .iter()
             .map(|note| {
+                let rel = match note.path.rel() {
+                    Ok(rel) => rel,
+                    Err(e) => {
+                        return CreateResult {
+                            path: note.path.clone(),
+                            created: false,
+                            error: Some(ApiError::from_core(&e)),
+                        };
+                    }
+                };
                 let result = match (&note.base, &note.content) {
                     (Some(_), _) if note.content.is_some() || note.frontmatter.is_some() => {
                         Err(md_core::Error::conflict(
                             "base copies a note verbatim; pass neither content nor frontmatter",
                         ))
                     }
-                    (Some(base), _) => self.vault().read_note(base).and_then(|text| {
-                        if text.len() > MAX_WRITE_BYTES {
-                            return Err(write_size_error("note", text.len()));
-                        }
-                        self.vault().create_note(&note.path, text.as_bytes(), req.overwrite)
-                    }),
+                    (Some(base), _) => base
+                        .rel()
+                        .and_then(|base| self.vault().read_note(&base))
+                        .and_then(|text| {
+                            if text.len() > MAX_WRITE_BYTES {
+                                return Err(write_size_error("note", text.len()));
+                            }
+                            self.vault().create_note(&rel, text.as_bytes(), req.overwrite)
+                        }),
                     (None, None) => Err(md_core::Error::new(
                         Code::MissingContent,
                         "content is required unless base is given",
@@ -484,7 +498,7 @@ impl MdServer {
                             if text.len() > MAX_WRITE_BYTES {
                                 return Err(write_size_error("note", text.len()));
                             }
-                            self.vault().create_note(&note.path, text.as_bytes(), req.overwrite)
+                            self.vault().create_note(&rel, text.as_bytes(), req.overwrite)
                         })
                     }
                 };
@@ -497,9 +511,8 @@ impl MdServer {
         let ops: Vec<EventOp> = created
             .iter()
             .filter(|c| c.created)
-            .map(|c| EventOp::Create {
-                path: c.path.clone(),
-            })
+            .filter_map(|c| c.path.rel().ok())
+            .map(|path| EventOp::Create { path })
             .collect();
         for op in &ops {
             self.emit_event("create_notes", None, std::slice::from_ref(op));
@@ -530,10 +543,8 @@ impl MdServer {
         let mut ops = Vec::new();
         for item in &req.appends {
             let result = self.append_one(item);
-            if result.appended {
-                let op = EventOp::Write {
-                    path: result.path.clone(),
-                };
+            if let (true, Ok(path)) = (result.appended, result.path.rel()) {
+                let op = EventOp::Write { path };
                 self.emit_event("append_notes", None, std::slice::from_ref(&op));
                 ops.push(op);
             }
@@ -609,7 +620,17 @@ impl MdServer {
 
 impl MdServer {
     fn append_one(&self, item: &AppendInput) -> AppendResult {
-        if md_core::Vault::is_internal_path(&item.path) {
+        let rel = match item.path.rel() {
+            Ok(rel) => rel,
+            Err(e) => {
+                return AppendResult {
+                    path: item.path.clone(),
+                    appended: false,
+                    error: Some(ApiError::from_core(&e)),
+                };
+            }
+        };
+        if md_core::Vault::is_internal_path(&rel) {
             return AppendResult {
                 path: item.path.clone(),
                 appended: false,
@@ -620,7 +641,7 @@ impl MdServer {
                 }),
             };
         }
-        let base = match self.vault().read_note(&item.path) {
+        let base = match self.vault().read_note(&rel) {
             Ok(s) => s,
             Err(e) if e.code == Code::NotFound && item.create_if_missing => String::new(),
             Err(e) => {
@@ -644,7 +665,7 @@ impl MdServer {
                 ))),
             };
         }
-        match self.vault().write_atomic(&item.path, combined.as_bytes()) {
+        match self.vault().write_atomic(&rel, combined.as_bytes()) {
             Ok(()) => AppendResult {
                 path: item.path.clone(),
                 appended: true,
@@ -660,7 +681,7 @@ impl MdServer {
 
     async fn run_edit_sections(&self, edits: &[EditItem]) -> EditSectionsResponse {
         // Group edits by path, keeping each edit's global index.
-        let mut by_path: BTreeMap<&str, Vec<(usize, &EditItem)>> = BTreeMap::new();
+        let mut by_path: BTreeMap<&VaultPath, Vec<(usize, &EditItem)>> = BTreeMap::new();
         for (i, e) in edits.iter().enumerate() {
             by_path.entry(&e.path).or_default().push((i, e));
         }
@@ -687,8 +708,11 @@ impl MdServer {
                 continue;
             }
 
-            let source = match self.vault().read_note(path) {
-                Ok(s) => s,
+            let (rel, source) = match path.rel().and_then(|rel| {
+                let source = self.vault().read_note(&rel)?;
+                Ok((rel, source))
+            }) {
+                Ok(v) => v,
                 Err(e) => {
                     errors.push(ApiError::at(items[0].0, &e));
                     continue;
@@ -709,13 +733,13 @@ impl MdServer {
                         let (new_path, hash) = edit_outcome(&new_source, item);
                         applied.push(AppliedEdit {
                             index: *gi,
-                            path: (*path).to_string(),
+                            path: (*path).clone(),
                             new_heading_path: new_path,
                             content_hash: hash,
                         });
                     }
                     writes.push(Op::Write {
-                        path: (*path).to_string(),
+                        path: rel,
                         content: new_source.into_bytes(),
                     });
                 }
@@ -764,7 +788,7 @@ impl MdServer {
     async fn run_replace_text(&self, items: &[ReplaceItem], dry_run: bool) -> ReplaceTextResponse {
         // Group by path, keeping each item's global index: one note is read,
         // rewritten, and written once however many items target it.
-        let mut by_path: BTreeMap<&str, Vec<(usize, &ReplaceItem)>> = BTreeMap::new();
+        let mut by_path: BTreeMap<&VaultPath, Vec<(usize, &ReplaceItem)>> = BTreeMap::new();
         for (i, it) in items.iter().enumerate() {
             by_path.entry(&it.path).or_default().push((i, it));
         }
@@ -774,8 +798,11 @@ impl MdServer {
         let mut applied: Vec<AppliedReplace> = Vec::new();
 
         for (path, group) in &by_path {
-            let source = match self.vault().read_note(path) {
-                Ok(s) => s,
+            let (rel, source) = match path.rel().and_then(|rel| {
+                let source = self.vault().read_note(&rel)?;
+                Ok((rel, source))
+            }) {
+                Ok(v) => v,
                 Err(e) => {
                     errors.push(ApiError::at(group[0].0, &e));
                     continue;
@@ -798,7 +825,7 @@ impl MdServer {
                     for (li, (gi, _)) in group.iter().enumerate() {
                         applied.push(AppliedReplace {
                             index: *gi,
-                            path: (*path).to_string(),
+                            path: (*path).clone(),
                             replaced: hits[li].len(),
                             hits: hits[li]
                                 .iter()
@@ -811,7 +838,7 @@ impl MdServer {
                         });
                     }
                     writes.push(Op::Write {
-                        path: (*path).to_string(),
+                        path: rel,
                         content: new_source.into_bytes(),
                     });
                 }
@@ -870,7 +897,7 @@ impl MdServer {
 
     async fn run_edit_properties(&self, edits: &[PropertyEdit]) -> EditPropertiesResponse {
         // Apply per path in order, accumulating into one new content per path.
-        let mut by_path: BTreeMap<&str, Vec<(usize, &PropertyEdit)>> = BTreeMap::new();
+        let mut by_path: BTreeMap<&VaultPath, Vec<(usize, &PropertyEdit)>> = BTreeMap::new();
         for (i, e) in edits.iter().enumerate() {
             by_path.entry(&e.path).or_default().push((i, e));
         }
@@ -880,8 +907,11 @@ impl MdServer {
         let mut applied: Vec<PropertyApplied> = Vec::new();
 
         for (path, items) in &by_path {
-            let mut source = match self.vault().read_note(path) {
-                Ok(s) => s,
+            let (rel, mut source) = match path.rel().and_then(|rel| {
+                let source = self.vault().read_note(&rel)?;
+                Ok((rel, source))
+            }) {
+                Ok(v) => v,
                 Err(e) => {
                     errors.push(ApiError::at(items[0].0, &e));
                     continue;
@@ -908,7 +938,7 @@ impl MdServer {
                         source = new_source;
                         applied.push(PropertyApplied {
                             index: *gi,
-                            path: (*path).to_string(),
+                            path: (*path).clone(),
                             key: edit.key.clone(),
                         });
                     }
@@ -928,7 +958,7 @@ impl MdServer {
             }
             if path_ok {
                 writes.push(Op::Write {
-                    path: (*path).to_string(),
+                    path: rel,
                     content: source.into_bytes(),
                 });
             }
@@ -1023,7 +1053,7 @@ mod tests {
         let (_d, s) = server(&[]);
         let notes: Vec<NoteInput> = (0..101)
             .map(|i| NoteInput {
-                path: format!("n{i}.md"),
+                path: format!("n{i}.md").into(),
                 content: Some("x".into()),
                 frontmatter: None,
                 base: None,
@@ -1051,13 +1081,13 @@ mod tests {
             .create_notes(Parameters(CreateNotesRequest {
                 notes: vec![
                     NoteInput {
-                        path: "script.sh".to_string(),
+                        path: "script.sh".into(),
                         content: Some("echo hi\n".to_string()),
                         frontmatter: None,
                         base: None,
                     },
                     NoteInput {
-                        path: decomposed,
+                        path: decomposed.into(),
                         content: Some("body\n".to_string()),
                         frontmatter: None,
                         base: None,
@@ -1582,6 +1612,34 @@ mod tests {
         assert_eq!(
             s.vault().read_note("n.md").unwrap(),
             "# A\nterm\n# B\nTERM\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_separator_inside_a_segment_is_rejected_and_creates_nothing() {
+        // ADR-0029: the incident this decision answers — a title holding '/'
+        // used to become a folder and a half-named note.
+        let (_d, s) = server(&[]);
+        let r = s
+            .create_notes(Parameters(CreateNotesRequest {
+                notes: vec![NoteInput {
+                    path: VaultPath(vec!["research".into(), "I/O terms.md".into()]),
+                    content: Some("x".into()),
+                    frontmatter: None,
+                    base: None,
+                }],
+                overwrite: false,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(!r.created[0].created);
+        let e = r.created[0].error.as_ref().unwrap();
+        assert_eq!(e.code, "SEGMENT");
+        assert!(e.message.contains("I/O terms.md"), "{}", e.message);
+        assert!(
+            !s.vault().exists("research").unwrap(),
+            "no folder was split off"
         );
     }
 }

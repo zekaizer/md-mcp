@@ -325,6 +325,22 @@ async fn put_note(
         (None, None) => {}
     }
 
+    // A URL cannot tell a separator from a '/' inside a title, so this surface
+    // never creates a directory as a side effect (ADR-0029; RFC 4918 §9.7).
+    if current.is_none()
+        && let Some((parent, _)) = path.rsplit_once('/')
+        && !server.vault().is_dir(parent).unwrap_or(false)
+    {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "no directory {parent:?} to put {path:?} into, and a PUT never creates one -- \
+                 make it first through the note tools (create_notes with a path under it), \
+                 then put again\n"
+            ),
+        )
+            .into_response();
+    }
     if let Err(error) = server.vault().create_note(&path, &body, true) {
         return core_error(&error);
     }

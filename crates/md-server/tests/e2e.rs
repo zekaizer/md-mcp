@@ -53,7 +53,8 @@ async fn client_lists_all_tools_and_calls_one() {
 
     // Calling read_notes over the protocol returns structured output.
     let mut args = serde_json::Map::new();
-    args.insert("paths".into(), json!(["hello.md", "missing.md"]));
+    // ADR-0029: a path is its segments, root to leaf.
+    args.insert("paths".into(), json!([["hello.md"], ["missing.md"]]));
     let result = client
         .call_tool(CallToolRequestParams::new("read_notes").with_arguments(args))
         .await

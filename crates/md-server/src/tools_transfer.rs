@@ -19,6 +19,7 @@ use crate::MdServer;
 use crate::oauth::{
     self, OAuthState, Scopes, TRANSFER_CODE_TTL_SECS, TRANSFER_TOKEN_TTL_SECS, percent_encode_path,
 };
+use crate::vault_path::VaultPath;
 
 /// Where the recipe parks the collected token. Never interpolated into a
 /// command, only read back through `$(cat …)`, so it stays out of shell history
@@ -49,8 +50,10 @@ pub struct ProvisionTransferRequest {
     /// Confine the credential to one directory. Ask for the narrowest one the
     /// task needs: a token that cannot reach the rest of the vault cannot take
     /// or damage it by mistake. Omit only when the task really is vault-wide.
+    /// Confine the grant to one directory or one note, as path segments
+    /// root to leaf.
     #[serde(default)]
-    pub prefix: Option<String>,
+    pub prefix: Option<VaultPath>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -101,6 +104,13 @@ impl MdServer {
             ));
         };
 
+        let prefix = req
+            .prefix
+            .as_ref()
+            .filter(|p| !p.is_root())
+            .map(VaultPath::rel)
+            .transpose()
+            .map_err(|e| ErrorData::invalid_params(e.message.clone(), None))?;
         let scopes = Scopes {
             read: true,
             write: req.write,
@@ -108,9 +118,9 @@ impl MdServer {
             delegated: true,
             // Composed here, once: the paths a grant is compared against are
             // composed, so a decomposed spelling would refuse its own notes.
-            prefix: req.prefix.as_deref().map(|p| nfc(p).into_owned()),
+            prefix: prefix.as_deref().map(|p| nfc(p).into_owned()),
         };
-        let example = confined_note(req.prefix.as_deref());
+        let example = confined_note(prefix.as_deref());
         let code = oauth.issue_transfer_code(scopes.clone());
         let root = oauth::base_url(&parts.headers);
         let base = format!("{root}/api/notes");
@@ -188,7 +198,7 @@ fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>)
     ];
     if write {
         recipe.push(format!(
-            "# put it back, only if it did not change since you read it (etag from the index or the GET);\n#    edit bytes a GET from this surface returned: a put carries frontmatter and body whole, and the note tools' read_notes strips the frontmatter -- putting its output back erases it.\n#    to create a note that does not exist yet, send no if-match header at all; if-match: * replaces whatever is there, knowingly.\n#    201 created, 204 replaced -- the reply carries the new etag, so a second edit needs no fresh GET -- 412 it changed underneath you, 428 replacing needs if-match\ncurl -sS -D - {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{target}\""
+            "# put it back, only if it did not change since you read it (etag from the index or the GET);\n#    edit bytes a GET from this surface returned: a put carries frontmatter and body whole, and the note tools' read_notes strips the frontmatter -- putting its output back erases it.\n#    to create a note that does not exist yet, send no if-match header at all; if-match: * replaces whatever is there, knowingly.\n#    its directory must already exist -- a put never creates one (409); make it through the note tools first (create_notes with a path under it).\n#    201 created, 204 replaced -- the reply carries the new etag, so a second edit needs no fresh GET -- 412 it changed underneath you, 428 replacing needs if-match\ncurl -sS -D - {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{target}\""
         ));
     }
     // A grant confined to one note has no many-notes case; the loop would be

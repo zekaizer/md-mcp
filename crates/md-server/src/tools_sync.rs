@@ -16,6 +16,7 @@ use serde::Serialize;
 
 use crate::MdServer;
 use crate::sync::Rebase;
+use crate::vault_path::VaultPath;
 
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -28,7 +29,7 @@ pub struct SyncVaultResponse {
     pub pushed: u64,
     /// Conflicted paths when `status` is `conflict`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub conflicts: Vec<String>,
+    pub conflicts: Vec<VaultPath>,
 }
 
 #[tool_router(router = sync_router, vis = "pub(crate)")]
@@ -66,7 +67,11 @@ impl MdServer {
                         ahead,
                         format!(
                             "rebase conflict in {}; resolve via sync_vault",
-                            r.conflicts.join(", ")
+                            r.conflicts
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ),
                     );
                 }
@@ -121,7 +126,7 @@ impl MdServer {
                             status: "conflict".into(),
                             pulled,
                             pushed: 0,
-                            conflicts,
+                            conflicts: conflicts.iter().map(|c| VaultPath::from_rel(c)).collect(),
                         });
                     }
                 }
@@ -297,7 +302,7 @@ mod tests {
         let s = server_with_sync(&vault_dir).await;
         let r = s.sync_vault().await.unwrap().0;
         assert_eq!(r.status, "conflict");
-        assert_eq!(r.conflicts, vec!["seed.md".to_string()]);
+        assert_eq!(r.conflicts, vec!["seed.md"]);
         // The rebase was aborted: local content intact, no markers, no
         // rebase-in-progress state.
         let text = std::fs::read_to_string(vault_dir.join("seed.md")).unwrap();

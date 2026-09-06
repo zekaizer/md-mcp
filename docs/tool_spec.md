@@ -5,8 +5,8 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
 **가정**
 - 단일 vault(root 디렉토리) 하위의 `.md` 파일 관리
 - 순수 markdown + YAML frontmatter 기준. Obsidian 전용 문법(wikilink, `^block-id`, backlink)은 **범위 밖**
-- 모든 path는 vault-relative (절대경로·`..` 차단 전제)
-- **path 접미사 규약**: 노트는 `.md`, 디렉토리는 `/`로 끝난다 — 접미사만으로 노트/디렉토리를 구문 판별(전 도구 공통)
+- **모든 path는 vault-relative 세그먼트 배열**([ADR-0029](adr/0029-path-segments.md)): `["dir","note.md"]`처럼 root→leaf 순서, `[]`는 vault root. 입력·출력·에러 상세 어디서든 같은 형태라 받은 값을 그대로 되넘긴다. 세그먼트가 빈 문자열·`.`·`..`이거나 `/`·`\`·NUL을 포함하면 `SEGMENT`로 거부 — 제목의 `/`가 폴더로 갈라지는 사고를 막는 검사이며, 구분자 문자는 계약에 없다.
+- **path 접미사 규약**: 노트는 마지막 세그먼트가 `.md`로 끝난다. 디렉토리는 접미사가 아니라 디스크(입력)·`kind` 필드(`list_notes` 출력)·필드 이름(`move_notes.into`)이 말한다.
 
 **용어 정의** (markdown 표준엔 'section' 개념이 없다 — CommonMark는 heading 블록만 규정하므로 이 spec이 정의한다)
 - **heading(제목)**: ATX(`#`~`######`) 제목 라인만 인정 — Setext(`===`/`---`)는 **범위 밖**(`---`의 frontmatter/thematic-break 모호성·h1~h2 깊이 제약 회피). level은 `#` 개수. fenced(```·~~~)·indented 코드블록 내부의 `#`는 heading이 **아니다**(코드펜스가 우선) — 섹션 경계 오인 방지.
@@ -40,7 +40,7 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
 | `edit_sections` | heading path 기준 섹션 편집 (replace/append/delete/insert/rename/move) | ✓ | **all-or-nothing** |
 | `replace_text` | 노트 body 내 리터럴 문자열 치환 (읽기 없이 오타·용어 수정) | ✓ | **all-or-nothing** |
 | `edit_properties` | frontmatter key:value 단위 set/remove | ✓ | **all-or-nothing** |
-| `move_notes` | 이동·이름 변경 통합 (dest가 `/`로 끝나면 디렉토리로, 아니면 최종 경로로) | ✓ | **all-or-nothing** |
+| `move_notes` | 이동·이름 변경 통합 (`into`=디렉토리 안으로, `dest`=최종 경로로) | ✓ | **all-or-nothing** |
 | `delete_notes` | 노트 삭제 | ✓ | **all-or-nothing** |
 | `sync_vault` | git 원격과 동기화 (opt-in, `MD_GIT_SYNC=1`일 때만 노출) | — | 단일 (conflict는 정상 결과) |
 
@@ -48,7 +48,7 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
 
 **출력 envelope**: 거부 시 `{ ok:false, errors:[{ index, item, operation, code, message }] }` — **어느 item(`index`·`item`)이, 어떤 명령(`operation`)에서, 왜(`code`·`message`) 막혔는지** 검출된 위반을 **전부** 보고하고 적용 결과는 비운다(아무것도 안 쓰임). 일부만 보고하면 에이전트가 고쳐 재시도→또 실패하는 왕복이 생기므로 전수 보고. `code`는 기계 판독용 사유(`NOT_FOUND`/`CONFLICT`/`HASH_MISMATCH`/`AMBIGUOUS`/`OVERLAP`/`COUNT_MISMATCH`/`HEADING_LEVEL`/`SUFFIX`/`DEST_NOT_DIR`/`BATCH_COLLISION`/`MISSING_CONTENT`/`TRAVERSAL`/`FRONTMATTER_PARSE`/`TOO_LARGE` 등). `required`·`enum`·타입 같은 schema 위반은 MCP 프레임워크가 envelope 이전 단계에서 거른다(서버 로직 사유와 분리). 단 `maxItems`(배치 상한)는 inputSchema에 노출되더라도 프레임워크가 검증하지 않으므로, 서버가 `batch_limit`으로 같은 단계에서 `invalid_params`로 거른다. 성공 시 각 도구가 per-item 적용 결과를 반환(도구별 출력 참조). 비파괴 도구의 부분 성공도 실패 item은 동일한 `{ index, item, code, message }` 형태로 사유를 단다(성공 item과 나란히). 검증은 통과했으나 write 도중 I/O 실패하면 서버가 롤백하므로 결과는 무적용 — 다른 거부와 똑같이 `errors`로 보고(부분 적용 상태는 남지 않는다).
 
-**표기 규약**: 아래 스키마는 지면을 위해 root `"type": "object"`를 생략한다(모든 inputSchema는 object). 객체 배열 파라미터는 도구 의미명(`notes`/`appends`/`edits`/`moves`/`targets`), 문자열 path 배열은 `paths`로 통일. 모든 batch 배열(읽기·쓰기)은 `maxItems: 100`(서버 강제) — 과대 batch의 토큰·메모리 통제.
+**표기 규약**: 아래 스키마는 지면을 위해 root `"type": "object"`를 생략한다(모든 inputSchema는 object). 객체 배열 파라미터는 도구 의미명(`notes`/`appends`/`edits`/`moves`/`targets`), 문자열 path 배열은 `paths`로 통일. 모든 batch 배열(읽기·쓰기)은 `maxItems: 100`(서버 강제) — 과대 batch의 토큰·메모리 통제. path형 필드는 지면상 `{ "type": "path" }`로 적는다 — 실제 스키마는 `{ "type": "array", "items": { "type": "string" } }`(세그먼트 배열, 가정 참조).
 
 ---
 
@@ -58,8 +58,8 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
 ```json
 {
   "properties": {
-    "paths": { "type": "array", "items": { "type": "string" },
-               "description": "Vault-relative paths" },
+    "paths": { "type": "array", "items": { "type": "path" },
+               "description": "노트 경로(세그먼트 배열)" },
     "include_body": { "type": "boolean", "default": true,
       "description": "본문(frontmatter 블록 제외) 포함 여부" },
     "include_frontmatter": { "type": "boolean", "default": true,
@@ -78,7 +78,7 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
 ```json
 {
   "properties": {
-    "paths": { "type": "array", "items": { "type": "string" } }
+    "paths": { "type": "array", "items": { "type": "path" } }
   },
   "required": ["paths"]
 }
@@ -94,7 +94,7 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
       "items": {
         "type": "object",
         "properties": {
-          "path": { "type": "string" },
+          "path": { "type": "path" },
           "heading_path": { "type": "array", "items": { "type": "string" },
             "description": "e.g. [\"Design\",\"Schema\"]. 빈 배열이면 root(노트 전체 body)" },
           "occurrence": { "type": "integer",
@@ -115,20 +115,20 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
 ```json
 {
   "properties": {
-    "directory": { "type": "string", "default": "",
-      "description": "탐색 시작 디렉토리(/로 끝남, e.g. daily/). \"\"=root" },
+    "directory": { "type": "path", "default": [],
+      "description": "탐색 시작 디렉토리(e.g. [\"daily\"]). []=root" },
     "recursive": { "type": "boolean", "default": true },
     "glob": { "type": "string",
       "description": "노트 경로 필터(확장자 명시). e.g. daily/**/*.md, projects/2024-*.md" },
     "include_dirs": { "type": "boolean", "default": false,
-      "description": "디렉토리도 결과에 포함. 디렉토리 항목은 path가 `/`로 끝남" },
+      "description": "디렉토리도 결과에 포함. 디렉토리 항목은 kind:\"dir\"" },
     "limit": { "type": "integer", "default": 200, "maximum": 1000 },
     "cursor": { "type": "string",
       "description": "이전 응답의 next_cursor. 다음 페이지 요청 시 전달" }
   }
 }
 ```
-출력: `{ items: [{ path, size_bytes, modified_time }], next_cursor }`. `modified_time`은 ISO 8601(UTC). 디렉토리 항목(`include_dirs:true`)은 `path`가 `/`로 끝나고 `size_bytes`는 null — 이 종결 `/`가 곧 `move_notes.dest`에 그대로 쓰는 형태다. 결과가 `limit`를 넘으면 `next_cursor`(opaque 문자열)를 반환, 더 없으면 생략·null. 토큰 폭주 방지를 위해 본문 미포함. 정렬은 안정적 기준(path 사전순) 고정 — 그래야 cursor paging이 중복·누락 없이 이어진다. dot-디렉토리·내부 상태 디렉토리(저널/백업/trash)는 기본 제외(§4 내부 상태 격리).
+출력: `{ items: [{ path, kind, size_bytes, modified_time }], next_cursor }`. `modified_time`은 ISO 8601(UTC). `kind`는 `note`|`dir` — 디렉토리 항목(`include_dirs:true`)은 `kind:"dir"`이고 `size_bytes`는 null이며, 그 `path`가 곧 `move_notes.into`에 그대로 쓰는 값이다. 결과가 `limit`를 넘으면 `next_cursor`(opaque 문자열)를 반환, 더 없으면 생략·null. 토큰 폭주 방지를 위해 본문 미포함. 정렬은 안정적 기준(path 사전순) 고정 — 그래야 cursor paging이 중복·누락 없이 이어진다. dot-디렉토리·내부 상태 디렉토리(저널/백업/trash)는 기본 제외(§4 내부 상태 격리).
 
 `directory`/`glob`/`recursive` 상호작용: `directory`는 탐색 시작점(default=root), `recursive`는 하위 디렉토리 재귀 여부, `glob`은 그 결과 경로에 대한 추가 필터(패턴은 `directory` 기준 상대). `glob`에 `**`가 있으면 재귀를 함의하므로 충돌 시 `glob`이 `recursive`보다 우선. `glob`은 노트(.md) 결과에만 적용 — 디렉토리(`include_dirs`)는 glob 필터를 거치지 않고 `directory`/`recursive` 범위로만 정해진다. 존재하지 않는 `directory`는 error가 아니라 빈 `items`.
 
@@ -168,10 +168,10 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
       "items": {
         "type": "object",
         "properties": {
-          "path": { "type": "string" },
+          "path": { "type": "path" },
           "content": { "type": "string" },
           "frontmatter": { "type": "object" },
-          "base": { "type": "string" }
+          "base": { "type": "path" }
         },
         "required": ["path"]
       }
@@ -194,7 +194,7 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
       "items": {
         "type": "object",
         "properties": {
-          "path": { "type": "string" },
+          "path": { "type": "path" },
           "content": { "type": "string" },
           "create_if_missing": { "type": "boolean", "default": false }
         },
@@ -216,7 +216,7 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
       "items": {
         "type": "object",
         "properties": {
-          "path": { "type": "string" },
+          "path": { "type": "path" },
           "heading_path": { "type": "array", "items": { "type": "string" },
             "description": "대상 섹션. 빈 배열이면 root(노트 전체 body)" },
           "occurrence": { "type": "integer",
@@ -281,7 +281,7 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
       "items": {
         "type": "object",
         "properties": {
-          "path": { "type": "string" },
+          "path": { "type": "path" },
           "find": { "type": "string",
             "description": "찾을 문자열. **리터럴 바이트 일치** — 정규식·대소문자 폴딩·CJK 공백 폴딩 없음" },
           "replace": { "type": "string", "description": "치환 결과. 빈 문자열이면 매치 삭제" },
@@ -323,7 +323,7 @@ MCP로 md note 파일을 관리하는 tool 명세를 제안한다. 먼저 범위
       "items": {
         "type": "object",
         "properties": {
-          "path": { "type": "string" },
+          "path": { "type": "path" },
           "key": { "type": "string", "description": "frontmatter 최상위 key" },
           "value": {
             "description": "설정할 값. JSON 타입을 그대로 YAML로 직렬화 — 문자열 \"123\"과 숫자 123 구분 보존(리스트/맵/null 가능). 필드 자체를 생략하면 해당 key 제거" }
@@ -346,11 +346,13 @@ frontmatter 편집기 — **item 하나 = (노트, key) 하나**의 atomic 단�
       "items": {
         "type": "object",
         "properties": {
-          "source": { "type": "string", "description": "파일(.md) 또는 디렉토리(/로 끝남), vault-relative" },
-          "dest": { "type": "string",
-            "description": "/로 끝나면 이동 대상 디렉토리(basename 유지, / 단독은 vault root); 아니면 새 basename을 포함한 최종 경로(노트는 .md 유지)" }
+          "source": { "type": "path", "description": "노트(.md) 또는 디렉토리. 디스크가 어느 쪽인지 정한다" },
+          "dest": { "type": "path",
+            "description": "새 basename을 포함한 최종 경로(노트는 .md 유지). into와 상호 배타" },
+          "into": { "type": "path",
+            "description": "이동 대상 디렉토리(basename 유지, []는 vault root). dest와 상호 배타" }
         },
-        "required": ["source","dest"]
+        "required": ["source"]
       }
     },
     "overwrite": { "type": "boolean", "default": false },
@@ -361,21 +363,21 @@ frontmatter 편집기 — **item 하나 = (노트, key) 하나**의 atomic 단�
   "required": ["moves"]
 }
 ```
-이동·이름 변경 통합 primitive([ADR-0024](adr/0024-unified-move-primitive.md)). `dest`의 형태가 동작을 가른다:
-- **`dest`가 `/`로 끝남 — 디렉토리 타깃**: `source`의 basename을 유지한 채 그 디렉토리 안으로 이동(구 relocate). `dest: "/"`는 vault root. 여러 item에 같은 `dest`를 주면 여러 노트를 한 폴더로 모음(N → 1-dir).
-- **`dest`에 종결 `/` 없음 — 최종 경로**: 새 basename을 포함한 전체 경로로 이동(제자리 rename과 "이동+이름 변경 동시"를 모두 커버). `source`가 노트(.md)면 `dest`도 `.md`로 끝나야 하고, 디렉토리(`/`)면 `dest`는 `.md`로 끝나면 안 된다.
+이동·이름 변경 통합 primitive([ADR-0024](adr/0024-unified-move-primitive.md), 필드 형태는 [ADR-0029](adr/0029-path-segments.md)). item마다 `into`·`dest` 중 **정확히 하나**를 준다(둘 다·둘 다 없음은 MISSING_CONTENT):
+- **`into` — 디렉토리 타깃**: `source`의 basename을 유지한 채 그 디렉토리 안으로 이동(구 relocate). `into: []`는 vault root. 여러 item에 같은 `into`를 주면 여러 노트를 한 폴더로 모음(N → 1-dir).
+- **`dest` — 최종 경로**: 새 basename을 포함한 전체 경로로 이동(제자리 rename과 "이동+이름 변경 동시"를 모두 커버). `source`가 노트(.md)면 `dest`도 `.md`로 끝나야 하고, 디렉토리면 `dest`는 `.md`로 끝나면 안 된다.
 - `source`가 디렉토리면 subtree 통째 이동.
-- `dest` 경로가 없으면 중간 경로 포함 자동 생성(`create_notes`의 parent 생성과 동일 관례). 단 그 경로(조상 포함)에 **노트(비-디렉토리)가 있으면 거부**(DEST_NOT_DIR).
-- `source`가 디렉토리일 때 `dest`가 그 **하위면 거부**(자기 안으로 이동 불가, OVERLAP).
+- 목적지 경로가 없으면 중간 경로 포함 자동 생성(`create_notes`의 parent 생성과 동일 관례). 단 그 경로(조상 포함)에 **노트(비-디렉토리)가 있으면 거부**(DEST_NOT_DIR).
+- `source`가 디렉토리일 때 목적지가 그 **하위면 거부**(자기 안으로 이동 불가, OVERLAP).
 - 충돌(destination에 다른 파일 존재) + overwrite:false → batch 전체 거부(merge 아님). 단 destination이 source 자신으로 해석되는 경우(같은 노트의 Unicode 철자 교정, NFD↔NFC)는 충돌이 아니라 정당한 rename.
 - **중첩 destination(final-tree 의미론)**: 한 item의 destination이 batch 내 다른 item의 **destination** subtree 안이면 허용 — batch가 최종 트리를 선언하고 엔진이 조상 destination부터 적용한다(예: 디렉토리를 옮기면서 같은 batch로 다른 노트를 그 새 위치 아래로). 반면 다른 item의 **source** subtree 안(batch가 비우는 경로)으로 향하는 destination은 순서 의존이라 거부(BATCH_COLLISION). swap(A→B·B→A)·chain(destination이 다른 source와 동일)도 종전대로 거부.
-- 출력(성공): `{ moved: [{ from, to }] }` — 입력 순서 유지, 디렉토리 대상이면 `from`/`to`는 `/`로 끝남. 체이닝에 이 `to`를 그대로 쓴다.
+- 출력(성공): `{ moved: [{ from, to }] }` — 입력 순서 유지. 체이닝에 이 `to`를 그대로 쓴다.
 
 markdown 상대 링크 `[..](path.md)`는 이동으로 깨질 수 있음 — `update_links: true`로 자동 갱신(아래·§4 참조).
 
 **`update_links` ([ADR-0022](adr/0022-link-rewrite-on-move.md))**: `update_links: true`면 표준 Markdown 링크(inline `[..](path)`·이미지 `![..](path)`·reference 정의 `[label]: path`)를 vault 전수 스캔으로 찾아, 이 배치가 옮긴 노트를 가리키는 **inbound** 링크와 옮겨진 노트 자신의 상대 **outbound** 링크를 함께 재작성한다. 링크 해석은 노트 기준 상대(root-절대 `/a/b.md`는 vault root 기준)이며, `#fragment`/`?query`/title·절대/`<angle>` 형태는 보존된다. 재작성은 move와 **같은 트랜잭션**(all-or-nothing, 동일 auto-commit)이고, 고쳐진 노트는 `relinked: [path…]`(배치 후 경로)로 보고된다. wikilink `[[..]]`·scheme URL·code block/span 안은 건드리지 않는다. frontmatter는 재작성 대상이 아니다. 인덱스는 없다 — 배치당 1회 전수 스캔이며 성능 카운터(`notes_total`/`candidates`/`rewritten`/`elapsed_us`)가 서버 로그(`update_links scan`)로 남는다. `dry_run`과 조합하면 재작성 계획을 쓰기 없이 미리 본다. `delete_notes`엔 없다(유효한 새 대상이 없음).
 
-**`prune_empty` (move/delete 공통)**: `prune_empty: true`면 성공한 배치가 **비워 놓은** source 디렉터리를 부모 방향으로 거슬러 올라가며 정리하고 `pruned: [dir/…]`로 보고한다. `remove_dir(2)` 기반이라 내용이 남은 디렉터리는 절대 지우지 못하며(안전 내장), 배치 전부터 비어 있던 무관한 디렉터리는 건드리지 않는다(source의 조상만 후보). 제자리 rename은 같은 부모 안이라 실질 대상 아님. best-effort — prune 실패는 배치 성공에 영향 없다. 빈 디렉터리 *생성*은 제공하지 않는다: git이 빈 디렉터리를 추적하지 못해 sync로 전파되지 않으므로, 필요하면 placeholder 노트를 만든다.
+**`prune_empty` (move/delete 공통)**: `prune_empty: true`면 성공한 배치가 **비워 놓은** source 디렉터리를 부모 방향으로 거슬러 올라가며 정리하고 `pruned: [path…]`로 보고한다. `remove_dir(2)` 기반이라 내용이 남은 디렉터리는 절대 지우지 못하며(안전 내장), 배치 전부터 비어 있던 무관한 디렉터리는 건드리지 않는다(source의 조상만 후보). 제자리 rename은 같은 부모 안이라 실질 대상 아님. best-effort — prune 실패는 배치 성공에 영향 없다. 빈 디렉터리 *생성*은 제공하지 않는다: git이 빈 디렉터리를 추적하지 못해 sync로 전파되지 않으므로, 필요하면 placeholder 노트를 만든다.
 
 **`dry_run` (move/delete 공통)**: `dry_run: true`면 all-or-nothing 검증(§4)을 전부 수행하되 아무것도 쓰지 않는다 — 통과 시 계획된 결과(`moved`/`deleted`)를, 거부 시 위반 전수를 평소와 같은 envelope으로 반환하고, 응답에 `dry_run: true`를 에코해 실제 적용과 구분한다. `delete_notes`의 dry-run `trashed_to`는 현재 기준 예정 위치라 실제 실행 시 uniquifier(`.n`)가 달라질 수 있다. event journal·auto-commit은 발생하지 않는다.
 
@@ -383,14 +385,14 @@ markdown 상대 링크 `[..](path.md)`는 이동으로 깨질 수 있음 — `up
 ```json
 {
   "properties": {
-    "paths": { "type": "array", "items": { "type": "string" } },
+    "paths": { "type": "array", "items": { "type": "path" } },
     "dry_run": { "type": "boolean", "default": false },
     "prune_empty": { "type": "boolean", "default": false }
   },
   "required": ["paths"]
 }
 ```
-파일·디렉토리 모두 대상(디렉토리는 `/`로 끝나는 path, subtree 재귀 삭제). 배치 내 path가 서로 동일·포함관계(디렉토리와 그 하위)면 거부(§4 대상 겹침 금지). 존재하지 않는 path 포함 시 batch 전체 거부(부분 삭제로 인한 모호한 상태 방지). 복구 가능하도록 영구 삭제 대신 trash 이동을 권장(trash 목록·restore 도구, overwrite/edit의 이전 버전 복구 대칭은 **별도 ADR**). 출력(성공): `{ deleted: [path…], trashed_to }` — trash 위치를 함께 줘 복구 경로를 안다.
+파일·디렉토리 모두 대상(path가 디스크상 디렉토리면 subtree 재귀 삭제). 배치 내 path가 서로 동일·포함관계(디렉토리와 그 하위)면 거부(§4 대상 겹침 금지). 존재하지 않는 path 포함 시 batch 전체 거부(부분 삭제로 인한 모호한 상태 방지). 복구 가능하도록 영구 삭제 대신 trash 이동을 권장(trash 목록·restore 도구, overwrite/edit의 이전 버전 복구 대칭은 **별도 ADR**). 출력(성공): `{ deleted: [path…], trashed_to }` — trash 위치를 함께 줘 복구 경로를 안다.
 
 ### sync_vault (조건부 등록 · 단일)
 ```json
@@ -404,7 +406,7 @@ markdown 상대 링크 `[..](path.md)`는 이동으로 깨질 수 있음 — `up
 
 ## 4. 설계 고려사항 (구현 시 필수)
 
-- **Path traversal 차단**: 모든 path를 vault root 기준 canonicalize 후 root 밖 이탈 검증. `..`, symlink escape, absolute path 거부. 이 부류 MCP의 1순위 보안 결함. vault root 자체를 가리키는 path(빈 문자열·`/`)에 대한 파괴적 연산(delete/move)도 거부.
+- **Path traversal 차단**: 모든 path를 vault root 기준 canonicalize 후 root 밖 이탈 검증. `..`, symlink escape, absolute path 거부. 이 부류 MCP의 1순위 보안 결함. vault root 자체를 가리키는 path(`[]`)에 대한 파괴적 연산(delete/move)도 거부. 세그먼트 단위 검사(`SEGMENT`)는 이보다 앞서 wire 경계에서 일어난다([ADR-0029](adr/0029-path-segments.md)).
 - **Atomic write**: 동일 디렉토리에 temp 파일 작성 후 `rename(2)`로 교체. partial write 방지. cross-filesystem rename은 atomic 보장 안 되므로 vault 내부 temp 사용. **다중 파일 batch의 원자성은 서버가 보장**: 적용 전 영향받는 모든 파일의 원본을 백업(또는 write-ahead 저널 기록)하고 전 item을 temp로 선작성 → 일괄 rename으로 commit. 도중 어느 rename이라도 실패하면 백업으로 **전부 롤백**해 무적용으로 되돌린다. commit 중 crash가 나면 서버 재시작 시 저널을 보고 incomplete batch를 롤백해 일관성을 복구한다. 롤백은 op별 undo(create→생성파일 삭제, delete→trash 복원, edit/overwrite→백업 복원). (이 트랜잭션 메커니즘은 ADR 대상.)
 - **동시성·격리**: readers-writer 락 — 쓰기는 직렬화(단일 exclusive write lease), 읽기는 서로 동시 허용하되 **commit 단계와는 배타**. 따라서 read는 진행 중 commit과 겹치지 않아 다중 파일 read도 torn snapshot(파일 간 신·구 혼재)을 보지 않는다. 외부 sync의 변경 감지는 `expected_hash`가 담당하는 별개 층.
 - **내부 상태 격리**: 트랜잭션 저널·원본 백업·delete trash는 노트 네임스페이스 **밖**에 둔다(vault 외부 또는 `.md-mcp/` 숨김 디렉토리). `list_notes`/`search_notes`는 dot-디렉토리와 이 내부 디렉토리를 기본 제외해 메모리·sync 오염을 막는다.
