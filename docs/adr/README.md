@@ -37,3 +37,4 @@ immutable; a changed decision supersedes the old one with a new ADR.
 - [0026](0026-outline-addressing-and-text-encoding.md) — Outline addressing and text encoding
 - [0027](0027-literal-text-replacement.md) — Literal text replacement
 - [0028](0028-byte-level-note-api.md) — Byte-level note I/O over HTTP
+- [0029](0029-path-segments.md) — Vault paths as segment arrays
