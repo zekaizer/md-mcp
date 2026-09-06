@@ -8,7 +8,9 @@ use md_server::config::HttpConfig;
 
 const NOTE: &str = "---\ntitle: Hi\n---\n# Heading\nbody\n";
 
-/// Serve on an ephemeral loopback port with a vault holding `hello.md`.
+/// Serve on an ephemeral loopback port with a vault holding `hello.md` and an
+/// empty `inbox/` — a PUT never creates a directory (ADR-0029), so fixtures
+/// that write under one need it to exist.
 async fn spawn(token: Option<&str>) -> SocketAddr {
     spawn_with_root(token).await.0
 }
@@ -20,6 +22,7 @@ async fn spawn_with_root(token: Option<&str>) -> (SocketAddr, std::path::PathBuf
     let root = dir.path().to_path_buf();
     let vault = Vault::open(dir.path()).unwrap();
     vault.write_atomic("hello.md", NOTE.as_bytes()).unwrap();
+    std::fs::create_dir(root.join("inbox")).unwrap();
     let state = tempfile::tempdir().unwrap();
     let cfg = HttpConfig {
         addr: "127.0.0.1:0".parse().unwrap(),
@@ -135,6 +138,28 @@ async fn put(
     if_match: Option<&str>,
 ) -> reqwest::Response {
     put_bytes(addr, path, body.as_bytes().to_vec(), if_match).await
+}
+
+/// A PUT never creates a directory (ADR-0029): a `/` in a URL cannot be told
+/// from one inside a title, so a missing parent is refused, not made.
+#[tokio::test]
+async fn put_into_a_missing_directory_is_a_conflict() {
+    let (addr, root) = spawn_with_root(None).await;
+    let refused = put(addr, "not-yet/one.md", "# x\n", None).await;
+    assert_eq!(refused.status(), 409);
+    let why = refused.text().await.unwrap();
+    assert!(
+        why.contains("create_notes"),
+        "the body names the way out: {why}"
+    );
+    assert!(!root.join("not-yet").exists(), "no directory was created");
+
+    std::fs::create_dir(root.join("made-first")).unwrap();
+    assert_eq!(
+        put(addr, "made-first/one.md", "# x\n", None).await.status(),
+        201
+    );
+    assert_eq!(put(addr, "top.md", "# x\n", None).await.status(), 201);
 }
 
 /// As [`put`], but bytes: what the wire actually carries. A helper typed

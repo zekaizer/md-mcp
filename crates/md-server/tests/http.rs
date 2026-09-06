@@ -16,13 +16,18 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use serde_json::{Value, json};
 
 /// Start the HTTP server on an ephemeral loopback port; returns its address and
-/// the serving task handle. The vault is seeded with `hello.md`.
+/// the serving task handle. The vault is seeded with `hello.md` and the empty
+/// directories `inbox/` and `노트/`: a PUT never creates a directory
+/// (ADR-0029), so fixtures that write under one need it to exist.
 async fn spawn_server(token: Option<&str>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let dir = tempfile::tempdir().unwrap();
     let vault = Vault::open(dir.path()).unwrap();
     vault
         .write_atomic("hello.md", b"---\ntitle: Hi\n---\n# Heading\nbody\n")
         .unwrap();
+    for seeded in ["inbox", "노트"] {
+        std::fs::create_dir(dir.path().join(seeded)).unwrap();
+    }
     let state = tempfile::tempdir().unwrap();
     let state_dir = state.path().to_path_buf();
     std::mem::forget(dir); // keep the temp dirs alive for the server's lifetime

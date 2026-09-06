@@ -198,7 +198,7 @@ fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>)
     ];
     if write {
         recipe.push(format!(
-            "# put it back, only if it did not change since you read it (etag from the index or the GET);\n#    edit bytes a GET from this surface returned: a put carries frontmatter and body whole, and the note tools' read_notes strips the frontmatter -- putting its output back erases it.\n#    to create a note that does not exist yet, send no if-match header at all; if-match: * replaces whatever is there, knowingly.\n#    201 created, 204 replaced -- the reply carries the new etag, so a second edit needs no fresh GET -- 412 it changed underneath you, 428 replacing needs if-match\ncurl -sS -D - {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{target}\""
+            "# put it back, only if it did not change since you read it (etag from the index or the GET);\n#    edit bytes a GET from this surface returned: a put carries frontmatter and body whole, and the note tools' read_notes strips the frontmatter -- putting its output back erases it.\n#    to create a note that does not exist yet, send no if-match header at all; if-match: * replaces whatever is there, knowingly.\n#    its directory must already exist -- a put never creates one (409); make it through the note tools first (create_notes with a path under it).\n#    201 created, 204 replaced -- the reply carries the new etag, so a second edit needs no fresh GET -- 412 it changed underneath you, 428 replacing needs if-match\ncurl -sS -D - {auth} -X PUT -H \"if-match: <etag>\" --data-binary @note.md \"{base}/{target}\""
         ));
     }
     // A grant confined to one note has no many-notes case; the loop would be
