@@ -19,6 +19,7 @@ use crate::MdServer;
 use crate::oauth::{
     self, OAuthState, Scopes, TRANSFER_CODE_TTL_SECS, TRANSFER_TOKEN_TTL_SECS, percent_encode_path,
 };
+use crate::vault_path::VaultPath;
 
 /// Where the recipe parks the collected token. Never interpolated into a
 /// command, only read back through `$(cat …)`, so it stays out of shell history
@@ -49,8 +50,10 @@ pub struct ProvisionTransferRequest {
     /// Confine the credential to one directory. Ask for the narrowest one the
     /// task needs: a token that cannot reach the rest of the vault cannot take
     /// or damage it by mistake. Omit only when the task really is vault-wide.
+    /// Confine the grant to one directory or one note, as path segments
+    /// root to leaf.
     #[serde(default)]
-    pub prefix: Option<String>,
+    pub prefix: Option<VaultPath>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -101,6 +104,13 @@ impl MdServer {
             ));
         };
 
+        let prefix = req
+            .prefix
+            .as_ref()
+            .filter(|p| !p.is_root())
+            .map(VaultPath::rel)
+            .transpose()
+            .map_err(|e| ErrorData::invalid_params(e.message.clone(), None))?;
         let scopes = Scopes {
             read: true,
             write: req.write,
@@ -108,9 +118,9 @@ impl MdServer {
             delegated: true,
             // Composed here, once: the paths a grant is compared against are
             // composed, so a decomposed spelling would refuse its own notes.
-            prefix: req.prefix.as_deref().map(|p| nfc(p).into_owned()),
+            prefix: prefix.as_deref().map(|p| nfc(p).into_owned()),
         };
-        let example = confined_note(req.prefix.as_deref());
+        let example = confined_note(prefix.as_deref());
         let code = oauth.issue_transfer_code(scopes.clone());
         let root = oauth::base_url(&parts.headers);
         let base = format!("{root}/api/notes");

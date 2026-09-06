@@ -45,15 +45,26 @@ async fn spawn_server(token: Option<&str>) -> (SocketAddr, tokio::task::JoinHand
     (addr, handle)
 }
 
+/// A vault path as the tools take it (ADR-0029): segments, root to leaf.
+fn segs(rel: &str) -> Value {
+    json!(rel.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>())
+}
+
 fn create_args(path: &str, body: &str) -> serde_json::Map<String, Value> {
     let mut args = serde_json::Map::new();
-    args.insert("notes".into(), json!([{ "path": path, "content": body }]));
+    args.insert(
+        "notes".into(),
+        json!([{ "path": segs(path), "content": body }]),
+    );
     args
 }
 
 fn append_args(path: &str, body: &str) -> serde_json::Map<String, Value> {
     let mut args = serde_json::Map::new();
-    args.insert("appends".into(), json!([{ "path": path, "content": body }]));
+    args.insert(
+        "appends".into(),
+        json!([{ "path": segs(path), "content": body }]),
+    );
     args
 }
 
@@ -71,7 +82,10 @@ async fn http_client_lists_tools_and_calls_one() {
     );
 
     let mut args = serde_json::Map::new();
-    args.insert("paths".into(), json!(["hello.md", "missing.md"]));
+    args.insert(
+        "paths".into(),
+        json!([segs("hello.md"), segs("missing.md")]),
+    );
     let result = client
         .call_tool(CallToolRequestParams::new("read_notes").with_arguments(args))
         .await
@@ -155,7 +169,7 @@ async fn concurrent_sessions_share_one_vault_and_serialize_writes() {
 
     // Session 2 reads back the note session 1 created and both appended to.
     let mut args = serde_json::Map::new();
-    args.insert("paths".into(), json!(["shared.md"]));
+    args.insert("paths".into(), json!([segs("shared.md")]));
     let read = s2
         .call_tool(CallToolRequestParams::new("read_notes").with_arguments(args))
         .await
@@ -418,7 +432,7 @@ async fn provision_confined_raw(
     let client = serve_client((), transport).await.expect("client handshake");
     let mut args = serde_json::Map::new();
     args.insert("write".into(), json!(write));
-    args.insert("prefix".into(), json!(prefix));
+    args.insert("prefix".into(), segs(prefix));
     let result = client
         .call_tool(CallToolRequestParams::new("provision_transfer").with_arguments(args))
         .await
@@ -593,7 +607,7 @@ async fn a_directory_grant_is_not_mistaken_for_a_note_before_it_exists() {
     let mut args = serde_json::Map::new();
     args.insert("write".into(), json!(true));
     // A writing grant naturally aims at a directory that does not exist yet.
-    args.insert("prefix".into(), json!("inbox/not-yet"));
+    args.insert("prefix".into(), segs("inbox/not-yet"));
     let grant = client
         .call_tool(CallToolRequestParams::new("provision_transfer").with_arguments(args))
         .await

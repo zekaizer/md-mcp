@@ -17,6 +17,7 @@ use serde_json::{Map, Value};
 use crate::MdServer;
 use crate::cjk_fold;
 use crate::envelope::limit_bounds;
+use crate::vault_path::VaultPath;
 
 fn default_recursive() -> bool {
     true
@@ -43,8 +44,10 @@ const MAX_QUERY_BYTES: usize = 1024;
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct ListNotesRequest {
+    /// Directory to list, as path segments root to leaf; `[]` (default) is
+    /// the vault root.
     #[serde(default)]
-    pub directory: String,
+    pub directory: VaultPath,
     #[serde(default = "default_recursive")]
     pub recursive: bool,
     #[serde(default)]
@@ -69,10 +72,20 @@ pub struct ListNotesResponse {
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct ListItem {
-    pub path: String,
+    pub path: VaultPath,
+    pub kind: ItemKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
     pub modified_time: String,
+}
+
+/// What a listing item is; the path alone no longer says (ADR-0029).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[schemars(crate = "rmcp::schemars")]
+pub enum ItemKind {
+    Note,
+    Dir,
 }
 
 // --- search_notes -----------------------------------------------------------
@@ -118,7 +131,7 @@ pub struct SearchNotesResponse {
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct SearchItem {
-    pub path: String,
+    pub path: VaultPath,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<String>,
     /// Number of body lines with a keyword hit; the snippet shows only the
@@ -133,7 +146,7 @@ pub struct SearchItem {
 impl MdServer {
     /// List notes (and optionally directories) by directory and glob.
     #[tool(
-        description = "List notes under a directory (default the whole vault), optionally filtered by a glob (e.g. daily/**/*.md). The glob selects notes only: with include_dirs, directories are listed whether or not they match it. Returns path-sorted items with size and modified time; pass next_cursor to page. Directories end with /.",
+        description = "List notes under a directory (default the whole vault), optionally filtered by a glob (e.g. daily/**/*.md). The glob selects notes only: with include_dirs, directories are listed whether or not they match it. Returns path-sorted items with kind (note|dir), size and modified time; pass next_cursor to page.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub async fn list_notes(
@@ -141,12 +154,16 @@ impl MdServer {
         Parameters(req): Parameters<ListNotesRequest>,
     ) -> Result<Json<ListNotesResponse>, ErrorData> {
         limit_bounds(req.limit, 1000)?;
+        let directory = req
+            .directory
+            .rel()
+            .map_err(|e| ErrorData::invalid_params(e.message.clone(), None))?;
         let _guard = self.lock().read().await;
         let limit = req.limit;
         let entries = self
             .vault()
             .list_entries(
-                &req.directory,
+                &directory,
                 req.recursive,
                 req.glob.as_deref(),
                 req.include_dirs,
@@ -163,7 +180,12 @@ impl MdServer {
             .into_iter()
             .take(limit)
             .map(|e| ListItem {
-                path: e.path,
+                path: VaultPath::from_rel(&e.path),
+                kind: if e.is_dir {
+                    ItemKind::Dir
+                } else {
+                    ItemKind::Note
+                },
                 size_bytes: e.size_bytes,
                 modified_time: e.modified,
             })
@@ -242,7 +264,8 @@ impl MdServer {
         };
 
         let after = req.cursor.clone().unwrap_or_default();
-        let mut matches: Vec<SearchItem> = Vec::new();
+        // (core path for the cursor, the item)
+        let mut matches: Vec<(String, SearchItem)> = Vec::new();
         for entry in entries {
             if entry.path.as_str() <= after.as_str() {
                 continue;
@@ -286,19 +309,29 @@ impl MdServer {
                 Value::Object(echo)
             });
 
-            matches.push(SearchItem {
-                path: entry.path,
-                snippet,
-                match_count,
-                frontmatter: echoed_fm,
-            });
+            matches.push((
+                entry.path,
+                SearchItem {
+                    path: VaultPath::default(),
+                    snippet,
+                    match_count,
+                    frontmatter: echoed_fm,
+                },
+            ));
             if matches.len() > limit {
                 break; // we have enough to know there is a next page
             }
         }
 
-        let next_cursor = (matches.len() > limit).then(|| matches[limit - 1].path.clone());
+        let next_cursor = (matches.len() > limit).then(|| matches[limit - 1].0.clone());
         matches.truncate(limit);
+        let matches = matches
+            .into_iter()
+            .map(|(rel, item)| SearchItem {
+                path: VaultPath::from_rel(&rel),
+                ..item
+            })
+            .collect();
         SearchNotesResponse {
             items: matches,
             next_cursor,
@@ -503,7 +536,7 @@ mod tests {
         for bad in [0usize, 1001] {
             let r = s
                 .list_notes(Parameters(ListNotesRequest {
-                    directory: String::new(),
+                    directory: VaultPath::default(),
                     recursive: true,
                     glob: None,
                     include_dirs: false,
@@ -552,7 +585,7 @@ mod tests {
         let (_d, s) = server(&[("a.md", "x"), ("b.md", "y"), ("c.md", "z")]);
         let page1 = s
             .list_notes(Parameters(ListNotesRequest {
-                directory: String::new(),
+                directory: VaultPath::default(),
                 recursive: true,
                 glob: None,
                 include_dirs: false,
@@ -566,7 +599,7 @@ mod tests {
             page1
                 .items
                 .iter()
-                .map(|i| i.path.as_str())
+                .map(|i| i.path.to_string())
                 .collect::<Vec<_>>(),
             ["a.md", "b.md"]
         );
@@ -574,7 +607,7 @@ mod tests {
 
         let page2 = s
             .list_notes(Parameters(ListNotesRequest {
-                directory: String::new(),
+                directory: VaultPath::default(),
                 recursive: true,
                 glob: None,
                 include_dirs: false,
@@ -588,7 +621,7 @@ mod tests {
             page2
                 .items
                 .iter()
-                .map(|i| i.path.as_str())
+                .map(|i| i.path.to_string())
                 .collect::<Vec<_>>(),
             ["c.md"]
         );
@@ -686,7 +719,7 @@ mod tests {
             .0
             .items
             .into_iter()
-            .map(|i| i.path)
+            .map(|i| i.path.to_string())
             .collect()
     }
 
@@ -759,8 +792,54 @@ mod tests {
             let mut req = search_req(Some(query));
             req.mode = SearchMode::Filename;
             let r = s.search_notes(Parameters(req)).await.unwrap().0;
-            let got: Vec<&str> = r.items.iter().map(|i| i.path.as_str()).collect();
+            let got: Vec<String> = r.items.iter().map(|i| i.path.to_string()).collect();
             assert_eq!(got, [want], "filename query {query:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn listing_says_what_each_item_is() {
+        // With no trailing '/', kind is the only way to tell a directory.
+        let (_d, s) = server(&[("d/n.md", "x"), ("top.md", "y")]);
+        let r = s
+            .list_notes(Parameters(ListNotesRequest {
+                directory: VaultPath::default(),
+                recursive: false,
+                glob: None,
+                include_dirs: true,
+                limit: 10,
+                cursor: None,
+            }))
+            .await
+            .unwrap()
+            .0;
+        let got: Vec<(String, ItemKind)> = r
+            .items
+            .iter()
+            .map(|i| (i.path.to_string(), i.kind))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("d".to_string(), ItemKind::Dir),
+                ("top.md".to_string(), ItemKind::Note)
+            ]
+        );
+        assert!(r.items[0].size_bytes.is_none());
+
+        let bad = s
+            .list_notes(Parameters(ListNotesRequest {
+                directory: VaultPath(vec!["a/b".into()]),
+                recursive: false,
+                glob: None,
+                include_dirs: false,
+                limit: 10,
+                cursor: None,
+            }))
+            .await;
+        assert!(
+            bad.is_err(),
+            "a separator in a segment is a schema-level rejection"
+        );
     }
 }

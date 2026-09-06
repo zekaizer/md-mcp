@@ -18,6 +18,7 @@ pub mod tools_search;
 pub mod tools_sync;
 pub mod tools_transfer;
 pub mod tools_write;
+pub mod vault_path;
 
 use std::sync::Arc;
 
@@ -313,10 +314,10 @@ impl ServerHandler for MdServer {
             "md-mcp v",
             env!("CARGO_PKG_VERSION"),
             " manages a single vault of pure-Markdown notes (.md + YAML frontmatter). \
-             Address notes by vault-relative path; every '/' in a path is a \
-             directory separator and cannot be escaped, so a title such as \
-             \"I/O\" splits into a folder \"I\" and a note \"O …\" — write it \
-             \"I∕O\" (U+2215) or \"IO\" instead. Notes over ~10 KB (size_bytes in \
+             Every path is an array of segments, root to leaf: \
+             [\"dir\", \"note.md\"], [] for the vault root. A segment may not \
+             contain '/' (SEGMENT): a title such as \"I/O\" needs \"I∕O\" (U+2215) \
+             or \"IO\". Notes over ~10 KB (size_bytes in \
              list_notes) are cheaper section-wise: read_outlines first, then \
              read_sections for the sections you need; read smaller notes whole via \
              read_notes. Destructive batches are all-or-nothing. These tools are \
@@ -327,8 +328,10 @@ impl ServerHandler for MdServer {
         )
         .to_string();
         if let Some(intro) = &self.intro_note {
+            let intro =
+                serde_json::to_string(&vault_path::VaultPath::from_rel(intro)).unwrap_or_default();
             instructions.push_str(&format!(
-                " Before working in this vault, read \"{intro}\" (via read_notes): it \
+                " Before working in this vault, read {intro} (via read_notes): it \
                  introduces the vault's purpose, structure, and conventions."
             ));
         }
@@ -370,7 +373,8 @@ mod tests {
             .get_info()
             .instructions
             .unwrap_or_default();
-        assert!(with.contains("meta/start-here.md"), "got: {with}");
+        // Spelled as the argument read_notes takes, ready to pass verbatim.
+        assert!(with.contains(r#"["meta","start-here.md"]"#), "got: {with}");
         assert!(with.contains("read_notes"), "got: {with}");
 
         let without = server().get_info().instructions.unwrap_or_default();

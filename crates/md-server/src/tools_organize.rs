@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::MdServer;
 use crate::envelope::{ApiError, batch_limit};
 use crate::events::EventOp;
+use crate::vault_path::VaultPath;
 
 // --- path helpers -----------------------------------------------------------
 
@@ -60,17 +61,6 @@ fn overlap(a: &str, b: &str) -> bool {
 /// Whether `a` strictly contains `b` (b is inside a's subtree, not equal).
 fn contains_strict(a: &str, b: &str) -> bool {
     nfc_key(b).starts_with(&format!("{}/", nfc_key(a)))
-}
-
-/// Echo an on-disk path with the directory suffix convention: when the caller
-/// addressed a directory (trailing `/`), the echoed path ends with `/` too, so
-/// it can be fed straight back into dest/path arguments.
-fn with_dir_suffix(actual: String, requested: &str) -> String {
-    if is_dir_path(requested) && !actual.ends_with('/') {
-        format!("{actual}/")
-    } else {
-        actual
-    }
 }
 
 fn err(index: usize, code: Code, message: impl Into<String>) -> ApiError {
@@ -124,8 +114,9 @@ fn check_move_collisions(pairs: &[(usize, String, String)], errors: &mut Vec<Api
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct DeleteNotesRequest {
+    /// Notes or directories, each as path segments root to leaf.
     #[schemars(length(max = 100))] // batch cap — keep in sync with MAX_BATCH
-    pub paths: Vec<String>,
+    pub paths: Vec<VaultPath>,
     /// Validate and report what would happen without writing anything.
     #[serde(default)]
     pub dry_run: bool,
@@ -144,7 +135,7 @@ pub struct DeleteNotesResponse {
     pub errors: Vec<ApiError>,
     /// Directories removed because the batch emptied them (prune_empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pruned: Vec<String>,
+    pub pruned: Vec<VaultPath>,
     /// True when this was a dry run: nothing was written.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
@@ -156,8 +147,8 @@ pub struct DeleteNotesResponse {
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct DeletedItem {
-    pub path: String,
-    pub trashed_to: String,
+    pub path: VaultPath,
+    pub trashed_to: VaultPath,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -182,12 +173,16 @@ pub struct MoveNotesRequest {
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct MoveItem {
-    pub source: String,
-    /// Destination (ADR-0024): ending in `/` it names a directory to move
-    /// into, keeping the source basename (`/` alone is the vault root);
-    /// otherwise it is the full destination path including the new basename
-    /// (a note keeps `.md`), renaming and moving in one step.
-    pub dest: String,
+    /// A note or directory, as path segments root to leaf.
+    pub source: VaultPath,
+    /// The full destination path including the new basename (a note keeps
+    /// `.md`), renaming and moving in one step. Exactly one of `dest`/`into`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest: Option<VaultPath>,
+    /// A directory to move into, keeping the source basename; `[]` is the
+    /// vault root. Exactly one of `dest`/`into`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub into: Option<VaultPath>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -200,11 +195,11 @@ pub struct MoveResponse {
     pub errors: Vec<ApiError>,
     /// Directories removed because the batch emptied them (prune_empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pruned: Vec<String>,
+    pub pruned: Vec<VaultPath>,
     /// Notes whose links were rewritten for this batch (update_links),
     /// reported at their post-batch paths.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub relinked: Vec<String>,
+    pub relinked: Vec<VaultPath>,
     /// True when this was a dry run: nothing was written.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
@@ -216,8 +211,8 @@ pub struct MoveResponse {
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct MovedItem {
-    pub from: String,
-    pub to: String,
+    pub from: VaultPath,
+    pub to: VaultPath,
 }
 
 /// The per-batch behavior flags for a move batch.
@@ -231,7 +226,7 @@ struct MoveOpts {
 impl MdServer {
     /// Delete notes or directories (to a recoverable trash). All-or-nothing.
     #[tool(
-        description = "Delete notes (or directories ending in /) to a recoverable trash. All-or-nothing: a missing path, the vault root, or two overlapping targets reject the whole batch and nothing is deleted. Returns each item's trash location. dry_run:true validates and returns the planned outcome (or every rejection) without deleting. prune_empty:true also removes source directories the batch left empty (reported as pruned).",
+        description = "Delete notes or directories (a path is its segments root to leaf) to a recoverable trash. All-or-nothing: a missing path, the vault root, or two overlapping targets reject the whole batch and nothing is deleted. Returns each item's trash location. dry_run:true validates and returns the planned outcome (or every rejection) without deleting. prune_empty:true also removes source directories the batch left empty (reported as pruned).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -253,7 +248,7 @@ impl MdServer {
 
     /// Move or rename notes and directories. All-or-nothing.
     #[tool(
-        description = "Move or rename notes and directories. Each item's dest either ends with '/' — move into that directory keeping the basename ('/' alone is the vault root) — or is the full destination path including the new basename (a note keeps .md), renaming and moving in one step. All-or-nothing: collisions (without overwrite), moving a directory into its own subtree, or in-batch duplicates/swaps reject the whole batch; an item may land inside another item's moved directory (ancestor destinations apply first). dry_run:true validates and returns the planned destinations without moving. prune_empty:true also removes source directories the batch left empty (reported as pruned). update_links:true also rewrites standard-Markdown links vault-wide so they keep pointing at the moved notes (relinked notes are reported; wikilinks untouched).",
+        description = "Move or rename notes and directories; paths are segment arrays root to leaf. Each item names its target with exactly one of: into — a directory to move into keeping the basename ([] is the vault root) — or dest — the full destination path including the new basename (a note keeps .md), renaming and moving in one step. All-or-nothing: collisions (without overwrite), moving a directory into its own subtree, or in-batch duplicates/swaps reject the whole batch; an item may land inside another item's moved directory (ancestor destinations apply first). dry_run:true validates and returns the planned destinations without moving. prune_empty:true also removes source directories the batch left empty (reported as pruned). update_links:true also rewrites standard-Markdown links vault-wide so they keep pointing at the moved notes (relinked notes are reported; wikilinks untouched).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -283,20 +278,28 @@ impl MdServer {
 impl MdServer {
     async fn run_delete(
         &self,
-        paths: &[String],
+        wire_paths: &[VaultPath],
         dry_run: bool,
         prune_empty: bool,
     ) -> DeleteNotesResponse {
         let mut errors = Vec::new();
-        for (i, p) in paths.iter().enumerate() {
-            if let Err(e) = Vault::validate_rel(p) {
-                errors.push(ApiError::at(i, &e));
-                continue;
+        // Internal form: a directory carries the trailing '/' the engine keys on.
+        let mut paths: Vec<String> = Vec::with_capacity(wire_paths.len());
+        for (i, p) in wire_paths.iter().enumerate() {
+            let rel = match p.rel().and_then(|rel| Vault::validate_rel(&rel)) {
+                Ok(rel) => rel,
+                Err(e) => {
+                    errors.push(ApiError::at(i, &e));
+                    paths.push(p.to_string());
+                    continue;
+                }
+            };
+            if !self.vault().exists(&rel).unwrap_or(false) {
+                errors.push(err(i, Code::NotFound, format!("path not found: {rel}")));
             }
-            if !self.vault().exists(p).unwrap_or(false) {
-                errors.push(err(i, Code::NotFound, format!("path not found: {p}")));
-            }
+            paths.push(self.internal_form(rel));
         }
+        let paths = &paths;
         for i in 0..paths.len() {
             for j in (i + 1)..paths.len() {
                 if overlap(&paths[i], &paths[j]) {
@@ -329,8 +332,8 @@ impl MdServer {
             let deleted = paths
                 .iter()
                 .map(|p| DeletedItem {
-                    path: p.clone(),
-                    trashed_to: self.vault().planned_trash_path(p),
+                    path: VaultPath::from_rel(p),
+                    trashed_to: VaultPath::from_rel(&self.vault().planned_trash_path(p)),
                 })
                 .collect();
             return DeleteNotesResponse {
@@ -351,15 +354,14 @@ impl MdServer {
             Ok(receipt) => {
                 let ops = EventOp::from_outcomes(&receipt.outcomes);
                 self.emit_event("delete_notes", Some(&receipt.batch_id), &ops);
-                self.auto_commit("delete_notes", &ops, &paths).await;
+                self.auto_commit("delete_notes", &ops, &wire_paths).await;
                 let deleted = receipt
                     .outcomes
                     .into_iter()
-                    .zip(paths)
-                    .filter_map(|(o, requested)| match o {
+                    .filter_map(|o| match o {
                         OpOutcome::Deleted { path, trashed_to } => Some(DeletedItem {
-                            path: with_dir_suffix(path, requested),
-                            trashed_to,
+                            path: VaultPath::from_rel(&path),
+                            trashed_to: VaultPath::from_rel(&trashed_to),
                         }),
                         _ => None,
                     })
@@ -402,7 +404,7 @@ impl MdServer {
 
         for (i, m) in moves.iter().enumerate() {
             match self.compute_move(m) {
-                Ok(to) => {
+                Ok((source, to)) => {
                     // "Occupied" must mean a *different* file: a destination
                     // that resolves to the source itself is a Unicode
                     // respelling of the same note (e.g. NFD -> NFC), not a
@@ -410,11 +412,11 @@ impl MdServer {
                     let same_file = matches!(
                         (
                             self.vault().resolve_rel(strip_slash(&to)),
-                            self.vault().resolve_rel(strip_slash(&m.source)),
+                            self.vault().resolve_rel(strip_slash(&source)),
                         ),
                         (Ok(a), Ok(b)) if a == b
                     );
-                    if strip_slash(&to) == strip_slash(&m.source) {
+                    if strip_slash(&to) == strip_slash(&source) {
                         // A no-op move reads as "already exists" otherwise,
                         // suggesting a different file is in the way. (It would
                         // also fail at commit time with a raw un-indexed IO
@@ -422,7 +424,7 @@ impl MdServer {
                         errors.push(err(
                             i,
                             Code::Conflict,
-                            format!("source is already at the destination: {}", m.source),
+                            format!("source is already at the destination: {source}"),
                         ));
                     } else if !overwrite && !same_file && self.vault().exists(&to).unwrap_or(false)
                     {
@@ -432,7 +434,7 @@ impl MdServer {
                             format!("destination already exists: {to}"),
                         ));
                     }
-                    pairs.push((i, m.source.clone(), to));
+                    pairs.push((i, source, to));
                 }
                 Err(e) => errors.push(ApiError::at(i, &e)),
             }
@@ -455,7 +457,7 @@ impl MdServer {
     /// removing directories the batch left empty. `remove_empty_dir` refuses a
     /// non-empty directory, so any remaining content stops the ascent — this
     /// can never delete notes. Returns pruned dirs with the `/` suffix.
-    fn prune_emptied_dirs<'a>(&self, sources: impl Iterator<Item = &'a str>) -> Vec<String> {
+    fn prune_emptied_dirs<'a>(&self, sources: impl Iterator<Item = &'a str>) -> Vec<VaultPath> {
         let mut pruned = Vec::new();
         for src in sources {
             let mut dir = parent_dir(src);
@@ -466,7 +468,16 @@ impl MdServer {
         }
         pruned.sort();
         pruned.dedup();
-        pruned
+        pruned.iter().map(|d| VaultPath::from_rel(d)).collect()
+    }
+
+    /// The engine's spelling of an existing path: a directory ends with '/'.
+    fn internal_form(&self, rel: String) -> String {
+        if self.vault().is_dir(&rel).unwrap_or(false) {
+            format!("{rel}/")
+        } else {
+            rel
+        }
     }
 
     /// Reject a destination-directory chain segment occupied by a
@@ -492,52 +503,60 @@ impl MdServer {
         Ok(())
     }
 
-    /// Resolve a `MoveItem`'s destination path (ADR-0024): a `dest` ending in
-    /// `/` targets a directory keeping the source basename; otherwise it is
-    /// the full destination path including the new basename.
-    fn compute_move(&self, m: &MoveItem) -> Result<String, Error> {
-        Vault::validate_rel(&m.source)?;
-        if !self.vault().exists(&m.source).unwrap_or(false) {
-            return Err(Error::not_found(format!("source not found: {}", m.source)));
+    /// Resolve one item to the engine's `(source, to)` pair, both in internal
+    /// form (a directory ends with '/').
+    fn compute_move(&self, m: &MoveItem) -> Result<(String, String), Error> {
+        let source = Vault::validate_rel(&m.source.rel()?)?;
+        if !self.vault().exists(&source).unwrap_or(false) {
+            return Err(Error::not_found(format!("source not found: {source}")));
         }
-        let is_dir = is_dir_path(&m.source);
+        let source = self.internal_form(source);
+        let is_dir = is_dir_path(&source);
         let dir_suffix = if is_dir { "/" } else { "" };
-        let to = if m.dest == "/" || is_dir_path(&m.dest) {
-            // Directory target, keeping the source basename. "/" is the suffix
-            // convention's spelling of the vault root — without it there is no
-            // way to move a note back to the top level.
-            let dest_prefix: &str = if m.dest == "/" { "" } else { &m.dest };
-            self.check_dest_chain(dest_prefix)?;
-            format!("{dest_prefix}{}{dir_suffix}", basename(&m.source))
-        } else {
-            // Full destination path, including the new basename.
-            if is_dir {
-                if Vault::is_note_path(&m.dest) {
-                    return Err(Error::new(
-                        Code::Suffix,
-                        "a directory's dest must not end with .md",
-                    ));
-                }
-            } else if !Vault::is_note_path(&m.dest) {
+        let to = match (&m.dest, &m.into) {
+            (Some(_), Some(_)) | (None, None) => {
                 return Err(Error::new(
-                    Code::Suffix,
-                    "a note's dest must end with .md (end dest with '/' to move into a directory)",
+                    Code::MissingContent,
+                    "pass exactly one of dest (full destination path) or into (target directory)",
                 ));
             }
-            self.check_dest_chain(&parent_dir(&m.dest))?;
-            format!("{}{dir_suffix}", m.dest)
+            (None, Some(into)) => {
+                let prefix = into.rel()?;
+                let dest_prefix = if prefix.is_empty() {
+                    prefix
+                } else {
+                    format!("{prefix}/")
+                };
+                self.check_dest_chain(&dest_prefix)?;
+                format!("{dest_prefix}{}{dir_suffix}", basename(&source))
+            }
+            (Some(dest), None) => {
+                let dest = Vault::validate_rel(&dest.rel()?)?;
+                if is_dir {
+                    if Vault::is_note_path(&dest) {
+                        return Err(Error::new(
+                            Code::Suffix,
+                            "a directory's dest must not end with .md",
+                        ));
+                    }
+                } else if !Vault::is_note_path(&dest) {
+                    return Err(Error::new(
+                        Code::Suffix,
+                        "a note's dest must end with .md (use into to move into a directory)",
+                    ));
+                }
+                self.check_dest_chain(&parent_dir(&dest))?;
+                format!("{dest}{dir_suffix}")
+            }
         };
         Vault::validate_rel(&to)?;
-        // A directory cannot move into its own subtree. Strict containment on
-        // purpose: an equal key is either a no-op or a Unicode respelling of
-        // the same directory, both handled by the caller's conflict checks.
-        if is_dir && contains_strict(&m.source, &to) {
+        if is_dir && contains_strict(&source, &to) {
             return Err(Error::new(
                 Code::Overlap,
                 "cannot move a directory into its own subtree",
             ));
         }
-        Ok(to)
+        Ok((source, to))
     }
 
     async fn finish_move(
@@ -575,7 +594,10 @@ impl MdServer {
             // Validation passed; report the plan without touching the vault.
             let moved = pairs
                 .into_iter()
-                .map(|(_, from, to)| MovedItem { from, to })
+                .map(|(_, from, to)| MovedItem {
+                    from: VaultPath::from_rel(&from),
+                    to: VaultPath::from_rel(&to),
+                })
                 .collect();
             return MoveResponse {
                 ok: true,
@@ -612,12 +634,12 @@ impl MdServer {
                     .into_iter()
                     .filter(|o| matches!(o, OpOutcome::Moved { .. }))
                     .zip(&pairs)
-                    .filter_map(|(o, (idx, pfrom, pto))| match o {
+                    .filter_map(|(o, (idx, _, _))| match o {
                         OpOutcome::Moved { from, to } => Some((
                             *idx,
                             MovedItem {
-                                from: with_dir_suffix(from, pfrom),
-                                to: with_dir_suffix(to, pto),
+                                from: VaultPath::from_rel(&from),
+                                to: VaultPath::from_rel(&to),
                             },
                         )),
                         _ => None,
@@ -665,7 +687,7 @@ impl MdServer {
         tool: &str,
         pairs: &[(usize, String, String)],
         dry_run: bool,
-    ) -> (Vec<Op>, Vec<String>) {
+    ) -> (Vec<Op>, Vec<VaultPath>) {
         use md_core::relink::MoveMap;
 
         let started = std::time::Instant::now();
@@ -733,7 +755,7 @@ impl MdServer {
                 path: old_path,
                 content: content.into_bytes(),
             });
-            relinked.push(new_path);
+            relinked.push(VaultPath::from_rel(&new_path));
         }
         tracing::info!(
             tool,
@@ -818,17 +840,33 @@ mod tests {
             .unwrap()
             .0;
         assert!(ok.ok);
-        assert!(ok.deleted[0].trashed_to.starts_with(".md-mcp/trash/"));
+        assert!(
+            ok.deleted[0]
+                .trashed_to
+                .0
+                .starts_with(&[".md-mcp".to_string(), "trash".to_string()])
+        );
         assert!(!s.vault().exists("a.md").unwrap());
+    }
+
+    /// A move item spelled the way the vault is set up: a target ending in
+    /// `/` is a directory to move `into`, anything else the full `dest`.
+    fn mv(source: &str, target: &str) -> MoveItem {
+        let (dest, into) = match target.strip_suffix('/') {
+            Some(dir) => (None, Some(dir.into())),
+            None => (Some(target.into()), None),
+        };
+        MoveItem {
+            source: source.into(),
+            dest,
+            into,
+        }
     }
 
     /// Shorthand for a single-item move_notes call with default flags.
     async fn move_one(s: &MdServer, source: &str, dest: &str) -> MoveResponse {
         s.move_notes(Parameters(MoveNotesRequest {
-            moves: vec![MoveItem {
-                source: source.into(),
-                dest: dest.into(),
-            }],
+            moves: vec![mv(source, dest)],
             overwrite: false,
             update_links: false,
             dry_run: false,
@@ -846,16 +884,7 @@ mod tests {
         // move --dry_run: the planned destinations come back, nothing moves.
         let r = s
             .move_notes(Parameters(MoveNotesRequest {
-                moves: vec![
-                    MoveItem {
-                        source: "업무/plan.md".into(),
-                        dest: "02-areas/work/".into(),
-                    },
-                    MoveItem {
-                        source: "b.md".into(),
-                        dest: "c.md".into(),
-                    },
-                ],
+                moves: vec![mv("업무/plan.md", "02-areas/work/"), mv("b.md", "c.md")],
                 overwrite: false,
                 update_links: false,
                 dry_run: true,
@@ -884,7 +913,12 @@ mod tests {
             .0;
         assert!(r.ok, "{:?}", r.errors);
         assert!(r.dry_run);
-        assert!(r.deleted[0].trashed_to.starts_with(".md-mcp/trash/"));
+        assert!(
+            r.deleted[0]
+                .trashed_to
+                .0
+                .starts_with(&[".md-mcp".to_string(), "trash".to_string()])
+        );
         assert!(s.vault().exists("b.md").unwrap(), "not applied");
     }
 
@@ -893,10 +927,7 @@ mod tests {
         let (_d, s) = server(&[("a/b/n.md", "x"), ("a/keep.md", "y")]);
         let r = s
             .move_notes(Parameters(MoveNotesRequest {
-                moves: vec![MoveItem {
-                    source: "a/b/n.md".into(),
-                    dest: "dst/".into(),
-                }],
+                moves: vec![mv("a/b/n.md", "dst/")],
                 overwrite: false,
                 update_links: false,
                 dry_run: false,
@@ -943,16 +974,7 @@ mod tests {
         let (_d, s) = server(&[("a.md", "x"), ("b.md", "y")]);
         let r = s
             .move_notes(Parameters(MoveNotesRequest {
-                moves: vec![
-                    MoveItem {
-                        source: "a.md".into(),
-                        dest: "dst/".into(),
-                    },
-                    MoveItem {
-                        source: "missing.md".into(),
-                        dest: "dst/".into(),
-                    },
-                ],
+                moves: vec![mv("a.md", "dst/"), mv("missing.md", "dst/")],
                 overwrite: false,
                 update_links: false,
                 dry_run: true,
@@ -991,7 +1013,7 @@ mod tests {
 
         let bad = s
             .delete_notes(Parameters(DeleteNotesRequest {
-                paths: vec![format!("{nfd_dir}/"), "\u{d55c}/c.md".into()],
+                paths: vec![format!("{nfd_dir}/").into(), "\u{d55c}/c.md".into()],
                 dry_run: false,
                 prune_empty: false,
             }))
@@ -1005,14 +1027,8 @@ mod tests {
         let bad = s
             .move_notes(Parameters(MoveNotesRequest {
                 moves: vec![
-                    MoveItem {
-                        source: file.clone(),
-                        dest: format!("{nfd_dir}/d.md"),
-                    },
-                    MoveItem {
-                        source: "\u{d55c}/c.md".into(),
-                        dest: "\u{d55c}/e.md".into(),
-                    },
+                    mv(&file, &format!("{nfd_dir}/d.md")),
+                    mv("\u{d55c}/c.md", "\u{d55c}/e.md"),
                 ],
                 overwrite: false,
                 update_links: false,
@@ -1160,14 +1176,8 @@ mod tests {
         let ok = s
             .move_notes(Parameters(MoveNotesRequest {
                 moves: vec![
-                    MoveItem {
-                        source: "kernel/dma-buf/".into(),
-                        dest: "02-areas/ak/dma-buf".into(),
-                    },
-                    MoveItem {
-                        source: "ak/".into(),
-                        dest: "02-areas/".into(),
-                    },
+                    mv("kernel/dma-buf/", "02-areas/ak/dma-buf"),
+                    mv("ak/", "02-areas/"),
                 ],
                 overwrite: false,
                 update_links: false,
@@ -1196,16 +1206,7 @@ mod tests {
         let (_d, s) = server(&[("a/keep.md", "k"), ("x.md", "x")]);
         let bad = s
             .move_notes(Parameters(MoveNotesRequest {
-                moves: vec![
-                    MoveItem {
-                        source: "a/".into(),
-                        dest: "z/".into(),
-                    },
-                    MoveItem {
-                        source: "x.md".into(),
-                        dest: "a/sub/x.md".into(),
-                    },
-                ],
+                moves: vec![mv("a/", "z/"), mv("x.md", "a/sub/x.md")],
                 overwrite: false,
                 update_links: false,
                 dry_run: false,
@@ -1230,16 +1231,7 @@ mod tests {
         // Swap: a -> b while b -> a.
         let bad = s
             .move_notes(Parameters(MoveNotesRequest {
-                moves: vec![
-                    MoveItem {
-                        source: "a.md".into(),
-                        dest: "b.md".into(),
-                    },
-                    MoveItem {
-                        source: "b.md".into(),
-                        dest: "a.md".into(),
-                    },
-                ],
+                moves: vec![mv("a.md", "b.md"), mv("b.md", "a.md")],
                 overwrite: false,
                 update_links: false,
                 dry_run: false,
@@ -1260,16 +1252,7 @@ mod tests {
         // Chain: a moves to where b was while b moves away.
         let bad = s
             .move_notes(Parameters(MoveNotesRequest {
-                moves: vec![
-                    MoveItem {
-                        source: "a.md".into(),
-                        dest: "b.md".into(),
-                    },
-                    MoveItem {
-                        source: "b.md".into(),
-                        dest: "c.md".into(),
-                    },
-                ],
+                moves: vec![mv("a.md", "b.md"), mv("b.md", "c.md")],
                 overwrite: false,
                 update_links: false,
                 dry_run: false,
@@ -1308,10 +1291,7 @@ mod tests {
 
         let ok = s
             .move_notes(Parameters(MoveNotesRequest {
-                moves: vec![MoveItem {
-                    source: "a.md".into(),
-                    dest: "taken.md".into(),
-                }],
+                moves: vec![mv("a.md", "taken.md")],
                 overwrite: true,
                 update_links: false,
                 dry_run: false,
@@ -1332,16 +1312,7 @@ mod tests {
         let (_d, s) = server(&[("a.md", "x")]);
         let bad = s
             .move_notes(Parameters(MoveNotesRequest {
-                moves: vec![
-                    MoveItem {
-                        source: "a.md".into(),
-                        dest: "archive/".into(),
-                    },
-                    MoveItem {
-                        source: "ghost.md".into(),
-                        dest: "archive/".into(),
-                    },
-                ],
+                moves: vec![mv("a.md", "archive/"), mv("ghost.md", "archive/")],
                 overwrite: false,
                 update_links: false,
                 dry_run: false,
@@ -1383,16 +1354,7 @@ mod tests {
         let (_d, s) = server(&[("a.md", "x"), ("sub/a.md", "y")]);
         let collide = s
             .move_notes(Parameters(MoveNotesRequest {
-                moves: vec![
-                    MoveItem {
-                        source: "a.md".into(),
-                        dest: "d/".into(),
-                    },
-                    MoveItem {
-                        source: "sub/a.md".into(),
-                        dest: "d/a.md".into(),
-                    },
-                ],
+                moves: vec![mv("a.md", "d/"), mv("sub/a.md", "d/a.md")],
                 overwrite: false,
                 update_links: false,
                 dry_run: false,
@@ -1418,10 +1380,7 @@ mod tests {
 
     async fn move_linked(s: &MdServer, source: &str, dest: &str, dry_run: bool) -> MoveResponse {
         s.move_notes(Parameters(MoveNotesRequest {
-            moves: vec![MoveItem {
-                source: source.into(),
-                dest: dest.into(),
-            }],
+            moves: vec![mv(source, dest)],
             overwrite: false,
             update_links: true,
             dry_run,
@@ -1528,5 +1487,47 @@ mod tests {
         assert!(r.ok, "{:?}", r.errors);
         assert_eq!(r.relinked, ["linker.md"]);
         assert_eq!(s.vault().read_note("linker.md").unwrap(), "[l](b/new.md)");
+    }
+
+    #[tokio::test]
+    async fn a_move_names_exactly_one_of_dest_or_into() {
+        let (_d, s) = server(&[("a.md", "x"), ("d/n.md", "y")]);
+        for item in [
+            MoveItem {
+                source: "a.md".into(),
+                dest: Some("b.md".into()),
+                into: Some("d".into()),
+            },
+            MoveItem {
+                source: "a.md".into(),
+                dest: None,
+                into: None,
+            },
+        ] {
+            let r = s
+                .move_notes(Parameters(MoveNotesRequest {
+                    moves: vec![item],
+                    overwrite: false,
+                    update_links: false,
+                    dry_run: false,
+                    prune_empty: false,
+                }))
+                .await
+                .unwrap()
+                .0;
+            assert!(!r.ok);
+            assert_eq!(r.errors[0].code, "MISSING_CONTENT", "{:?}", r.errors);
+            assert_eq!(r.errors[0].index, Some(0));
+        }
+        assert!(s.vault().exists("a.md").unwrap(), "nothing moved");
+
+        // `into: []` is the vault root; a directory moves as a directory.
+        let r = move_one(&s, "d/", "/").await;
+        assert!(!r.ok, "{:?}", r.moved);
+        assert!(r.errors[0].message.contains("already at the destination"));
+        let r = move_one(&s, "d/n.md", "/").await;
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(r.moved[0].to, "n.md");
+        assert!(s.vault().exists("n.md").unwrap());
     }
 }
