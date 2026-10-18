@@ -39,6 +39,8 @@ const MAX_PATH_COMPONENT_BYTES: usize = 255;
 pub struct Vault {
     root: Dir,
     root_path: PathBuf,
+    /// Every write entry point refuses with [`Code::ReadOnly`] when set.
+    read_only: bool,
 }
 
 /// RAII guard for the cross-process vault lock; the OS lock is released when
@@ -51,15 +53,50 @@ impl Vault {
     /// Open the vault at `path`. Fails if it does not exist or is not a
     /// directory. Rolls back any transaction left incomplete by a crash.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let root = Dir::open_ambient_dir(path, ambient_authority())
-            .map_err(|e| Error::io(format!("cannot open vault {}: {e}", path.display())))?;
-        let vault = Self {
-            root,
-            root_path: path.to_path_buf(),
-        };
+        let vault = Self::open_dir(path.as_ref(), false)?;
         vault.recover_transactions()?;
         Ok(vault)
+    }
+
+    /// Open the vault at `path` for reading only (ADR-0030): every write entry
+    /// point refuses with [`Code::ReadOnly`]. Recovery would mutate the tree, so
+    /// a pending transaction journal fails the open instead.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let vault = Self::open_dir(path.as_ref(), true)?;
+        if vault.has_pending_transactions() {
+            return Err(Error::new(
+                Code::ReadOnly,
+                format!(
+                    "vault {} has an unrecovered transaction; open it read-write once to recover",
+                    path.as_ref().display()
+                ),
+            ));
+        }
+        Ok(vault)
+    }
+
+    fn open_dir(path: &Path, read_only: bool) -> Result<Self> {
+        let root = Dir::open_ambient_dir(path, ambient_authority())
+            .map_err(|e| Error::io(format!("cannot open vault {}: {e}", path.display())))?;
+        Ok(Self {
+            root,
+            root_path: path.to_path_buf(),
+            read_only,
+        })
+    }
+
+    /// [`Code::ReadOnly`] when the vault was opened read-only.
+    pub(crate) fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            return Err(Error::new(Code::ReadOnly, "this vault is read-only"));
+        }
+        Ok(())
+    }
+
+    /// Whether the vault was opened with [`Vault::open_read_only`].
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// The filesystem path the vault was opened at (for diagnostics).
@@ -246,6 +283,9 @@ impl Vault {
     /// internal state directory are refused. Best-effort by design (for
     /// post-batch pruning): any failure just reports `false`.
     pub fn remove_empty_dir(&self, rel: &str) -> bool {
+        if self.read_only {
+            return false;
+        }
         let rel = rel.strip_suffix('/').unwrap_or(rel);
         let Ok(clean) = self.resolve_rel(rel) else {
             return false;
@@ -289,6 +329,7 @@ impl Vault {
     /// renames it over the target — so a reader sees the old or the complete new
     /// file, never a torn one.
     pub fn write_atomic(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        self.ensure_writable()?;
         // A trailing '/' denotes a directory (suffix convention); silently
         // stripping it would write a file where the caller expected a directory.
         if rel.ends_with('/') {
@@ -401,6 +442,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = Vault::open(dir.path()).unwrap();
         (dir, vault)
+    }
+
+    #[test]
+    fn a_read_only_vault_refuses_every_write_and_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        Vault::open(dir.path())
+            .unwrap()
+            .write_atomic("a.md", b"# A\n")
+            .unwrap();
+        std::fs::create_dir(dir.path().join("empty")).unwrap();
+
+        let vault = Vault::open_read_only(dir.path()).unwrap();
+        assert!(vault.is_read_only());
+        assert_eq!(vault.read_note("a.md").unwrap(), "# A\n");
+
+        let refusals = [
+            vault.write_atomic("a.md", b"x").unwrap_err(),
+            vault.create_note("b.md", b"x", false).unwrap_err(),
+            vault
+                .commit_batch(&[crate::transaction::Op::Delete {
+                    path: "a.md".into(),
+                }])
+                .unwrap_err(),
+        ];
+        for err in refusals {
+            assert_eq!(err.code, Code::ReadOnly, "got: {err}");
+        }
+        assert!(!vault.remove_empty_dir("empty"));
+
+        assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), b"# A\n");
+        assert!(!dir.path().join("b.md").exists());
+        assert!(dir.path().join("empty").is_dir());
+        assert!(
+            !dir.path().join(INTERNAL_DIR).exists(),
+            "a refused batch must not even take the vault lock"
+        );
     }
 
     #[test]

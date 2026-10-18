@@ -78,6 +78,7 @@ fn strip_slash(path: &str) -> &str {
 impl Vault {
     /// Apply a batch of ops atomically. On any failure nothing is left changed.
     pub fn commit_batch(&self, ops: &[Op]) -> Result<CommitReceipt> {
+        self.ensure_writable()?;
         // Agent ops may never target the internal `.md-mcp/` state directory.
         for op in ops {
             let paths: Vec<&str> = match op {
@@ -193,6 +194,15 @@ impl Vault {
                 Err(e)
             }
         }
+    }
+
+    /// Whether a transaction journal is waiting for recovery.
+    pub(crate) fn has_pending_transactions(&self) -> bool {
+        self.dir().read_dir(JOURNAL_DIR).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".json")))
+        })
     }
 
     /// Roll back any transaction a crash left incomplete. Called at open.
@@ -620,6 +630,32 @@ mod tests {
             "recovery should have rolled back"
         );
         assert!(!dir.path().join(".md-mcp/journal/planted.json").exists());
+    }
+
+    #[test]
+    fn a_read_only_open_refuses_a_pending_journal_and_leaves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        Vault::open(dir.path())
+            .unwrap()
+            .write_atomic("victim.md", b"kept")
+            .unwrap();
+        let jdir = dir.path().join(".md-mcp/journal");
+        std::fs::create_dir_all(&jdir).unwrap();
+        std::fs::write(
+            jdir.join("planted.json"),
+            br#"{"batch_id":"planted","committed":false,"undo":[{"DeletePath":{"path":"victim.md"}}]}"#,
+        )
+        .unwrap();
+
+        let Err(err) = Vault::open_read_only(dir.path()) else {
+            panic!("a read-only open must not serve a vault with a pending journal");
+        };
+        assert_eq!(err.code, crate::Code::ReadOnly, "got: {err}");
+        assert!(dir.path().join("victim.md").exists(), "nothing rolled back");
+        assert!(
+            jdir.join("planted.json").exists(),
+            "the journal is left for a read-write open"
+        );
     }
 
     #[test]
