@@ -44,6 +44,8 @@ pub enum Code {
     TooLarge,
     /// A note body that is not valid UTF-8 text.
     Encoding,
+    /// A write reached a vault opened read-only.
+    ReadOnly,
     /// An unexpected I/O failure.
     Io,
 }
@@ -70,6 +72,7 @@ impl Code {
             Code::FrontmatterParse => "FRONTMATTER_PARSE",
             Code::TooLarge => "TOO_LARGE",
             Code::Encoding => "ENCODING",
+            Code::ReadOnly => "READ_ONLY",
             Code::Io => "IO",
         }
     }

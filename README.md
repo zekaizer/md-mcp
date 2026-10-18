@@ -83,6 +83,16 @@ stderr (under stdio, stdout is the JSON-RPC channel).
 connecting agents are told to read first — useful for teaching agents your
 vault's conventions.
 
+`MD_READ_ONLY=1` (`--read-only 1`) serves the vault read-only
+([ADR-0030](docs/adr/0030-read-only-vault.md)): only the read and search tools
+are offered, the transfer API has no `PUT`, and any write the core still sees is
+refused with `READ_ONLY`. With git sync on, the vault catches up by fetch and
+fast-forward only — at startup, every `MD_GIT_SYNC_INTERVAL_SECS`, and on
+`sync_vault` — and never commits or pushes; `MD_GIT_AUTO_COMMIT` and
+`MD_GIT_AUTO_PUSH_SECS` are refused alongside it. To serve several vaults, run
+one instance per vault, each with its own env file and hostname. Serving one
+directory from a read-write and a read-only instance at once is unsupported.
+
 ## Configuration
 
 ### HTTP options

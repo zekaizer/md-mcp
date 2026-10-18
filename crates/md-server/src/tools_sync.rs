@@ -8,6 +8,9 @@
 //! A rebase conflict aborts (restoring the tree) and is reported as a normal
 //! result, not an error: it is one of sync's outcomes, resolved by agents or
 //! humans, never by leaving conflict markers in a note.
+//!
+//! On a read-only vault the sequence is fetch → guard + flock { fast-forward }
+//! and nothing else: no sweep commit, no push (ADR-0030).
 
 use rmcp::handler::server::wrapper::Json;
 use rmcp::schemars::JsonSchema;
@@ -15,7 +18,10 @@ use rmcp::{ErrorData, tool, tool_router};
 use serde::Serialize;
 
 use crate::MdServer;
-use crate::sync::Rebase;
+use crate::sync::{GitSync, Rebase};
+
+const NO_UPSTREAM: &str =
+    "current branch has no upstream; set one (e.g. git push -u origin <branch>) to sync";
 use crate::vault_path::VaultPath;
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -36,7 +42,7 @@ pub struct SyncVaultResponse {
 impl MdServer {
     /// Synchronize the vault with its git remote.
     #[tool(
-        description = "Synchronize the vault with its git remote: commit local changes, rebase onto the fetched upstream, and push. Returns {status, pulled, pushed, conflicts}. status:\"conflict\" means the rebase was aborted and the vault left unchanged — the listed paths need manual/agent resolution. Errors are reserved for git execution failures. Commit model: when auto-commit is enabled each write batch is already committed as `mcp(<tool>)` the moment it lands, so the sweep here picks up only edits made outside mcp — status:\"clean\" with pushed:0 right after your writes means they were committed (and possibly auto-pushed) earlier, not lost.",
+        description = "Synchronize the vault with its git remote: commit local changes, rebase onto the fetched upstream, and push. Returns {status, pulled, pushed, conflicts}. status:\"conflict\" means the rebase was aborted and the vault left unchanged — the listed paths need manual/agent resolution. Errors are reserved for git execution failures. Commit model: when auto-commit is enabled each write batch is already committed as `mcp(<tool>)` the moment it lands, so the sweep here picks up only edits made outside mcp — status:\"clean\" with pushed:0 right after your writes means they were committed (and possibly auto-pushed) earlier, not lost. On a read-only vault it only fast-forwards to the fetched upstream: nothing is committed or pushed, and a branch that cannot fast-forward is an error.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -97,15 +103,15 @@ impl MdServer {
         let Some(git) = self.git_sync() else {
             return Err("git sync is not enabled".into());
         };
+        if self.vault().is_read_only() {
+            return self.run_pull(git).await;
+        }
 
         let mut pulled = 0usize;
         let mut last_push_err = String::new();
         for attempt in 0..2 {
             let Some(old_upstream) = git.upstream_tip().await else {
-                return Err(
-                    "current branch has no upstream; set one (e.g. git push -u origin <branch>) to sync"
-                        .into(),
-                );
+                return Err(NO_UPSTREAM.into());
             };
             git.fetch().await?;
             let new_upstream = git
@@ -167,6 +173,34 @@ impl MdServer {
             }
         }
         Err(format!("push failed after retry: {last_push_err}"))
+    }
+
+    /// The read-only sync: fetch, then fast-forward under the guard and flock.
+    /// Never commits, never pushes (ADR-0030).
+    async fn run_pull(&self, git: &GitSync) -> Result<SyncVaultResponse, String> {
+        if git.upstream_tip().await.is_none() {
+            return Err(NO_UPSTREAM.into());
+        }
+        git.fetch().await?;
+        let (old_head, new_head) = {
+            let _guard = self.lock().write().await;
+            let _flock = self.vault().exclusive_lock().map_err(|e| e.to_string())?;
+            let old_head = git.head().await?;
+            git.fast_forward().await?;
+            (old_head, git.head().await?)
+        };
+        let mut pulled = 0;
+        if new_head != old_head {
+            let ops = git.changed_between(&old_head, &new_head).await;
+            pulled = ops.len();
+            self.emit_event("sync_vault", None, &ops);
+        }
+        Ok(SyncVaultResponse {
+            status: "clean".into(),
+            pulled,
+            pushed: 0,
+            conflicts: vec![],
+        })
     }
 }
 
@@ -236,6 +270,101 @@ mod tests {
         let vault = Vault::open(vault_dir).unwrap();
         let git = GitSync::preflight(vault_dir).await.unwrap();
         MdServer::new(vault).with_git_sync(git)
+    }
+
+    async fn read_only_server_with_sync(vault_dir: &Path) -> MdServer {
+        let vault = Vault::open_read_only(vault_dir).unwrap();
+        let git = GitSync::preflight(vault_dir).await.unwrap();
+        MdServer::new(vault).with_git_sync(git)
+    }
+
+    fn rev(dir: &Path, rev: &str) -> String {
+        let out = Command::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn push_remote_note(clone: &Path, name: &str) {
+        std::fs::write(clone.join(name), "# Remote\n").unwrap();
+        git(clone, &["add", "-A"]);
+        git(clone, &["commit", "-m", name]);
+        git(clone, &["push"]);
+    }
+
+    #[tokio::test]
+    async fn a_read_only_vault_syncs_by_fast_forward_alone() {
+        let (root, vault_dir, clone) = repo_fixture();
+        push_remote_note(&clone, "remote-note.md");
+        // A local edit a read-write sync would sweep into a commit and push.
+        std::fs::write(vault_dir.join("local.md"), "# Local\n").unwrap();
+
+        let s = read_only_server_with_sync(&vault_dir).await;
+        let r = s.sync_vault().await.unwrap().0;
+        assert_eq!(r.status, "clean");
+        assert_eq!(r.pulled, 1);
+        assert_eq!(r.pushed, 0, "a read-only vault never pushes");
+        assert!(vault_dir.join("remote-note.md").exists());
+        assert_eq!(
+            rev(&vault_dir, "HEAD"),
+            rev(&clone, "HEAD"),
+            "no local commit"
+        );
+        assert_eq!(
+            rev(&root.path().join("remote.git"), "main"),
+            rev(&clone, "HEAD"),
+            "the remote holds only what the other clone pushed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(vault_dir.join("local.md")).unwrap(),
+            "# Local\n",
+            "the local edit is left as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_vault_refuses_to_sync_a_diverged_branch() {
+        let (root, vault_dir, clone) = repo_fixture();
+        push_remote_note(&clone, "remote-note.md");
+        std::fs::write(vault_dir.join("local.md"), "# Local\n").unwrap();
+        git(&vault_dir, &["add", "-A"]);
+        git(&vault_dir, &["commit", "-m", "local"]);
+        let local_head = rev(&vault_dir, "HEAD");
+
+        let s = read_only_server_with_sync(&vault_dir).await;
+        let err = s
+            .sync_vault()
+            .await
+            .err()
+            .expect("a diverged branch cannot sync");
+        assert!(err.message.contains("fast-forward"), "got: {}", err.message);
+        assert_eq!(rev(&vault_dir, "HEAD"), local_head, "local history kept");
+        assert!(!vault_dir.join("remote-note.md").exists());
+        assert_eq!(
+            rev(&root.path().join("remote.git"), "main"),
+            rev(&clone, "HEAD"),
+            "nothing pushed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_vault_pulls_once_at_startup() {
+        let (_root, vault_dir, clone) = repo_fixture();
+        push_remote_note(&clone, "remote-note.md");
+
+        let _s = read_only_server_with_sync(&vault_dir)
+            .await
+            .with_startup_sync();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !vault_dir.join("remote-note.md").exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the startup sync never pulled"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]

@@ -38,7 +38,11 @@ async fn main() -> Result<()> {
     }
 
     let config = Config::from_cli(cli)?;
-    let vault = Vault::open(&config.vault_dir)?;
+    let vault = if config.read_only {
+        Vault::open_read_only(&config.vault_dir)?
+    } else {
+        Vault::open(&config.vault_dir)?
+    };
     // Keep .md-mcp/ out of any git repo the vault lives in (ADR-0016).
     md_server::sync::ensure_git_exclude(&config.vault_dir);
     let mut server = MdServer::new(vault);
@@ -65,6 +69,11 @@ async fn main() -> Result<()> {
         match md_server::sync::GitSync::preflight(&config.vault_dir).await {
             Ok(git) => {
                 server = server.with_git_sync(git);
+                if config.read_only {
+                    // Its only way to catch up besides the interval and
+                    // sync_vault (ADR-0030).
+                    server = server.with_startup_sync();
+                }
                 if config.git.auto_commit {
                     server = server.with_auto_commit();
                 }

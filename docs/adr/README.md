@@ -38,3 +38,4 @@ immutable; a changed decision supersedes the old one with a new ADR.
 - [0027](0027-literal-text-replacement.md) — Literal text replacement
 - [0028](0028-byte-level-note-api.md) — Byte-level note I/O over HTTP
 - [0029](0029-path-segments.md) — Vault paths as segment arrays
+- [0030](0030-read-only-vault.md) — Read-only vault mode

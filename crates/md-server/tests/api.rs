@@ -18,11 +18,23 @@ async fn spawn(token: Option<&str>) -> SocketAddr {
 /// As [`spawn`], also handing back the vault root for tests that care what
 /// landed on disk rather than what the API answered.
 async fn spawn_with_root(token: Option<&str>) -> (SocketAddr, std::path::PathBuf) {
+    spawn_opened(token, |p| Vault::open(p)).await
+}
+
+/// As [`spawn_with_root`], over a vault opened by `open` once the fixture is
+/// on disk.
+async fn spawn_opened(
+    token: Option<&str>,
+    open: fn(&std::path::Path) -> md_core::Result<Vault>,
+) -> (SocketAddr, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    let vault = Vault::open(dir.path()).unwrap();
-    vault.write_atomic("hello.md", NOTE.as_bytes()).unwrap();
+    Vault::open(dir.path())
+        .unwrap()
+        .write_atomic("hello.md", NOTE.as_bytes())
+        .unwrap();
     std::fs::create_dir(root.join("inbox")).unwrap();
+    let vault = open(dir.path()).unwrap();
     let state = tempfile::tempdir().unwrap();
     let cfg = HttpConfig {
         addr: "127.0.0.1:0".parse().unwrap(),
@@ -41,6 +53,28 @@ async fn spawn_with_root(token: Option<&str>) -> (SocketAddr, std::path::PathBuf
         axum::serve(listener, app).await.ok();
     });
     (addr, root)
+}
+
+#[tokio::test]
+async fn a_read_only_vault_has_no_put_and_still_serves_get() {
+    let (addr, root) = spawn_opened(None, |p| Vault::open_read_only(p)).await;
+    let url = format!("http://{addr}/api/notes/hello.md");
+
+    let put = reqwest::Client::new()
+        .put(&url)
+        .header("if-match", "*")
+        .body("replaced")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 405, "a read-only vault routes no PUT");
+    assert_eq!(
+        std::fs::read_to_string(root.join("hello.md")).unwrap(),
+        NOTE
+    );
+
+    let get = reqwest::get(&url).await.unwrap();
+    assert_eq!(get.status(), 200);
 }
 
 #[tokio::test]
