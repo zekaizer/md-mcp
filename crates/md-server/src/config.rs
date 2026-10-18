@@ -33,6 +33,9 @@ pub struct Cli {
     /// Vault root directory (required).
     #[arg(long, env = "MD_VAULT")]
     pub vault: PathBuf,
+    /// Serve the vault read-only: no write tools, no PUT, fast-forward-only sync.
+    #[arg(long, env = "MD_READ_ONLY")]
+    pub read_only: Option<String>,
 
     /// HTTP bind address [default: 127.0.0.1:7654].
     #[arg(long, env = "MD_HTTP_ADDR")]
@@ -309,6 +312,21 @@ impl GitConfig {
     }
 }
 
+/// Refuse settings that would write from a read-only vault (ADR-0030): its
+/// sync never commits or pushes, so the automation layers that do are a
+/// misconfiguration, not a silent no-op.
+fn check_read_only(read_only: bool, git: &GitConfig) -> Result<()> {
+    if read_only {
+        if git.auto_commit {
+            bail!("MD_GIT_AUTO_COMMIT cannot be combined with MD_READ_ONLY=1");
+        }
+        if git.auto_push_secs.is_some() {
+            bail!("MD_GIT_AUTO_PUSH_SECS cannot be combined with MD_READ_ONLY=1");
+        }
+    }
+    Ok(())
+}
+
 /// Parse a positive-seconds env var. Unset/blank → `None`; `0` or a non-number
 /// is a hard error, never a silent off.
 fn parse_secs(raw: Option<String>, var: &str) -> Result<Option<u64>> {
@@ -331,6 +349,8 @@ fn parse_secs(raw: Option<String>, var: &str) -> Result<Option<u64>> {
 pub struct Config {
     /// The vault root directory.
     pub vault_dir: PathBuf,
+    /// Serve the vault read-only (`MD_READ_ONLY`, ADR-0030).
+    pub read_only: bool,
     /// The selected transport.
     pub transport: Transport,
     /// Event journal + hook (ADR-0017).
@@ -376,6 +396,8 @@ impl Config {
             cli.git_auto_push_secs,
             cli.git_sync_interval_secs,
         )?;
+        let read_only = parse_flag(cli.read_only, "MD_READ_ONLY")?;
+        check_read_only(read_only, &git)?;
 
         let intro_note = cli
             .intro_note
@@ -384,6 +406,7 @@ impl Config {
 
         Ok(Self {
             vault_dir: cli.vault,
+            read_only,
             transport,
             events,
             git,
@@ -444,6 +467,20 @@ mod tests {
         assert!(Cli::try_parse_from(["md-server", "--bogus", "--vault", "/v"]).is_err());
         // vault is required (no --vault and no MD_VAULT in this parse).
         assert!(Cli::try_parse_from(["md-server"]).is_err());
+    }
+
+    #[test]
+    fn a_read_only_vault_refuses_the_layers_that_commit_or_push() {
+        let git = |auto_commit: bool, auto_push: Option<u64>| GitConfig {
+            sync: true,
+            auto_commit,
+            auto_push_secs: auto_push,
+            sync_interval_secs: Some(60),
+        };
+        assert!(check_read_only(true, &git(false, None)).is_ok());
+        assert!(check_read_only(true, &git(true, None)).is_err());
+        assert!(check_read_only(true, &git(false, Some(30))).is_err());
+        assert!(check_read_only(false, &git(true, Some(30))).is_ok());
     }
 
     #[test]
