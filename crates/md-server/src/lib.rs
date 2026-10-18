@@ -130,6 +130,14 @@ impl MdServer {
         self
     }
 
+    /// Run one sync in the background right away (ADR-0030); spawns a task,
+    /// so a tokio runtime must be running.
+    #[must_use]
+    pub fn with_startup_sync(self) -> Self {
+        tokio::spawn(sync::startup_sync_task(self.clone()));
+        self
+    }
+
     /// Expose `provision_transfer`. It delegates from the caller's own bearer,
     /// so it is advertised only where there is one: over stdio, or on an
     /// unguarded loopback server, it could never do anything but fail.

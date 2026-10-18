@@ -173,6 +173,28 @@ impl GitSync {
             .map(|s| s.trim().to_string())
     }
 
+    /// The commit HEAD points at.
+    pub async fn head(&self) -> Result<String, String> {
+        self.run(&["rev-parse", "HEAD"])
+            .await
+            .map(|s| s.trim().to_string())
+    }
+
+    /// Fast-forward HEAD to the fetched upstream tip. Diverged history, or a
+    /// local change the merge would overwrite, fails and leaves the tree as it
+    /// was.
+    pub async fn fast_forward(&self) -> Result<(), String> {
+        self.run(&["merge", "--ff-only", "@{u}"])
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                format!(
+                    "cannot fast-forward to the upstream; a read-only vault never \
+                     merges or overwrites local changes: {e}"
+                )
+            })
+    }
+
     /// Fetch the current branch's remote.
     pub async fn fetch(&self) -> Result<(), String> {
         self.run(&["fetch"]).await.map(|_| ())
@@ -383,6 +405,11 @@ pub(crate) async fn auto_push_task(
             }
         }
     }
+}
+
+/// One sync as soon as the server starts (ADR-0030).
+pub(crate) async fn startup_sync_task(server: crate::MdServer) {
+    log_background_sync("startup sync", server.run_sync().await);
 }
 
 /// Periodic full sync, pulling remote changes without agent involvement.
