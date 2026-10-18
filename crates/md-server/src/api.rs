@@ -39,15 +39,19 @@ pub(crate) const NOTE_COUNT: axum::http::HeaderName =
 
 /// `/api/notes/...`, mounted beside `/mcp` and behind the same bearer guard.
 pub(crate) fn routes(server: MdServer) -> Router {
+    // A read-only vault routes no PUT, so the method answers 405 (ADR-0030).
+    let note = if server.vault().is_read_only() {
+        get(get_note)
+    } else {
+        get(get_note).put(put_note)
+    };
     Router::new()
         .route("/api/notes", get(get_collection))
         .route(
             "/api/notes/{*path}",
-            get(get_note)
-                .put(put_note)
-                // MCP's write limit, not axum's default 2 MiB: a note one
-                // surface accepts, the other must not refuse.
-                .layer(DefaultBodyLimit::max(MAX_WRITE_BYTES)),
+            // MCP's write limit, not axum's default 2 MiB: a note one surface
+            // accepts, the other must not refuse.
+            note.layer(DefaultBodyLimit::max(MAX_WRITE_BYTES)),
         )
         // A compressing intermediary re-encodes the body and weakens the
         // ETag to W/"...", which then satisfies no if-match. The bytes and
@@ -469,6 +473,7 @@ fn core_status(error: &md_core::Error) -> (StatusCode, String) {
     let status = match error.code {
         Code::NotFound => StatusCode::NOT_FOUND,
         Code::Conflict => StatusCode::CONFLICT,
+        Code::ReadOnly => StatusCode::METHOD_NOT_ALLOWED,
         _ => StatusCode::BAD_REQUEST,
     };
     (status, format!("{}\n", error.message))

@@ -58,6 +58,11 @@ impl MdServer {
     /// Build a server over an opened vault.
     #[must_use]
     pub fn new(vault: Vault) -> Self {
+        let tool_router = if vault.is_read_only() {
+            Self::read_only_router()
+        } else {
+            Self::base_router()
+        };
         Self {
             vault: Arc::new(vault),
             lock: Arc::new(RwLock::new(())),
@@ -67,7 +72,7 @@ impl MdServer {
             push_tx: None,
             sync_health: Arc::new(std::sync::Mutex::new(None)),
             intro_note: None,
-            tool_router: Self::base_router(),
+            tool_router,
         }
     }
 
@@ -82,7 +87,7 @@ impl MdServer {
     #[must_use]
     pub fn with_git_sync(mut self, git: sync::GitSync) -> Self {
         self.git = Some(Arc::new(git));
-        self.tool_router = Self::base_router() + Self::sync_router();
+        self.tool_router = self.tool_router.clone() + Self::sync_router();
         self
     }
 
@@ -298,6 +303,11 @@ impl MdServer {
     pub(crate) fn base_router() -> ToolRouter<Self> {
         Self::read_router() + Self::write_router() + Self::organize_router() + Self::search_router()
     }
+
+    /// The tool families a read-only vault offers (ADR-0030).
+    pub(crate) fn read_only_router() -> ToolRouter<Self> {
+        Self::read_router() + Self::search_router()
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -320,13 +330,21 @@ impl ServerHandler for MdServer {
              or \"IO\". Notes over ~10 KB (size_bytes in \
              list_notes) are cheaper section-wise: read_outlines first, then \
              read_sections for the sections you need; read smaller notes whole via \
-             read_notes. Destructive batches are all-or-nothing. These tools are \
-             how work here is normally done; when a note is too large to pull \
-             through context, or a job is repetitive enough that a shell script \
-             would plainly beat them, provision_transfer opens a byte-level HTTP \
-             surface for that instead."
+             read_notes. "
         )
         .to_string();
+        instructions.push_str(if self.vault.is_read_only() {
+            "This vault is read-only: notes can be read and searched but not \
+             changed, and any write is refused (READ_ONLY). "
+        } else {
+            "Destructive batches are all-or-nothing. "
+        });
+        instructions.push_str(
+            "These tools are how work here is normally done; when a note is too \
+             large to pull through context, or a job is repetitive enough that a \
+             shell script would plainly beat them, provision_transfer opens a \
+             byte-level HTTP surface for that instead.",
+        );
         if let Some(intro) = &self.intro_note {
             let intro =
                 serde_json::to_string(&vault_path::VaultPath::from_rel(intro)).unwrap_or_default();
@@ -350,6 +368,40 @@ mod tests {
         // Keep the temp dir alive for the test's lifetime by leaking it.
         std::mem::forget(dir);
         MdServer::new(vault)
+    }
+
+    fn read_only_server() -> MdServer {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open_read_only(dir.path()).unwrap();
+        std::mem::forget(dir);
+        MdServer::new(vault)
+    }
+
+    #[test]
+    fn a_read_only_server_advertises_only_the_read_tools() {
+        let tools = read_only_server().tool_router.list_all();
+        let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "list_notes",
+                "read_notes",
+                "read_outlines",
+                "read_sections",
+                "search_notes"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_read_only_server_says_so_in_its_instructions() {
+        let text = read_only_server()
+            .get_info()
+            .instructions
+            .unwrap_or_default();
+        assert!(text.contains("read-only"), "got: {text}");
+        assert!(!text.contains("Destructive batches"), "got: {text}");
     }
 
     #[test]

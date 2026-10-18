@@ -94,6 +94,12 @@ impl MdServer {
         Parameters(req): Parameters<ProvisionTransferRequest>,
         Extension(parts): Extension<Parts>,
     ) -> Result<Json<ProvisionTransferResponse>, ErrorData> {
+        if req.write && self.vault().is_read_only() {
+            return Err(ErrorData::invalid_params(
+                "this vault is read-only; a transfer grant can only read",
+                None,
+            ));
+        }
         // The authorization server is put here by the bearer guard, so its
         // absence means the deployment has no token configured and there is no
         // authority to delegate.
@@ -218,7 +224,30 @@ fn recipe(base: &str, redeem: &str, code: &str, write: bool, note: Option<&str>)
 
 #[cfg(test)]
 mod tests {
-    use super::{recipe, token_file};
+    use super::{ProvisionTransferRequest, recipe, token_file};
+    use crate::MdServer;
+    use rmcp::handler::server::tool::Extension;
+    use rmcp::handler::server::wrapper::Parameters;
+
+    #[tokio::test]
+    async fn a_read_only_vault_grants_no_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MdServer::new(md_core::Vault::open_read_only(dir.path()).unwrap());
+        let parts = axum::http::Request::new(()).into_parts().0;
+        let Err(err) = server
+            .provision_transfer(
+                Parameters(ProvisionTransferRequest {
+                    write: true,
+                    prefix: None,
+                }),
+                Extension(parts),
+            )
+            .await
+        else {
+            panic!("a read-only vault must not grant write");
+        };
+        assert!(err.message.contains("read-only"), "got: {}", err.message);
+    }
 
     fn lines(write: bool, note: Option<&str>) -> Vec<String> {
         lines_for("TICKET", write, note)
