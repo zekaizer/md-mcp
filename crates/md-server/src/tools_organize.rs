@@ -439,6 +439,27 @@ impl MdServer {
                 Err(e) => errors.push(ApiError::at(i, &e)),
             }
         }
+        if !overwrite {
+            // The disk check above misses a destination that a directory
+            // moved by this same batch will already occupy on arrival.
+            for (i, _, to) in &pairs {
+                let carried = pairs.iter().any(|(_, dir_from, dir_to)| {
+                    contains_strict(dir_to, to) && {
+                        let under = &nfc_key(to)[nfc_key(dir_to).len()..];
+                        self.vault()
+                            .exists(&format!("{}{under}", strip_slash(dir_from)))
+                            .unwrap_or(false)
+                    }
+                });
+                if carried {
+                    errors.push(err(
+                        *i,
+                        Code::Conflict,
+                        format!("destination already exists: {to}"),
+                    ));
+                }
+            }
+        }
         self.finish_move(
             "move_notes",
             pairs,
@@ -783,6 +804,29 @@ mod tests {
             vault.write_atomic(p, b.as_bytes()).unwrap();
         }
         (dir, MdServer::new(vault))
+    }
+
+    #[tokio::test]
+    async fn a_move_into_a_directory_moved_in_the_same_batch_sees_its_contents() {
+        let (dir, s) = server(&[("x/z.md", "inner"), ("z.md", "top")]);
+        let req = serde_json::from_value(serde_json::json!({
+            "moves": [
+                {"source": ["x"], "dest": ["y"]},
+                {"source": ["z.md"], "into": ["y"]}
+            ],
+            "overwrite": false
+        }))
+        .unwrap();
+
+        let r = s.move_notes(Parameters(req)).await.unwrap().0;
+
+        assert!(!r.ok, "y/z.md is taken by what x brings along");
+        assert_eq!(r.errors[0].code, "CONFLICT");
+        assert_eq!(r.errors[0].index, Some(1));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("x/z.md")).unwrap(),
+            "inner"
+        );
     }
 
     #[test]
