@@ -99,6 +99,9 @@ OAuth handshake and breaks the claude.ai connector (ADR-0014).
     --header "Authorization: Bearer <MD_HTTP_TOKEN>"
   ```
 
+A person can open a read-only vault in Obsidian through a kernel-enforced
+read-only view: see [obsidian-view.md](obsidian-view.md).
+
 ## 6. Verify
 
 ```sh

@@ -92,6 +92,8 @@ fast-forward only — at startup, every `MD_GIT_SYNC_INTERVAL_SECS`, and on
 `MD_GIT_AUTO_PUSH_SECS` are refused alongside it. To serve several vaults, run
 one instance per vault, each with its own env file and hostname. Serving one
 directory from a read-write and a read-only instance at once is unsupported.
+To open a read-only vault in Obsidian without making it editable, see
+[deploy/obsidian-view.md](deploy/obsidian-view.md).
 
 ## Configuration
 
