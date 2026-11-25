@@ -264,18 +264,24 @@ impl GitSync {
         // "pathspec did not match any files" and aborts the *whole* batch. Keep
         // only paths git can stage — present in the worktree (creates/edits) or
         // tracked in the index (deletions) — so one vanished path never sinks a
-        // real change in the same batch.
+        // real change in the same batch. The same goes for an untracked path
+        // the repository ignores, which `git add` refuses outright.
         let mut addable: Vec<&str> = Vec::new();
         for p in paths {
-            let in_worktree = self.root.join(p).exists();
-            let tracked = in_worktree
-                || !self
-                    .run(&["ls-files", "--", p])
-                    .await
-                    .unwrap_or_default()
-                    .trim()
-                    .is_empty();
-            if tracked {
+            let tracked = !self
+                .run(&["ls-files", "--", p])
+                .await
+                .unwrap_or_default()
+                .trim()
+                .is_empty();
+            let stageable = tracked
+                || (self.root.join(p).exists()
+                    && self
+                        .run(&["ls-files", "-o", "-i", "--exclude-standard", "--", p])
+                        .await?
+                        .trim()
+                        .is_empty());
+            if stageable {
                 addable.push(p.as_str());
             }
         }
@@ -623,6 +629,28 @@ mod tests {
         git.run(&["config", "user.email", "t@t"]).await.unwrap();
         git.run(&["config", "user.name", "t"]).await.unwrap();
         git
+    }
+
+    #[tokio::test]
+    async fn commit_paths_skips_an_ignored_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = init_repo(dir.path()).await;
+        std::fs::write(dir.path().join(".gitignore"), "drafts/\n").unwrap();
+        git.run(&["add", "-A"]).await.unwrap();
+        git.run(&["commit", "-qm", "init"]).await.unwrap();
+
+        std::fs::create_dir(dir.path().join("drafts")).unwrap();
+        std::fs::write(dir.path().join("drafts/a.md"), "ignored").unwrap();
+        std::fs::write(dir.path().join("b.md"), "kept").unwrap();
+        let created = git
+            .commit_paths(
+                "mcp(create_notes): 2 notes",
+                &["drafts/a.md".into(), "b.md".into()],
+            )
+            .await
+            .expect("an ignored path must not fail the whole commit");
+
+        assert!(created);
     }
 
     #[tokio::test]
