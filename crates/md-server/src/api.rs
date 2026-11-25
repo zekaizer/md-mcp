@@ -350,6 +350,7 @@ async fn put_note(
     }
 
     let created = current.is_none();
+    let path = server.stored_path(path);
     let ops = [if created {
         EventOp::Create { path: path.clone() }
     } else {

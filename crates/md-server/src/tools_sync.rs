@@ -441,6 +441,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_commit_stages_an_nfd_note_addressed_in_nfc() {
+        let (_root, vault_dir, _clone) = repo_fixture();
+        git(&vault_dir, &["config", "core.precomposeunicode", "false"]);
+        let nfd = "\u{1112}\u{1161}\u{11ab}.md";
+        std::fs::write(vault_dir.join(nfd), "old\n").unwrap();
+        git(&vault_dir, &["add", "-A"]);
+        git(&vault_dir, &["commit", "-m", "nfd note"]);
+
+        let s = server_with_sync(&vault_dir).await.with_auto_commit();
+        let req = serde_json::from_value(serde_json::json!({
+            "appends": [{"path": ["\u{d55c}.md"], "content": "more\n"}]
+        }))
+        .unwrap();
+        s.append_notes(Parameters(req)).await.unwrap();
+
+        let dirty = Command::new("git")
+            .args(["status", "--porcelain", "--", nfd])
+            .current_dir(&vault_dir)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&dirty.stdout), "");
+    }
+
+    #[tokio::test]
     async fn auto_commit_is_per_batch_and_path_scoped() {
         let (_root, vault_dir, _clone) = repo_fixture();
         // A concurrent external edit that must never be swept into an

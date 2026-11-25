@@ -512,7 +512,9 @@ impl MdServer {
             .iter()
             .filter(|c| c.created)
             .filter_map(|c| c.path.rel().ok())
-            .map(|path| EventOp::Create { path })
+            .map(|path| EventOp::Create {
+                path: self.stored_path(path),
+            })
             .collect();
         for op in &ops {
             self.emit_event("create_notes", None, std::slice::from_ref(op));
@@ -544,7 +546,9 @@ impl MdServer {
         for item in &req.appends {
             let result = self.append_one(item);
             if let (true, Ok(path)) = (result.appended, result.path.rel()) {
-                let op = EventOp::Write { path };
+                let op = EventOp::Write {
+                    path: self.stored_path(path),
+                };
                 self.emit_event("append_notes", None, std::slice::from_ref(&op));
                 ops.push(op);
             }
