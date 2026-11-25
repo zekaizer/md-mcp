@@ -54,6 +54,9 @@ const STATE_VERSION: u32 = 1;
 /// registration to keep an internet-reachable endpoint from growing the file without end.
 const MAX_CLIENTS: usize = 50;
 const MAX_REDIRECT_URIS: usize = 8;
+/// Without this the two caps above bound a count, not the file: one
+/// registration could persist as many bytes as the request body allows.
+const MAX_REDIRECT_URI_BYTES: usize = 2048;
 
 /// On-disk, persisted across restarts. Bearer material at rest — see [`create_private`]
 /// for how the file is kept owner-only.
@@ -329,16 +332,13 @@ impl OAuthState {
 
     /// Rotate a refresh token for a fresh access/refresh pair, carrying `client_id` forward.
     fn refresh(&self, refresh_token: &str) -> Option<TokenResponse> {
-        let client_id = {
-            let mut store = self.store.lock().unwrap();
-            let rec = store.refresh.remove(refresh_token)?;
-            if rec.expires_at <= now_secs() {
-                self.persist();
-                return None;
-            }
-            rec.client_id
-        };
-        Some(self.issue_tokens(client_id))
+        // The guard is a temporary: `persist` takes the same lock.
+        let rec = self.store.lock().unwrap().refresh.remove(refresh_token)?;
+        if rec.expires_at <= now_secs() {
+            self.persist();
+            return None;
+        }
+        Some(self.issue_tokens(rec.client_id))
     }
 
     /// A one-time ticket that trades for a transfer token, so the credential
@@ -524,8 +524,14 @@ async fn register(
         );
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri");
     }
-    if !req.redirect_uris.iter().all(|u| is_absolute_http(u)) {
-        tracing::warn!("oauth: client registration rejected (non-http(s) redirect_uri)");
+    if !req
+        .redirect_uris
+        .iter()
+        .all(|u| u.len() <= MAX_REDIRECT_URI_BYTES && is_absolute_http(u))
+    {
+        tracing::warn!(
+            "oauth: client registration rejected (non-http(s) or oversized redirect_uri)"
+        );
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri");
     }
     let client_id = oauth.register_client(req.redirect_uris.clone());
@@ -924,6 +930,29 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn an_expired_refresh_token_is_refused_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let oauth = OAuthState::load("static-token".to_string(), dir.path().join("s.json"));
+        oauth.store.lock().unwrap().refresh.insert(
+            "expired".to_string(),
+            TokenRec {
+                expires_at: now_secs() - 1,
+                scopes: Scopes::full(),
+                client_id: None,
+            },
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = oauth.clone();
+        std::thread::spawn(move || tx.send(worker.refresh("expired").is_none()));
+
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("refresh() must return, not deadlock on the store lock");
+        assert!(refused);
     }
 
     #[test]

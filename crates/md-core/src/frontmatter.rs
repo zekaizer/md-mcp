@@ -233,7 +233,13 @@ fn is_top_level_key(line: &str, key: &str) -> bool {
         }
         return false;
     }
-    let Some(colon) = line.find(':') else {
+    // A plain key ends at the first `:` followed by whitespace or the line's
+    // end; a `:` followed by anything else is part of the key (`dc:title`).
+    let Some(colon) = line
+        .match_indices(':')
+        .map(|(i, _)| i)
+        .find(|&i| line[i + 1..].chars().next().is_none_or(char::is_whitespace))
+    else {
         return false;
     };
     nfc(line[..colon].trim()) == nfc(key)
@@ -329,6 +335,20 @@ fn verify_remove(original: &str, result: &str, key: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_key_holding_a_colon_is_its_own_key() {
+        let src = "---\ndc:title: Foo\nother: 1\n---\nbody\n";
+
+        assert_eq!(
+            set_property(src, "dc", &json!("x")).unwrap(),
+            "---\ndc:title: Foo\nother: 1\ndc: x\n---\nbody\n"
+        );
+        assert_eq!(
+            set_property(src, "dc:title", &json!("Bar")).unwrap(),
+            "---\n\"dc:title\": Bar\nother: 1\n---\nbody\n"
+        );
+    }
 
     // --- parse --------------------------------------------------------------
 

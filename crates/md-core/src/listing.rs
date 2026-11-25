@@ -44,13 +44,17 @@ impl Vault {
         include_dirs: bool,
     ) -> Result<Vec<Entry>> {
         let base = directory.strip_suffix('/').unwrap_or(directory);
-        if !base.is_empty() {
-            Vault::validate_rel(base)?;
+        let resolved;
+        let base = if base.is_empty() {
+            base
+        } else {
             // The internal state directory is never listed, even if named directly.
             if Vault::is_internal_path(base) || !self.exists(base)? {
                 return Ok(Vec::new());
             }
-        }
+            resolved = self.resolve_rel(base)?;
+            &resolved
+        };
 
         let matcher = match glob {
             Some(pat) => {
@@ -201,6 +205,20 @@ mod tests {
 
     fn paths(entries: &[Entry]) -> Vec<&str> {
         entries.iter().map(|e| e.path.as_str()).collect()
+    }
+
+    #[test]
+    fn a_directory_stored_in_nfd_lists_under_its_nfc_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let nfd = "\u{1112}\u{1161}\u{11ab}";
+        std::fs::create_dir(dir.path().join(nfd)).unwrap();
+        std::fs::write(dir.path().join(nfd).join("a.md"), "x").unwrap();
+
+        let entries = vault.list_entries("\u{d55c}", false, None, false).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, format!("{nfd}/a.md"));
     }
 
     #[test]

@@ -297,10 +297,11 @@ impl Vault {
     }
 
     /// Read a note's raw text (as stored on disk, UTF-8). The internal state
-    /// directory is hidden — reading inside it reports the note as absent.
+    /// directory is hidden, and a file that is not a note is not one to read —
+    /// either reports the note as absent.
     pub fn read_note(&self, rel: &str) -> Result<String> {
         let clean = self.resolve_rel(rel)?;
-        if Self::is_internal_path(rel) {
+        if Self::is_internal_path(rel) || !Self::is_note_path(&clean) {
             return Err(Error::not_found(format!("note not found: {rel}")));
         }
         self.root
@@ -338,8 +339,15 @@ impl Vault {
                 format!("a note path must not end with '/': {rel}"),
             ));
         }
-        let clean = self.resolve_rel(rel)?;
-        let clean_path = Path::new(&clean);
+        self.write_resolved(&self.resolve_rel(rel)?, bytes)
+    }
+
+    /// [`Self::write_atomic`] for a path already in its on-disk spelling.
+    /// Resolving again would respell it when the file is momentarily absent,
+    /// as it is between a transaction's backup and its write.
+    pub(crate) fn write_resolved(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        let clean = rel;
+        let clean_path = Path::new(clean);
         let name = clean_path
             .file_name()
             .ok_or_else(|| Error::traversal(format!("path has no file name: {rel}")))?;
@@ -380,7 +388,7 @@ impl Vault {
             .map_err(|e| Error::io(format!("fsync temp for {rel}: {e}")))?;
         tmp.replace(name)
             .map_err(|e| Error::io(format!("commit {rel}: {e}")))?;
-        self.fsync_parent(&clean);
+        self.fsync_parent(clean);
         Ok(())
     }
 
@@ -442,6 +450,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = Vault::open(dir.path()).unwrap();
         (dir, vault)
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_note_does_not_read_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join(".obsidian")).unwrap();
+        std::fs::write(dir.path().join(".obsidian/app.json"), b"{}").unwrap();
+
+        let err = vault.read_note(".obsidian/app.json").unwrap_err();
+
+        assert_eq!(err.code, Code::NotFound);
     }
 
     #[test]

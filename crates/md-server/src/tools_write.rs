@@ -512,7 +512,9 @@ impl MdServer {
             .iter()
             .filter(|c| c.created)
             .filter_map(|c| c.path.rel().ok())
-            .map(|path| EventOp::Create { path })
+            .map(|path| EventOp::Create {
+                path: self.stored_path(path),
+            })
             .collect();
         for op in &ops {
             self.emit_event("create_notes", None, std::slice::from_ref(op));
@@ -544,7 +546,9 @@ impl MdServer {
         for item in &req.appends {
             let result = self.append_one(item);
             if let (true, Ok(path)) = (result.appended, result.path.rel()) {
-                let op = EventOp::Write { path };
+                let op = EventOp::Write {
+                    path: self.stored_path(path),
+                };
                 self.emit_event("append_notes", None, std::slice::from_ref(&op));
                 ops.push(op);
             }
@@ -630,15 +634,11 @@ impl MdServer {
                 };
             }
         };
-        if md_core::Vault::is_internal_path(&rel) {
+        if let Err(e) = md_core::Vault::validate_note_rel(&rel) {
             return AppendResult {
                 path: item.path.clone(),
                 appended: false,
-                error: Some(ApiError {
-                    code: Code::Traversal.as_str().to_string(),
-                    message: "cannot target a protected directory".to_string(),
-                    index: None,
-                }),
+                error: Some(ApiError::from_core(&e)),
             };
         }
         let base = match self.vault().read_note(&rel) {
@@ -681,9 +681,9 @@ impl MdServer {
 
     async fn run_edit_sections(&self, edits: &[EditItem]) -> EditSectionsResponse {
         // Group edits by path, keeping each edit's global index.
-        let mut by_path: BTreeMap<&VaultPath, Vec<(usize, &EditItem)>> = BTreeMap::new();
+        let mut by_path: BTreeMap<VaultPath, Vec<(usize, &EditItem)>> = BTreeMap::new();
         for (i, e) in edits.iter().enumerate() {
-            by_path.entry(&e.path).or_default().push((i, e));
+            by_path.entry(e.path.nfc()).or_default().push((i, e));
         }
 
         let mut errors: Vec<ApiError> = Vec::new();
@@ -788,9 +788,9 @@ impl MdServer {
     async fn run_replace_text(&self, items: &[ReplaceItem], dry_run: bool) -> ReplaceTextResponse {
         // Group by path, keeping each item's global index: one note is read,
         // rewritten, and written once however many items target it.
-        let mut by_path: BTreeMap<&VaultPath, Vec<(usize, &ReplaceItem)>> = BTreeMap::new();
+        let mut by_path: BTreeMap<VaultPath, Vec<(usize, &ReplaceItem)>> = BTreeMap::new();
         for (i, it) in items.iter().enumerate() {
-            by_path.entry(&it.path).or_default().push((i, it));
+            by_path.entry(it.path.nfc()).or_default().push((i, it));
         }
 
         let mut errors: Vec<ApiError> = Vec::new();
@@ -897,9 +897,9 @@ impl MdServer {
 
     async fn run_edit_properties(&self, edits: &[PropertyEdit]) -> EditPropertiesResponse {
         // Apply per path in order, accumulating into one new content per path.
-        let mut by_path: BTreeMap<&VaultPath, Vec<(usize, &PropertyEdit)>> = BTreeMap::new();
+        let mut by_path: BTreeMap<VaultPath, Vec<(usize, &PropertyEdit)>> = BTreeMap::new();
         for (i, e) in edits.iter().enumerate() {
-            by_path.entry(&e.path).or_default().push((i, e));
+            by_path.entry(e.path.nfc()).or_default().push((i, e));
         }
 
         let mut errors: Vec<ApiError> = Vec::new();
@@ -1012,6 +1012,54 @@ mod tests {
             vault.write_atomic(p, b.as_bytes()).unwrap();
         }
         (dir, MdServer::new(vault))
+    }
+
+    #[tokio::test]
+    async fn append_refuses_a_path_that_is_not_a_note() {
+        let (dir, s) = server(&[]);
+        let req = serde_json::from_value(json!({"appends": [
+            {"path": ["run.sh"], "content": "echo\n", "create_if_missing": true}
+        ]}))
+        .unwrap();
+
+        let r = s.append_notes(Parameters(req)).await.unwrap().0;
+
+        assert_eq!(r.appended[0].error.as_ref().unwrap().code, "SUFFIX");
+        assert!(!dir.path().join("run.sh").exists());
+    }
+
+    #[tokio::test]
+    async fn two_spellings_of_one_note_in_a_batch_are_one_note() {
+        let nfc = "\u{d55c}.md";
+        let nfd = "\u{1112}\u{1161}\u{11ab}.md";
+        let read = |dir: &tempfile::TempDir| std::fs::read_to_string(dir.path().join(nfc)).unwrap();
+
+        let (dir, s) = server(&[(nfc, "# A\none\n\n# B\ntwo\n")]);
+        let req = serde_json::from_value(json!({"edits": [
+            {"path": [nfc], "heading_path": ["A"], "operation": "replace", "content": "new A\n"},
+            {"path": [nfd], "heading_path": ["B"], "operation": "replace", "content": "new B\n"}
+        ]}))
+        .unwrap();
+        assert!(s.edit_sections(Parameters(req)).await.unwrap().0.ok);
+        assert_eq!(read(&dir), "# A\nnew A\n\n# B\nnew B\n");
+
+        let (dir, s) = server(&[(nfc, "alpha beta\n")]);
+        let req = serde_json::from_value(json!({"replaces": [
+            {"path": [nfc], "find": "alpha", "replace": "ALPHA"},
+            {"path": [nfd], "find": "beta", "replace": "BETA"}
+        ]}))
+        .unwrap();
+        assert!(s.replace_text(Parameters(req)).await.unwrap().0.ok);
+        assert_eq!(read(&dir), "ALPHA BETA\n");
+
+        let (dir, s) = server(&[(nfc, "body\n")]);
+        let req = serde_json::from_value(json!({"edits": [
+            {"path": [nfc], "key": "a", "value": 1},
+            {"path": [nfd], "key": "b", "value": 2}
+        ]}))
+        .unwrap();
+        assert!(s.edit_properties(Parameters(req)).await.unwrap().0.ok);
+        assert_eq!(read(&dir), "---\na: 1\nb: 2\n---\nbody\n");
     }
 
     #[test]

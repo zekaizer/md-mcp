@@ -439,6 +439,27 @@ impl MdServer {
                 Err(e) => errors.push(ApiError::at(i, &e)),
             }
         }
+        if !overwrite {
+            // The disk check above misses a destination that a directory
+            // moved by this same batch will already occupy on arrival.
+            for (i, _, to) in &pairs {
+                let carried = pairs.iter().any(|(_, dir_from, dir_to)| {
+                    contains_strict(dir_to, to) && {
+                        let under = &nfc_key(to)[nfc_key(dir_to).len()..];
+                        self.vault()
+                            .exists(&format!("{}{under}", strip_slash(dir_from)))
+                            .unwrap_or(false)
+                    }
+                });
+                if carried {
+                    errors.push(err(
+                        *i,
+                        Code::Conflict,
+                        format!("destination already exists: {to}"),
+                    ));
+                }
+            }
+        }
         self.finish_move(
             "move_notes",
             pairs,
@@ -697,21 +718,20 @@ impl MdServer {
                 .map(|(_, f, t)| (f.clone(), t.clone()))
                 .collect::<Vec<_>>(),
         );
-        // Pre-filter needles: a link to a moved path must spell its basename,
-        // raw or with the common %20 space encoding. Moved notes themselves
-        // bypass this (their own outbound links can point anywhere).
+        // Pre-filter: a link to a moved path spells its basename, unless an
+        // encoding hides it — any `%` or `\\` could be one, so those notes are
+        // parsed rather than guessed at. Moved notes themselves bypass this
+        // (their own outbound links can point anywhere).
         let needles: Vec<String> = pairs
             .iter()
-            .flat_map(|(_, from, _)| {
-                let base = basename(from).to_string();
-                let encoded = base.replace(' ', "%20");
-                if encoded == base {
-                    vec![base]
-                } else {
-                    vec![base, encoded]
-                }
-            })
+            .map(|(_, from, _)| nfc_key(basename(from)))
             .collect();
+        let may_link = |source: &str| {
+            source.contains(['%', '\\']) || {
+                let composed = md_core::text::nfc(source);
+                needles.iter().any(|n| composed.contains(n.as_str()))
+            }
+        };
 
         let entries = match self.vault().list_entries("", true, None, false) {
             Ok(e) => e,
@@ -737,14 +757,18 @@ impl MdServer {
             if !(source.contains("](") || source.contains("]:")) {
                 continue;
             }
-            if old_path == new_path && !needles.iter().any(|n| source.contains(n.as_str())) {
+            if old_path == new_path && !may_link(&source) {
                 continue;
             }
             candidates += 1;
             // Links live in the body; frontmatter is never rewritten.
-            let body_start = md_core::Document::parse(&source)
-                .frontmatter
-                .map_or(0, |s| s.end);
+            // A BOM ahead of the fence would hide the frontmatter from the
+            // parser, which reads the text as the vault normalizes it.
+            let bom = source.len() - source.trim_start_matches('\u{feff}').len();
+            let body_start = bom
+                + md_core::Document::parse(&source[bom..])
+                    .frontmatter
+                    .map_or(0, |s| s.end);
             let Some(new_body) =
                 md_core::rewrite_body(&source[body_start..], &old_path, &new_path, &map)
             else {
@@ -783,6 +807,29 @@ mod tests {
             vault.write_atomic(p, b.as_bytes()).unwrap();
         }
         (dir, MdServer::new(vault))
+    }
+
+    #[tokio::test]
+    async fn a_move_into_a_directory_moved_in_the_same_batch_sees_its_contents() {
+        let (dir, s) = server(&[("x/z.md", "inner"), ("z.md", "top")]);
+        let req = serde_json::from_value(serde_json::json!({
+            "moves": [
+                {"source": ["x"], "dest": ["y"]},
+                {"source": ["z.md"], "into": ["y"]}
+            ],
+            "overwrite": false
+        }))
+        .unwrap();
+
+        let r = s.move_notes(Parameters(req)).await.unwrap().0;
+
+        assert!(!r.ok, "y/z.md is taken by what x brings along");
+        assert_eq!(r.errors[0].code, "CONFLICT");
+        assert_eq!(r.errors[0].index, Some(1));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("x/z.md")).unwrap(),
+            "inner"
+        );
     }
 
     #[test]
@@ -1409,6 +1456,46 @@ mod tests {
         assert_eq!(
             s.vault().read_note("other.md").unwrap(),
             "no links to the target"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_links_finds_a_link_however_its_name_is_encoded() {
+        let nfc = "\u{d68c}\u{c758}.md";
+        let nfd: String = "\u{1112}\u{116c}\u{110b}\u{1174}.md".into();
+        let (_d, s) = server(&[
+            (nfc, "# T"),
+            ("a (1).md", "# T"),
+            ("pct.md", "[a](%ED%9A%8C%EC%9D%98.md)"),
+            ("nfd.md", &format!("[a]({nfd})")),
+            ("paren.md", "[b](a%20%281%29.md)"),
+        ]);
+
+        let r = move_linked(&s, nfc, "sub/", false).await;
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(r.relinked, ["nfd.md", "pct.md"]);
+
+        let r = move_linked(&s, "a (1).md", "sub/", false).await;
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(r.relinked, ["paren.md"]);
+        assert_eq!(
+            s.vault().read_note("paren.md").unwrap(),
+            "[b](sub/a%20%281%29.md)"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_links_leaves_frontmatter_alone_behind_a_bom() {
+        let (dir, s) = server(&[("target.md", "# T")]);
+        let with_bom = "\u{feff}---\nrelated: \"[t](target.md)\"\n---\n[t](target.md)\n";
+        std::fs::write(dir.path().join("linker.md"), with_bom).unwrap();
+
+        let r = move_linked(&s, "target.md", "sub/", false).await;
+
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("linker.md")).unwrap(),
+            "\u{feff}---\nrelated: \"[t](target.md)\"\n---\n[t](sub/target.md)\n"
         );
     }
 

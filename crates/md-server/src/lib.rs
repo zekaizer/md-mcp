@@ -205,6 +205,13 @@ impl MdServer {
         })
     }
 
+    /// The on-disk spelling of a path a tool just wrote. Events and git
+    /// pathspecs name the file as stored, which an NFC request for a note
+    /// synced in NFD is not.
+    pub(crate) fn stored_path(&self, rel: String) -> String {
+        self.vault().resolve_rel(&rel).unwrap_or(rel)
+    }
+
     /// Record a successful mutation in the event journal, if one is attached.
     /// Emission is best-effort: a journal failure is logged, never surfaced —
     /// the vault write has already durably committed.

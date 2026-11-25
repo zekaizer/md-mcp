@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::error::{Code, Error, Result};
 use crate::vault::Vault;
 
 const JOURNAL_DIR: &str = ".md-mcp/journal";
@@ -79,7 +79,8 @@ impl Vault {
     /// Apply a batch of ops atomically. On any failure nothing is left changed.
     pub fn commit_batch(&self, ops: &[Op]) -> Result<CommitReceipt> {
         self.ensure_writable()?;
-        // Agent ops may never target the internal `.md-mcp/` state directory.
+        // Agent ops may never target the internal `.md-mcp/` state directory,
+        // and what they write is a note.
         for op in ops {
             let paths: Vec<&str> = match op {
                 Op::Write { path, .. } | Op::Delete { path } => vec![path.as_str()],
@@ -91,6 +92,14 @@ impl Vault {
                         "cannot target a protected directory: {p}"
                     )));
                 }
+            }
+            if let Op::Write { path, .. } = op
+                && !Self::is_note_path(path)
+            {
+                return Err(Error::new(
+                    Code::Suffix,
+                    format!("not a Markdown note (only .md files): {path}"),
+                ));
             }
         }
 
@@ -275,7 +284,7 @@ impl Vault {
                     });
                     self.write_journal(journal_path, journal)?;
                 }
-                self.write_atomic(path, content)?;
+                self.write_resolved(path, content)?;
                 Ok(OpOutcome::Written {
                     path: path.to_string(),
                 })
@@ -437,6 +446,71 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = Vault::open(dir.path()).unwrap();
         (dir, vault)
+    }
+
+    fn md_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".md"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_batch_write_refuses_a_path_that_is_not_a_note() {
+        let (dir, vault) = temp_vault();
+        std::fs::write(dir.path().join("app.json"), b"{}").unwrap();
+
+        let err = vault
+            .commit_batch(&[Op::Write {
+                path: "app.json".into(),
+                content: b"x".to_vec(),
+            }])
+            .unwrap_err();
+
+        assert_eq!(err.code, Code::Suffix);
+        assert_eq!(std::fs::read(dir.path().join("app.json")).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn a_batch_write_keeps_the_stored_spelling_of_an_nfd_note() {
+        let (dir, vault) = temp_vault();
+        let nfd = "\u{1112}\u{1161}\u{11ab}.md";
+        let nfc = "\u{d55c}.md";
+        std::fs::write(dir.path().join(nfd), b"old").unwrap();
+
+        vault
+            .commit_batch(&[Op::Write {
+                path: nfc.into(),
+                content: b"new".to_vec(),
+            }])
+            .unwrap();
+
+        assert_eq!(md_names(dir.path()), [nfd]);
+        assert_eq!(std::fs::read(dir.path().join(nfd)).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_rolled_back_write_to_an_nfd_note_leaves_one_file() {
+        let (dir, vault) = temp_vault();
+        let nfd = "\u{1112}\u{1161}\u{11ab}.md";
+        std::fs::write(dir.path().join(nfd), b"old").unwrap();
+
+        let failed = vault.commit_batch(&[
+            Op::Write {
+                path: "\u{d55c}.md".into(),
+                content: b"new".to_vec(),
+            },
+            Op::Delete {
+                path: "missing.md".into(),
+            },
+        ]);
+
+        assert!(failed.is_err());
+        assert_eq!(md_names(dir.path()), [nfd]);
+        assert_eq!(std::fs::read(dir.path().join(nfd)).unwrap(), b"old");
     }
 
     #[test]

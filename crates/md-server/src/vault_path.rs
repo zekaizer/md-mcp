@@ -29,6 +29,18 @@ impl VaultPath {
         Self(md_core::split_rel(rel))
     }
 
+    /// The key two spellings of one path share: a batch that names a note in
+    /// both NFC and NFD addresses one note (tool_spec §4).
+    #[must_use]
+    pub fn nfc(&self) -> Self {
+        Self(
+            self.0
+                .iter()
+                .map(|seg| md_core::text::nfc(seg).into_owned())
+                .collect(),
+        )
+    }
+
     #[must_use]
     pub fn is_root(&self) -> bool {
         self.0.is_empty()

@@ -68,14 +68,21 @@ pub fn extract_links(body: &str) -> Vec<LinkOccurrence> {
         }
     }
 
-    scan_inline(body, &mask, 0..body.len(), &mut out);
+    let closers = bracket_closers(body, &mask);
+    scan_inline(body, &mask, &closers, 0..body.len(), &mut out);
     out.sort_by_key(|o| o.span.start);
     out
 }
 
 /// Scan `range` for inline links/images, recursing into link text so a nested
 /// image (`[![alt](img)](page)`) is emitted too.
-fn scan_inline(src: &str, mask: &[bool], range: Range<usize>, out: &mut Vec<LinkOccurrence>) {
+fn scan_inline(
+    src: &str,
+    mask: &[bool],
+    closers: &Closers,
+    range: Range<usize>,
+    out: &mut Vec<LinkOccurrence>,
+) {
     let b = src.as_bytes();
     let mut i = range.start;
     while i < range.end {
@@ -86,20 +93,21 @@ fn scan_inline(src: &str, mask: &[bool], range: Range<usize>, out: &mut Vec<Link
         match b[i] {
             b'\\' => i += 2,
             b'!' if i + 1 < range.end && b[i + 1] == b'[' && !mask[i + 1] => {
-                if let Some((occ, text)) = parse_inline_at(src, mask, i + 1, i, LinkKind::Image) {
+                if let Some((occ, text)) = parse_inline_at(src, closers, i + 1, i, LinkKind::Image)
+                {
                     let end = occ.span.end;
                     out.push(occ);
-                    scan_inline(src, mask, text, out);
+                    scan_inline(src, mask, closers, text, out);
                     i = end;
                 } else {
                     i += 2;
                 }
             }
             b'[' => {
-                if let Some((occ, text)) = parse_inline_at(src, mask, i, i, LinkKind::Inline) {
+                if let Some((occ, text)) = parse_inline_at(src, closers, i, i, LinkKind::Inline) {
                     let end = occ.span.end;
                     out.push(occ);
-                    scan_inline(src, mask, text, out);
+                    scan_inline(src, mask, closers, text, out);
                     i = end;
                 } else {
                     i += 1;
@@ -110,20 +118,18 @@ fn scan_inline(src: &str, mask: &[bool], range: Range<usize>, out: &mut Vec<Link
     }
 }
 
-/// Parse `[text](dest ["title"])` with `open` at the `[`; `span_start` is the
-/// `!` for an image. Returns the occurrence and the text range (for nesting).
-fn parse_inline_at(
-    src: &str,
-    mask: &[bool],
-    open: usize,
-    span_start: usize,
-    kind: LinkKind,
-) -> Option<(LinkOccurrence, Range<usize>)> {
+/// Each link-text `[` mapped to the `]` that balances it.
+type Closers = std::collections::HashMap<usize, usize>;
+
+/// Pair every `[` with its balancing `]` in one pass: escapes and masked
+/// (code-span) bytes are structurally inert, and a blank line ends the
+/// paragraph, leaving what is still open unpaired. Scanning forward from each
+/// `[` instead is quadratic in a run of unclosed brackets.
+fn bracket_closers(src: &str, mask: &[bool]) -> Closers {
     let b = src.as_bytes();
-    // Link text: balanced brackets; escapes and masked (code-span) bytes are
-    // structurally inert; a blank line ends the paragraph and the attempt.
-    let mut j = open + 1;
-    let mut depth = 1usize;
+    let mut closers = Closers::new();
+    let mut open: Vec<usize> = Vec::new();
+    let mut j = 0;
     while j < src.len() {
         if mask[j] {
             j += 1;
@@ -132,23 +138,36 @@ fn parse_inline_at(
         match b[j] {
             b'\\' => j += 2,
             b'[' => {
-                depth += 1;
+                open.push(j);
                 j += 1;
             }
             b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    break;
+                if let Some(o) = open.pop() {
+                    closers.insert(o, j);
                 }
                 j += 1;
             }
-            b'\n' if blank_line_follows(src, j) => return None,
+            b'\n' if blank_line_follows(src, j) => {
+                open.clear();
+                j += 1;
+            }
             _ => j += 1,
         }
     }
-    if depth != 0 {
-        return None;
-    }
+    closers
+}
+
+/// Parse `[text](dest ["title"])` with `open` at the `[`; `span_start` is the
+/// `!` for an image. Returns the occurrence and the text range (for nesting).
+fn parse_inline_at(
+    src: &str,
+    closers: &Closers,
+    open: usize,
+    span_start: usize,
+    kind: LinkKind,
+) -> Option<(LinkOccurrence, Range<usize>)> {
+    let b = src.as_bytes();
+    let j = *closers.get(&open)?;
     let text = open + 1..j;
     if b.get(j + 1) != Some(&b'(') {
         return None;
@@ -314,6 +333,18 @@ fn split_suffix(src: &str, raw: Range<usize>) -> (Range<usize>, String, String) 
     )
 }
 
+/// Whether `content` (indent stripped) starts a list item: `-`, `*`, `+` or
+/// digits with `.`/`)`, then a space.
+fn is_list_marker(content: &str) -> bool {
+    let rest = content.strip_prefix(['-', '*', '+']).or_else(|| {
+        let digits = content.trim_start_matches(|c: char| c.is_ascii_digit());
+        (digits.len() < content.len())
+            .then(|| digits.strip_prefix(['.', ')']))
+            .flatten()
+    });
+    rest.is_some_and(|r| r.starts_with([' ', '\t']))
+}
+
 /// Byte mask covering fenced code blocks (including the fence lines), indented
 /// code blocks, and inline code spans — regions the link scan must never read.
 fn code_mask(src: &str) -> Vec<bool> {
@@ -323,15 +354,25 @@ fn code_mask(src: &str) -> Vec<bool> {
     // Line pass: fenced blocks and (approximate) indented code blocks. The
     // indented-code approximation treats a ≥4-space line as code unless it
     // lazily continues a paragraph — the common cases, not full CommonMark.
-    let mut fence: Option<Fence> = None;
+    //
+    // Under a list item the item's own content is indented, so there the
+    // threshold is one level deeper and a fence opens at any indent. A list
+    // lasts until unindented text resumes after a blank line.
+    let mut fence: Option<(Fence, bool)> = None;
     let mut in_paragraph = false;
+    let mut in_list = false;
     for &(s, e) in &lines {
         let line = src[s..e].trim_end_matches(['\r', '\n']);
         let indent = line.len() - line.trim_start_matches(' ').len();
         let trimmed = &line[indent..];
-        if let Some(f) = fence {
+        let content = line.trim_start_matches([' ', '\t']);
+        let width: usize = line[..line.len() - content.len()]
+            .bytes()
+            .map(|b| if b == b'\t' { 4 } else { 1 })
+            .sum();
+        if let Some((f, listed)) = fence {
             mask[s..e].fill(true);
-            if indent <= 3 && f.closes(trimmed) {
+            if (listed && f.closes(content)) || (indent <= 3 && f.closes(trimmed)) {
                 fence = None;
             }
             continue;
@@ -340,16 +381,27 @@ fn code_mask(src: &str) -> Vec<bool> {
             in_paragraph = false;
             continue;
         }
-        if indent <= 3
-            && let Some(f) = Fence::opens(trimmed)
-        {
-            fence = Some(f);
+        let opened = if in_list {
+            Fence::opens(content)
+        } else if indent <= 3 {
+            Fence::opens(trimmed)
+        } else {
+            None
+        };
+        if let Some(f) = opened {
+            fence = Some((f, in_list));
             mask[s..e].fill(true);
             continue;
         }
-        if (indent >= 4 || line.starts_with('\t')) && !in_paragraph {
+        let marker = is_list_marker(content);
+        if width >= if in_list { 8 } else { 4 } && !in_paragraph && !marker {
             mask[s..e].fill(true);
             continue;
+        }
+        if marker {
+            in_list = true;
+        } else if width == 0 && !in_paragraph {
+            in_list = false;
         }
         in_paragraph = true;
     }
@@ -440,6 +492,36 @@ mod tests {
 
     fn dests(body: &str) -> Vec<String> {
         links(body).into_iter().map(|o| o.dest).collect()
+    }
+
+    #[test]
+    fn an_indented_line_under_a_list_item_is_text_not_code() {
+        assert_eq!(dests("- item\n\n    see [x](t.md)\n"), ["t.md"]);
+        assert_eq!(dests("- a\n\n    - [x](t.md)\n"), ["t.md"]);
+        assert_eq!(dests("- a\n\n\t- [x](t.md)\n"), ["t.md"]);
+        assert_eq!(dests("1. a\n\n   b\n\n    [x](t.md)\n"), ["t.md"]);
+    }
+
+    #[test]
+    fn code_under_a_list_item_is_still_code() {
+        assert!(dests("1. step\n    ~~~\n    [x](t.md)\n    ~~~\n").is_empty());
+        assert!(dests("- step\n\t~~~\n\t[x](t.md)\n\t~~~\n").is_empty());
+        assert!(dests("- step\n\n        [x](t.md)\n").is_empty());
+    }
+
+    #[test]
+    fn a_list_ends_where_unindented_text_resumes() {
+        assert!(dests("- item\n\npara\n\n    [x](t.md)\n").is_empty());
+    }
+
+    #[test]
+    fn unclosed_brackets_scan_in_linear_time() {
+        let body = "[".repeat(200_000);
+        let started = std::time::Instant::now();
+
+        assert!(links(&body).is_empty());
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     // --- basic kinds ---------------------------------------------------

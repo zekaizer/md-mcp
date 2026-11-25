@@ -261,3 +261,23 @@ async fn authorization_code_is_single_use() {
 
     handle.abort();
 }
+
+/// `/register` is unauthenticated and persists what it accepts, so one
+/// registration must not be able to carry megabytes into the state file.
+#[tokio::test]
+async fn registration_refuses_an_oversized_redirect_uri() {
+    let (addr, handle) = spawn().await;
+    let http = client();
+
+    let huge = format!("https://example.com/{}", "a".repeat(4096));
+    let status = http
+        .post(format!("http://{addr}/register"))
+        .json(&json!({ "redirect_uris": [huge] }))
+        .send()
+        .await
+        .unwrap()
+        .status();
+
+    assert_eq!(status, 400);
+    handle.abort();
+}

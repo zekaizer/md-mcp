@@ -103,6 +103,7 @@ impl MdServer {
         let Some(git) = self.git_sync() else {
             return Err("git sync is not enabled".into());
         };
+        let _serial = git.serialized().await;
         if self.vault().is_read_only() {
             return self.run_pull(git).await;
         }
@@ -110,21 +111,20 @@ impl MdServer {
         let mut pulled = 0usize;
         let mut last_push_err = String::new();
         for attempt in 0..2 {
-            let Some(old_upstream) = git.upstream_tip().await else {
+            if git.upstream_tip().await.is_none() {
                 return Err(NO_UPSTREAM.into());
-            };
+            }
             git.fetch().await?;
-            let new_upstream = git
-                .upstream_tip()
-                .await
-                .unwrap_or_else(|| old_upstream.clone());
 
             // Local-only section: exclusive with reads/commits in-process
             // (write guard) and with cooperating external tools (flock).
-            {
+            let (base, upstream) = {
                 let _guard = self.lock().write().await;
                 let _flock = self.vault().exclusive_lock().map_err(|e| e.to_string())?;
                 git.commit_all("mcp(sync): checkpoint").await?;
+                // Measured from the tree, not from this run's fetch: an
+                // earlier sync may have fetched commits it never applied.
+                let base = git.upstream_base().await?;
                 match git.rebase_onto_upstream().await? {
                     Rebase::Ok => {}
                     Rebase::Conflict(conflicts) => {
@@ -136,12 +136,13 @@ impl MdServer {
                         });
                     }
                 }
-            }
+                (base, git.upstream_tip().await.ok_or(NO_UPSTREAM)?)
+            };
 
             // The rebase applied the fetched changes: publish them to the
             // event journal so the stream stays a complete account (ADR-0017).
-            if new_upstream != old_upstream {
-                let ops = git.changed_between(&old_upstream, &new_upstream).await;
+            if upstream != base {
+                let ops = git.changed_between(&base, &upstream).await;
                 pulled += ops.len();
                 self.emit_event("sync_vault", None, &ops);
             }
@@ -438,6 +439,85 @@ mod tests {
         assert_eq!(text, "# Seed\nlocal line\n");
         assert!(!vault_dir.join(".git/rebase-merge").exists());
         assert!(!vault_dir.join(".git/rebase-apply").exists());
+    }
+
+    fn journal_paths(vault: &Path) -> Vec<String> {
+        std::fs::read_to_string(vault.join(".md-mcp/events.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .flat_map(|line| {
+                let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                record["ops"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|op| op["path"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    async fn server_with_sync_and_events(vault_dir: &Path) -> MdServer {
+        let sink = crate::events::EventSink::open(vault_dir, None).unwrap();
+        server_with_sync(vault_dir).await.with_event_sink(sink)
+    }
+
+    #[tokio::test]
+    async fn changes_fetched_by_a_conflicted_sync_are_journaled_once_applied() {
+        let (_root, vault_dir, clone) = repo_fixture();
+        std::fs::write(clone.join("remote-a.md"), "# A\n").unwrap();
+        std::fs::write(clone.join("seed.md"), "# Seed\nremote line\n").unwrap();
+        git(&clone, &["add", "-A"]);
+        git(&clone, &["commit", "-m", "remote a + edit"]);
+        git(&clone, &["push"]);
+        std::fs::write(vault_dir.join("seed.md"), "# Seed\nlocal line\n").unwrap();
+        let s = server_with_sync_and_events(&vault_dir).await;
+        assert_eq!(s.sync_vault().await.unwrap().0.status, "conflict");
+
+        std::fs::write(clone.join("seed.md"), "# Seed\nlocal line\n").unwrap();
+        git(&clone, &["add", "-A"]);
+        git(&clone, &["commit", "-m", "resolve"]);
+        git(&clone, &["push"]);
+        assert_eq!(s.sync_vault().await.unwrap().0.status, "clean");
+
+        assert!(vault_dir.join("remote-a.md").exists());
+        assert!(journal_paths(&vault_dir).contains(&"remote-a.md".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_syncs_both_succeed_and_journal_a_pull_once() {
+        let (_root, vault_dir, clone) = repo_fixture();
+        push_remote_note(&clone, "remote-note.md");
+        let s = server_with_sync_and_events(&vault_dir).await;
+
+        let (a, b) = tokio::join!(s.sync_vault(), s.sync_vault());
+
+        assert!(a.is_ok() && b.is_ok(), "{:?} {:?}", a.err(), b.err());
+        assert_eq!(journal_paths(&vault_dir), ["remote-note.md"]);
+    }
+
+    #[tokio::test]
+    async fn auto_commit_stages_an_nfd_note_addressed_in_nfc() {
+        let (_root, vault_dir, _clone) = repo_fixture();
+        git(&vault_dir, &["config", "core.precomposeunicode", "false"]);
+        let nfd = "\u{1112}\u{1161}\u{11ab}.md";
+        std::fs::write(vault_dir.join(nfd), "old\n").unwrap();
+        git(&vault_dir, &["add", "-A"]);
+        git(&vault_dir, &["commit", "-m", "nfd note"]);
+
+        let s = server_with_sync(&vault_dir).await.with_auto_commit();
+        let req = serde_json::from_value(serde_json::json!({
+            "appends": [{"path": ["\u{d55c}.md"], "content": "more\n"}]
+        }))
+        .unwrap();
+        s.append_notes(Parameters(req)).await.unwrap();
+
+        let dirty = Command::new("git")
+            .args(["status", "--porcelain", "--", nfd])
+            .current_dir(&vault_dir)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&dirty.stdout), "");
     }
 
     #[tokio::test]

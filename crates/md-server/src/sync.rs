@@ -112,6 +112,9 @@ pub enum Rebase {
 #[derive(Debug)]
 pub struct GitSync {
     root: PathBuf,
+    /// One sync at a time: `git fetch` runs outside the write guard and the
+    /// flock (it is network-bound), and two fetches race on the tracking ref.
+    serial: tokio::sync::Mutex<()>,
 }
 
 impl GitSync {
@@ -122,6 +125,7 @@ impl GitSync {
     pub async fn preflight(vault_root: &Path) -> Result<Self, String> {
         let sync = Self {
             root: vault_root.to_path_buf(),
+            serial: tokio::sync::Mutex::new(()),
         };
         let toplevel = sync
             .run(&["rev-parse", "--show-toplevel"])
@@ -160,6 +164,9 @@ impl GitSync {
             .args(args)
             .current_dir(&self.root)
             .env("GIT_TERMINAL_PROMPT", "0")
+            // Every path this driver passes names one file: a note called
+            // `x[1].md` must not glob in its neighbour `x1.md`.
+            .env("GIT_LITERAL_PATHSPECS", "1")
             .output()
             .await
             .map_err(|e| format!("cannot run git: {e}"))
@@ -170,6 +177,19 @@ impl GitSync {
         self.run(&["rev-parse", "@{u}"])
             .await
             .ok()
+            .map(|s| s.trim().to_string())
+    }
+
+    /// Held for the length of one sync run.
+    pub async fn serialized(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.serial.lock().await
+    }
+
+    /// Where HEAD and the fetched upstream last agreed: everything upstream
+    /// has past this point is not in the tree yet.
+    pub async fn upstream_base(&self) -> Result<String, String> {
+        self.run(&["merge-base", "HEAD", "@{u}"])
+            .await
             .map(|s| s.trim().to_string())
     }
 
@@ -244,18 +264,24 @@ impl GitSync {
         // "pathspec did not match any files" and aborts the *whole* batch. Keep
         // only paths git can stage — present in the worktree (creates/edits) or
         // tracked in the index (deletions) — so one vanished path never sinks a
-        // real change in the same batch.
+        // real change in the same batch. The same goes for an untracked path
+        // the repository ignores, which `git add` refuses outright.
         let mut addable: Vec<&str> = Vec::new();
         for p in paths {
-            let in_worktree = self.root.join(p).exists();
-            let tracked = in_worktree
-                || !self
-                    .run(&["ls-files", "--", p])
-                    .await
-                    .unwrap_or_default()
-                    .trim()
-                    .is_empty();
-            if tracked {
+            let tracked = !self
+                .run(&["ls-files", "--", p])
+                .await
+                .unwrap_or_default()
+                .trim()
+                .is_empty();
+            let stageable = tracked
+                || (self.root.join(p).exists()
+                    && self
+                        .run(&["ls-files", "-o", "-i", "--exclude-standard", "--", p])
+                        .await?
+                        .trim()
+                        .is_empty());
+            if stageable {
                 addable.push(p.as_str());
             }
         }
@@ -597,11 +623,56 @@ mod tests {
     async fn init_repo(root: &Path) -> GitSync {
         let git = GitSync {
             root: root.to_path_buf(),
+            serial: tokio::sync::Mutex::new(()),
         };
         git.run(&["init", "-q"]).await.unwrap();
         git.run(&["config", "user.email", "t@t"]).await.unwrap();
         git.run(&["config", "user.name", "t"]).await.unwrap();
         git
+    }
+
+    #[tokio::test]
+    async fn commit_paths_skips_an_ignored_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = init_repo(dir.path()).await;
+        std::fs::write(dir.path().join(".gitignore"), "drafts/\n").unwrap();
+        git.run(&["add", "-A"]).await.unwrap();
+        git.run(&["commit", "-qm", "init"]).await.unwrap();
+
+        std::fs::create_dir(dir.path().join("drafts")).unwrap();
+        std::fs::write(dir.path().join("drafts/a.md"), "ignored").unwrap();
+        std::fs::write(dir.path().join("b.md"), "kept").unwrap();
+        let created = git
+            .commit_paths(
+                "mcp(create_notes): 2 notes",
+                &["drafts/a.md".into(), "b.md".into()],
+            )
+            .await
+            .expect("an ignored path must not fail the whole commit");
+
+        assert!(created);
+    }
+
+    #[tokio::test]
+    async fn commit_paths_takes_a_path_literally() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = init_repo(dir.path()).await;
+        std::fs::write(dir.path().join("x[1].md"), "bracketed").unwrap();
+        std::fs::write(dir.path().join("x1.md"), "external").unwrap();
+        git.run(&["add", "-A"]).await.unwrap();
+        git.run(&["commit", "-qm", "init"]).await.unwrap();
+
+        std::fs::remove_file(dir.path().join("x[1].md")).unwrap();
+        std::fs::write(dir.path().join("x1.md"), "external edit").unwrap();
+        git.commit_paths("mcp(delete_notes): 1 notes", &["x[1].md".into()])
+            .await
+            .unwrap();
+
+        let log = git
+            .run(&["log", "-1", "--name-only", "--format="])
+            .await
+            .unwrap();
+        assert_eq!(log.trim(), "x[1].md");
     }
 
     /// A restructure can leave a batch path that git cannot stage: a directory
