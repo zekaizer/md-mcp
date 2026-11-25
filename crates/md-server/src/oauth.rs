@@ -54,6 +54,9 @@ const STATE_VERSION: u32 = 1;
 /// registration to keep an internet-reachable endpoint from growing the file without end.
 const MAX_CLIENTS: usize = 50;
 const MAX_REDIRECT_URIS: usize = 8;
+/// Without this the two caps above bound a count, not the file: one
+/// registration could persist as many bytes as the request body allows.
+const MAX_REDIRECT_URI_BYTES: usize = 2048;
 
 /// On-disk, persisted across restarts. Bearer material at rest — see [`create_private`]
 /// for how the file is kept owner-only.
@@ -521,8 +524,14 @@ async fn register(
         );
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri");
     }
-    if !req.redirect_uris.iter().all(|u| is_absolute_http(u)) {
-        tracing::warn!("oauth: client registration rejected (non-http(s) redirect_uri)");
+    if !req
+        .redirect_uris
+        .iter()
+        .all(|u| u.len() <= MAX_REDIRECT_URI_BYTES && is_absolute_http(u))
+    {
+        tracing::warn!(
+            "oauth: client registration rejected (non-http(s) or oversized redirect_uri)"
+        );
         return oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri");
     }
     let client_id = oauth.register_client(req.redirect_uris.clone());
