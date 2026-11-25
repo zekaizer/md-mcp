@@ -338,8 +338,15 @@ impl Vault {
                 format!("a note path must not end with '/': {rel}"),
             ));
         }
-        let clean = self.resolve_rel(rel)?;
-        let clean_path = Path::new(&clean);
+        self.write_resolved(&self.resolve_rel(rel)?, bytes)
+    }
+
+    /// [`Self::write_atomic`] for a path already in its on-disk spelling.
+    /// Resolving again would respell it when the file is momentarily absent,
+    /// as it is between a transaction's backup and its write.
+    pub(crate) fn write_resolved(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        let clean = rel;
+        let clean_path = Path::new(clean);
         let name = clean_path
             .file_name()
             .ok_or_else(|| Error::traversal(format!("path has no file name: {rel}")))?;
@@ -380,7 +387,7 @@ impl Vault {
             .map_err(|e| Error::io(format!("fsync temp for {rel}: {e}")))?;
         tmp.replace(name)
             .map_err(|e| Error::io(format!("commit {rel}: {e}")))?;
-        self.fsync_parent(&clean);
+        self.fsync_parent(clean);
         Ok(())
     }
 

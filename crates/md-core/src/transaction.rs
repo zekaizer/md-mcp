@@ -275,7 +275,7 @@ impl Vault {
                     });
                     self.write_journal(journal_path, journal)?;
                 }
-                self.write_atomic(path, content)?;
+                self.write_resolved(path, content)?;
                 Ok(OpOutcome::Written {
                     path: path.to_string(),
                 })
@@ -437,6 +437,55 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = Vault::open(dir.path()).unwrap();
         (dir, vault)
+    }
+
+    fn md_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".md"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_batch_write_keeps_the_stored_spelling_of_an_nfd_note() {
+        let (dir, vault) = temp_vault();
+        let nfd = "\u{1112}\u{1161}\u{11ab}.md";
+        let nfc = "\u{d55c}.md";
+        std::fs::write(dir.path().join(nfd), b"old").unwrap();
+
+        vault
+            .commit_batch(&[Op::Write {
+                path: nfc.into(),
+                content: b"new".to_vec(),
+            }])
+            .unwrap();
+
+        assert_eq!(md_names(dir.path()), [nfd]);
+        assert_eq!(std::fs::read(dir.path().join(nfd)).unwrap(), b"new");
+    }
+
+    #[test]
+    fn a_rolled_back_write_to_an_nfd_note_leaves_one_file() {
+        let (dir, vault) = temp_vault();
+        let nfd = "\u{1112}\u{1161}\u{11ab}.md";
+        std::fs::write(dir.path().join(nfd), b"old").unwrap();
+
+        let failed = vault.commit_batch(&[
+            Op::Write {
+                path: "\u{d55c}.md".into(),
+                content: b"new".to_vec(),
+            },
+            Op::Delete {
+                path: "missing.md".into(),
+            },
+        ]);
+
+        assert!(failed.is_err());
+        assert_eq!(md_names(dir.path()), [nfd]);
+        assert_eq!(std::fs::read(dir.path().join(nfd)).unwrap(), b"old");
     }
 
     #[test]
