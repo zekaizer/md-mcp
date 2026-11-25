@@ -68,14 +68,21 @@ pub fn extract_links(body: &str) -> Vec<LinkOccurrence> {
         }
     }
 
-    scan_inline(body, &mask, 0..body.len(), &mut out);
+    let closers = bracket_closers(body, &mask);
+    scan_inline(body, &mask, &closers, 0..body.len(), &mut out);
     out.sort_by_key(|o| o.span.start);
     out
 }
 
 /// Scan `range` for inline links/images, recursing into link text so a nested
 /// image (`[![alt](img)](page)`) is emitted too.
-fn scan_inline(src: &str, mask: &[bool], range: Range<usize>, out: &mut Vec<LinkOccurrence>) {
+fn scan_inline(
+    src: &str,
+    mask: &[bool],
+    closers: &Closers,
+    range: Range<usize>,
+    out: &mut Vec<LinkOccurrence>,
+) {
     let b = src.as_bytes();
     let mut i = range.start;
     while i < range.end {
@@ -86,20 +93,20 @@ fn scan_inline(src: &str, mask: &[bool], range: Range<usize>, out: &mut Vec<Link
         match b[i] {
             b'\\' => i += 2,
             b'!' if i + 1 < range.end && b[i + 1] == b'[' && !mask[i + 1] => {
-                if let Some((occ, text)) = parse_inline_at(src, mask, i + 1, i, LinkKind::Image) {
+                if let Some((occ, text)) = parse_inline_at(src, closers, i + 1, i, LinkKind::Image) {
                     let end = occ.span.end;
                     out.push(occ);
-                    scan_inline(src, mask, text, out);
+                    scan_inline(src, mask, closers, text, out);
                     i = end;
                 } else {
                     i += 2;
                 }
             }
             b'[' => {
-                if let Some((occ, text)) = parse_inline_at(src, mask, i, i, LinkKind::Inline) {
+                if let Some((occ, text)) = parse_inline_at(src, closers, i, i, LinkKind::Inline) {
                     let end = occ.span.end;
                     out.push(occ);
-                    scan_inline(src, mask, text, out);
+                    scan_inline(src, mask, closers, text, out);
                     i = end;
                 } else {
                     i += 1;
@@ -110,20 +117,18 @@ fn scan_inline(src: &str, mask: &[bool], range: Range<usize>, out: &mut Vec<Link
     }
 }
 
-/// Parse `[text](dest ["title"])` with `open` at the `[`; `span_start` is the
-/// `!` for an image. Returns the occurrence and the text range (for nesting).
-fn parse_inline_at(
-    src: &str,
-    mask: &[bool],
-    open: usize,
-    span_start: usize,
-    kind: LinkKind,
-) -> Option<(LinkOccurrence, Range<usize>)> {
+/// Each link-text `[` mapped to the `]` that balances it.
+type Closers = std::collections::HashMap<usize, usize>;
+
+/// Pair every `[` with its balancing `]` in one pass: escapes and masked
+/// (code-span) bytes are structurally inert, and a blank line ends the
+/// paragraph, leaving what is still open unpaired. Scanning forward from each
+/// `[` instead is quadratic in a run of unclosed brackets.
+fn bracket_closers(src: &str, mask: &[bool]) -> Closers {
     let b = src.as_bytes();
-    // Link text: balanced brackets; escapes and masked (code-span) bytes are
-    // structurally inert; a blank line ends the paragraph and the attempt.
-    let mut j = open + 1;
-    let mut depth = 1usize;
+    let mut closers = Closers::new();
+    let mut open: Vec<usize> = Vec::new();
+    let mut j = 0;
     while j < src.len() {
         if mask[j] {
             j += 1;
@@ -132,23 +137,36 @@ fn parse_inline_at(
         match b[j] {
             b'\\' => j += 2,
             b'[' => {
-                depth += 1;
+                open.push(j);
                 j += 1;
             }
             b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    break;
+                if let Some(o) = open.pop() {
+                    closers.insert(o, j);
                 }
                 j += 1;
             }
-            b'\n' if blank_line_follows(src, j) => return None,
+            b'\n' if blank_line_follows(src, j) => {
+                open.clear();
+                j += 1;
+            }
             _ => j += 1,
         }
     }
-    if depth != 0 {
-        return None;
-    }
+    closers
+}
+
+/// Parse `[text](dest ["title"])` with `open` at the `[`; `span_start` is the
+/// `!` for an image. Returns the occurrence and the text range (for nesting).
+fn parse_inline_at(
+    src: &str,
+    closers: &Closers,
+    open: usize,
+    span_start: usize,
+    kind: LinkKind,
+) -> Option<(LinkOccurrence, Range<usize>)> {
+    let b = src.as_bytes();
+    let j = *closers.get(&open)?;
     let text = open + 1..j;
     if b.get(j + 1) != Some(&b'(') {
         return None;
@@ -495,6 +513,16 @@ mod tests {
     #[test]
     fn a_list_ends_where_unindented_text_resumes() {
         assert!(dests("- item\n\npara\n\n    [x](t.md)\n").is_empty());
+    }
+
+    #[test]
+    fn unclosed_brackets_scan_in_linear_time() {
+        let body = "[".repeat(200_000);
+        let started = std::time::Instant::now();
+
+        assert!(links(&body).is_empty());
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     // --- basic kinds ---------------------------------------------------
