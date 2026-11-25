@@ -111,21 +111,20 @@ impl MdServer {
         let mut pulled = 0usize;
         let mut last_push_err = String::new();
         for attempt in 0..2 {
-            let Some(old_upstream) = git.upstream_tip().await else {
+            if git.upstream_tip().await.is_none() {
                 return Err(NO_UPSTREAM.into());
-            };
+            }
             git.fetch().await?;
-            let new_upstream = git
-                .upstream_tip()
-                .await
-                .unwrap_or_else(|| old_upstream.clone());
 
             // Local-only section: exclusive with reads/commits in-process
             // (write guard) and with cooperating external tools (flock).
-            {
+            let (base, upstream) = {
                 let _guard = self.lock().write().await;
                 let _flock = self.vault().exclusive_lock().map_err(|e| e.to_string())?;
                 git.commit_all("mcp(sync): checkpoint").await?;
+                // Measured from the tree, not from this run's fetch: an
+                // earlier sync may have fetched commits it never applied.
+                let base = git.upstream_base().await?;
                 match git.rebase_onto_upstream().await? {
                     Rebase::Ok => {}
                     Rebase::Conflict(conflicts) => {
@@ -137,12 +136,13 @@ impl MdServer {
                         });
                     }
                 }
-            }
+                (base, git.upstream_tip().await.ok_or(NO_UPSTREAM)?)
+            };
 
             // The rebase applied the fetched changes: publish them to the
             // event journal so the stream stays a complete account (ADR-0017).
-            if new_upstream != old_upstream {
-                let ops = git.changed_between(&old_upstream, &new_upstream).await;
+            if upstream != base {
+                let ops = git.changed_between(&base, &upstream).await;
                 pulled += ops.len();
                 self.emit_event("sync_vault", None, &ops);
             }
@@ -460,6 +460,28 @@ mod tests {
     async fn server_with_sync_and_events(vault_dir: &Path) -> MdServer {
         let sink = crate::events::EventSink::open(vault_dir, None).unwrap();
         server_with_sync(vault_dir).await.with_event_sink(sink)
+    }
+
+    #[tokio::test]
+    async fn changes_fetched_by_a_conflicted_sync_are_journaled_once_applied() {
+        let (_root, vault_dir, clone) = repo_fixture();
+        std::fs::write(clone.join("remote-a.md"), "# A\n").unwrap();
+        std::fs::write(clone.join("seed.md"), "# Seed\nremote line\n").unwrap();
+        git(&clone, &["add", "-A"]);
+        git(&clone, &["commit", "-m", "remote a + edit"]);
+        git(&clone, &["push"]);
+        std::fs::write(vault_dir.join("seed.md"), "# Seed\nlocal line\n").unwrap();
+        let s = server_with_sync_and_events(&vault_dir).await;
+        assert_eq!(s.sync_vault().await.unwrap().0.status, "conflict");
+
+        std::fs::write(clone.join("seed.md"), "# Seed\nlocal line\n").unwrap();
+        git(&clone, &["add", "-A"]);
+        git(&clone, &["commit", "-m", "resolve"]);
+        git(&clone, &["push"]);
+        assert_eq!(s.sync_vault().await.unwrap().0.status, "clean");
+
+        assert!(vault_dir.join("remote-a.md").exists());
+        assert!(journal_paths(&vault_dir).contains(&"remote-a.md".to_string()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -182,6 +182,14 @@ impl GitSync {
         self.serial.lock().await
     }
 
+    /// Where HEAD and the fetched upstream last agreed: everything upstream
+    /// has past this point is not in the tree yet.
+    pub async fn upstream_base(&self) -> Result<String, String> {
+        self.run(&["merge-base", "HEAD", "@{u}"])
+            .await
+            .map(|s| s.trim().to_string())
+    }
+
     /// The commit HEAD points at.
     pub async fn head(&self) -> Result<String, String> {
         self.run(&["rev-parse", "HEAD"])
