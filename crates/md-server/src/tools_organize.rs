@@ -718,21 +718,20 @@ impl MdServer {
                 .map(|(_, f, t)| (f.clone(), t.clone()))
                 .collect::<Vec<_>>(),
         );
-        // Pre-filter needles: a link to a moved path must spell its basename,
-        // raw or with the common %20 space encoding. Moved notes themselves
-        // bypass this (their own outbound links can point anywhere).
+        // Pre-filter: a link to a moved path spells its basename, unless an
+        // encoding hides it — any `%` or `\\` could be one, so those notes are
+        // parsed rather than guessed at. Moved notes themselves bypass this
+        // (their own outbound links can point anywhere).
         let needles: Vec<String> = pairs
             .iter()
-            .flat_map(|(_, from, _)| {
-                let base = basename(from).to_string();
-                let encoded = base.replace(' ', "%20");
-                if encoded == base {
-                    vec![base]
-                } else {
-                    vec![base, encoded]
-                }
-            })
+            .map(|(_, from, _)| nfc_key(basename(from)))
             .collect();
+        let may_link = |source: &str| {
+            source.contains(['%', '\\']) || {
+                let composed = md_core::text::nfc(source);
+                needles.iter().any(|n| composed.contains(n.as_str()))
+            }
+        };
 
         let entries = match self.vault().list_entries("", true, None, false) {
             Ok(e) => e,
@@ -758,7 +757,7 @@ impl MdServer {
             if !(source.contains("](") || source.contains("]:")) {
                 continue;
             }
-            if old_path == new_path && !needles.iter().any(|n| source.contains(n.as_str())) {
+            if old_path == new_path && !may_link(&source) {
                 continue;
             }
             candidates += 1;
@@ -1453,6 +1452,31 @@ mod tests {
         assert_eq!(
             s.vault().read_note("other.md").unwrap(),
             "no links to the target"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_links_finds_a_link_however_its_name_is_encoded() {
+        let nfc = "\u{d68c}\u{c758}.md";
+        let nfd: String = "\u{1112}\u{116c}\u{110b}\u{1174}.md".into();
+        let (_d, s) = server(&[
+            (nfc, "# T"),
+            ("a (1).md", "# T"),
+            ("pct.md", "[a](%ED%9A%8C%EC%9D%98.md)"),
+            ("nfd.md", &format!("[a]({nfd})")),
+            ("paren.md", "[b](a%20%281%29.md)"),
+        ]);
+
+        let r = move_linked(&s, nfc, "sub/", false).await;
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(r.relinked, ["nfd.md", "pct.md"]);
+
+        let r = move_linked(&s, "a (1).md", "sub/", false).await;
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(r.relinked, ["paren.md"]);
+        assert_eq!(
+            s.vault().read_note("paren.md").unwrap(),
+            "[b](sub/a%20%281%29.md)"
         );
     }
 

@@ -10,9 +10,12 @@
 use std::ops::Range;
 
 use crate::links::extract_links;
+use crate::text::nfc;
 
 /// Where a batch moved each path: exact matches for files, prefix matches for
 /// directories. Sources/destinations are stored without a trailing `/`.
+/// Sources are matched in NFC: a link and the disk may each spell the same
+/// path either way, and the vault resolves both to one note.
 pub struct MoveMap {
     pairs: Vec<(String, String)>,
 }
@@ -25,7 +28,7 @@ impl MoveMap {
                 .iter()
                 .map(|(f, t)| {
                     (
-                        f.trim_end_matches('/').to_string(),
+                        nfc(f.trim_end_matches('/')).into_owned(),
                         t.trim_end_matches('/').to_string(),
                     )
                 })
@@ -38,6 +41,7 @@ impl MoveMap {
     /// upstream (ADR-0009), so at most one pair can match.
     #[must_use]
     pub fn apply(&self, path: &str) -> Option<String> {
+        let path = &*nfc(path);
         for (from, to) in &self.pairs {
             if path == from {
                 return Some(to.clone());
