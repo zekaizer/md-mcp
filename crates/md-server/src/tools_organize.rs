@@ -762,9 +762,13 @@ impl MdServer {
             }
             candidates += 1;
             // Links live in the body; frontmatter is never rewritten.
-            let body_start = md_core::Document::parse(&source)
-                .frontmatter
-                .map_or(0, |s| s.end);
+            // A BOM ahead of the fence would hide the frontmatter from the
+            // parser, which reads the text as the vault normalizes it.
+            let bom = source.len() - source.trim_start_matches('\u{feff}').len();
+            let body_start = bom
+                + md_core::Document::parse(&source[bom..])
+                    .frontmatter
+                    .map_or(0, |s| s.end);
             let Some(new_body) =
                 md_core::rewrite_body(&source[body_start..], &old_path, &new_path, &map)
             else {
@@ -1477,6 +1481,21 @@ mod tests {
         assert_eq!(
             s.vault().read_note("paren.md").unwrap(),
             "[b](sub/a%20%281%29.md)"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_links_leaves_frontmatter_alone_behind_a_bom() {
+        let (dir, s) = server(&[("target.md", "# T")]);
+        let with_bom = "\u{feff}---\nrelated: \"[t](target.md)\"\n---\n[t](target.md)\n";
+        std::fs::write(dir.path().join("linker.md"), with_bom).unwrap();
+
+        let r = move_linked(&s, "target.md", "sub/", false).await;
+
+        assert!(r.ok, "{:?}", r.errors);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("linker.md")).unwrap(),
+            "\u{feff}---\nrelated: \"[t](target.md)\"\n---\n[t](sub/target.md)\n"
         );
     }
 
