@@ -93,7 +93,8 @@ fn scan_inline(
         match b[i] {
             b'\\' => i += 2,
             b'!' if i + 1 < range.end && b[i + 1] == b'[' && !mask[i + 1] => {
-                if let Some((occ, text)) = parse_inline_at(src, closers, i + 1, i, LinkKind::Image) {
+                if let Some((occ, text)) = parse_inline_at(src, closers, i + 1, i, LinkKind::Image)
+                {
                     let end = occ.span.end;
                     out.push(occ);
                     scan_inline(src, mask, closers, text, out);
@@ -335,14 +336,12 @@ fn split_suffix(src: &str, raw: Range<usize>) -> (Range<usize>, String, String) 
 /// Whether `content` (indent stripped) starts a list item: `-`, `*`, `+` or
 /// digits with `.`/`)`, then a space.
 fn is_list_marker(content: &str) -> bool {
-    let rest = content
-        .strip_prefix(['-', '*', '+'])
-        .or_else(|| {
-            let digits = content.trim_start_matches(|c: char| c.is_ascii_digit());
-            (digits.len() < content.len())
-                .then(|| digits.strip_prefix(['.', ')']))
-                .flatten()
-        });
+    let rest = content.strip_prefix(['-', '*', '+']).or_else(|| {
+        let digits = content.trim_start_matches(|c: char| c.is_ascii_digit());
+        (digits.len() < content.len())
+            .then(|| digits.strip_prefix(['.', ')']))
+            .flatten()
+    });
     rest.is_some_and(|r| r.starts_with([' ', '\t']))
 }
 

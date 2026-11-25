@@ -235,12 +235,11 @@ fn is_top_level_key(line: &str, key: &str) -> bool {
     }
     // A plain key ends at the first `:` followed by whitespace or the line's
     // end; a `:` followed by anything else is part of the key (`dc:title`).
-    let Some(colon) = line.match_indices(':').map(|(i, _)| i).find(|&i| {
-        line[i + 1..]
-            .chars()
-            .next()
-            .is_none_or(char::is_whitespace)
-    }) else {
+    let Some(colon) = line
+        .match_indices(':')
+        .map(|(i, _)| i)
+        .find(|&i| line[i + 1..].chars().next().is_none_or(char::is_whitespace))
+    else {
         return false;
     };
     nfc(line[..colon].trim()) == nfc(key)

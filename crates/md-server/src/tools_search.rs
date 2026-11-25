@@ -483,17 +483,27 @@ mod tests {
     async fn every_keyword_is_matched_on_its_own() {
         let (_d, s) = server(&[("a.md", "testing here\n")]);
 
-        assert_eq!(content_hits(&s, "test testing").await, 1, "one keyword inside another");
+        assert_eq!(
+            content_hits(&s, "test testing").await,
+            1,
+            "one keyword inside another"
+        );
         assert_eq!(content_hits(&s, "here here").await, 1, "a repeated keyword");
         assert_eq!(content_hits(&s, "test absent").await, 0);
     }
 
     #[tokio::test]
     async fn a_non_ascii_capital_is_found_as_written() {
-        let (_d, s) = server(&[("a.md", "\u{dc}ber \u{41c}\u{43e}\u{441}\u{43a}\u{432}\u{430}\n")]);
+        let (_d, s) = server(&[(
+            "a.md",
+            "\u{dc}ber \u{41c}\u{43e}\u{441}\u{43a}\u{432}\u{430}\n",
+        )]);
 
         assert_eq!(content_hits(&s, "\u{dc}ber").await, 1);
-        assert_eq!(content_hits(&s, "\u{41c}\u{43e}\u{441}\u{43a}\u{432}\u{430}").await, 1);
+        assert_eq!(
+            content_hits(&s, "\u{41c}\u{43e}\u{441}\u{43a}\u{432}\u{430}").await,
+            1
+        );
     }
 
     #[tokio::test]
