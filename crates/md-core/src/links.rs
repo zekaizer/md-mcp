@@ -314,6 +314,20 @@ fn split_suffix(src: &str, raw: Range<usize>) -> (Range<usize>, String, String) 
     )
 }
 
+/// Whether `content` (indent stripped) starts a list item: `-`, `*`, `+` or
+/// digits with `.`/`)`, then a space.
+fn is_list_marker(content: &str) -> bool {
+    let rest = content
+        .strip_prefix(['-', '*', '+'])
+        .or_else(|| {
+            let digits = content.trim_start_matches(|c: char| c.is_ascii_digit());
+            (digits.len() < content.len())
+                .then(|| digits.strip_prefix(['.', ')']))
+                .flatten()
+        });
+    rest.is_some_and(|r| r.starts_with([' ', '\t']))
+}
+
 /// Byte mask covering fenced code blocks (including the fence lines), indented
 /// code blocks, and inline code spans — regions the link scan must never read.
 fn code_mask(src: &str) -> Vec<bool> {
@@ -323,15 +337,25 @@ fn code_mask(src: &str) -> Vec<bool> {
     // Line pass: fenced blocks and (approximate) indented code blocks. The
     // indented-code approximation treats a ≥4-space line as code unless it
     // lazily continues a paragraph — the common cases, not full CommonMark.
-    let mut fence: Option<Fence> = None;
+    //
+    // Under a list item the item's own content is indented, so there the
+    // threshold is one level deeper and a fence opens at any indent. A list
+    // lasts until unindented text resumes after a blank line.
+    let mut fence: Option<(Fence, bool)> = None;
     let mut in_paragraph = false;
+    let mut in_list = false;
     for &(s, e) in &lines {
         let line = src[s..e].trim_end_matches(['\r', '\n']);
         let indent = line.len() - line.trim_start_matches(' ').len();
         let trimmed = &line[indent..];
-        if let Some(f) = fence {
+        let content = line.trim_start_matches([' ', '\t']);
+        let width: usize = line[..line.len() - content.len()]
+            .bytes()
+            .map(|b| if b == b'\t' { 4 } else { 1 })
+            .sum();
+        if let Some((f, listed)) = fence {
             mask[s..e].fill(true);
-            if indent <= 3 && f.closes(trimmed) {
+            if (listed && f.closes(content)) || (indent <= 3 && f.closes(trimmed)) {
                 fence = None;
             }
             continue;
@@ -340,16 +364,27 @@ fn code_mask(src: &str) -> Vec<bool> {
             in_paragraph = false;
             continue;
         }
-        if indent <= 3
-            && let Some(f) = Fence::opens(trimmed)
-        {
-            fence = Some(f);
+        let opened = if in_list {
+            Fence::opens(content)
+        } else if indent <= 3 {
+            Fence::opens(trimmed)
+        } else {
+            None
+        };
+        if let Some(f) = opened {
+            fence = Some((f, in_list));
             mask[s..e].fill(true);
             continue;
         }
-        if (indent >= 4 || line.starts_with('\t')) && !in_paragraph {
+        let marker = is_list_marker(content);
+        if width >= if in_list { 8 } else { 4 } && !in_paragraph && !marker {
             mask[s..e].fill(true);
             continue;
+        }
+        if marker {
+            in_list = true;
+        } else if width == 0 && !in_paragraph {
+            in_list = false;
         }
         in_paragraph = true;
     }
@@ -440,6 +475,26 @@ mod tests {
 
     fn dests(body: &str) -> Vec<String> {
         links(body).into_iter().map(|o| o.dest).collect()
+    }
+
+    #[test]
+    fn an_indented_line_under_a_list_item_is_text_not_code() {
+        assert_eq!(dests("- item\n\n    see [x](t.md)\n"), ["t.md"]);
+        assert_eq!(dests("- a\n\n    - [x](t.md)\n"), ["t.md"]);
+        assert_eq!(dests("- a\n\n\t- [x](t.md)\n"), ["t.md"]);
+        assert_eq!(dests("1. a\n\n   b\n\n    [x](t.md)\n"), ["t.md"]);
+    }
+
+    #[test]
+    fn code_under_a_list_item_is_still_code() {
+        assert!(dests("1. step\n    ~~~\n    [x](t.md)\n    ~~~\n").is_empty());
+        assert!(dests("- step\n\t~~~\n\t[x](t.md)\n\t~~~\n").is_empty());
+        assert!(dests("- step\n\n        [x](t.md)\n").is_empty());
+    }
+
+    #[test]
+    fn a_list_ends_where_unindented_text_resumes() {
+        assert!(dests("- item\n\npara\n\n    [x](t.md)\n").is_empty());
     }
 
     // --- basic kinds ---------------------------------------------------
