@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::error::{Code, Error, Result};
 use crate::vault::Vault;
 
 const JOURNAL_DIR: &str = ".md-mcp/journal";
@@ -79,7 +79,8 @@ impl Vault {
     /// Apply a batch of ops atomically. On any failure nothing is left changed.
     pub fn commit_batch(&self, ops: &[Op]) -> Result<CommitReceipt> {
         self.ensure_writable()?;
-        // Agent ops may never target the internal `.md-mcp/` state directory.
+        // Agent ops may never target the internal `.md-mcp/` state directory,
+        // and what they write is a note.
         for op in ops {
             let paths: Vec<&str> = match op {
                 Op::Write { path, .. } | Op::Delete { path } => vec![path.as_str()],
@@ -91,6 +92,14 @@ impl Vault {
                         "cannot target a protected directory: {p}"
                     )));
                 }
+            }
+            if let Op::Write { path, .. } = op
+                && !Self::is_note_path(path)
+            {
+                return Err(Error::new(
+                    Code::Suffix,
+                    format!("not a Markdown note (only .md files): {path}"),
+                ));
             }
         }
 
@@ -447,6 +456,22 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn a_batch_write_refuses_a_path_that_is_not_a_note() {
+        let (dir, vault) = temp_vault();
+        std::fs::write(dir.path().join("app.json"), b"{}").unwrap();
+
+        let err = vault
+            .commit_batch(&[Op::Write {
+                path: "app.json".into(),
+                content: b"x".to_vec(),
+            }])
+            .unwrap_err();
+
+        assert_eq!(err.code, Code::Suffix);
+        assert_eq!(std::fs::read(dir.path().join("app.json")).unwrap(), b"{}");
     }
 
     #[test]

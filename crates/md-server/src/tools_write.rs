@@ -634,15 +634,11 @@ impl MdServer {
                 };
             }
         };
-        if md_core::Vault::is_internal_path(&rel) {
+        if let Err(e) = md_core::Vault::validate_note_rel(&rel) {
             return AppendResult {
                 path: item.path.clone(),
                 appended: false,
-                error: Some(ApiError {
-                    code: Code::Traversal.as_str().to_string(),
-                    message: "cannot target a protected directory".to_string(),
-                    index: None,
-                }),
+                error: Some(ApiError::from_core(&e)),
             };
         }
         let base = match self.vault().read_note(&rel) {
@@ -1016,6 +1012,20 @@ mod tests {
             vault.write_atomic(p, b.as_bytes()).unwrap();
         }
         (dir, MdServer::new(vault))
+    }
+
+    #[tokio::test]
+    async fn append_refuses_a_path_that_is_not_a_note() {
+        let (dir, s) = server(&[]);
+        let req = serde_json::from_value(json!({"appends": [
+            {"path": ["run.sh"], "content": "echo\n", "create_if_missing": true}
+        ]}))
+        .unwrap();
+
+        let r = s.append_notes(Parameters(req)).await.unwrap().0;
+
+        assert_eq!(r.appended[0].error.as_ref().unwrap().code, "SUFFIX");
+        assert!(!dir.path().join("run.sh").exists());
     }
 
     #[tokio::test]

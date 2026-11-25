@@ -297,10 +297,11 @@ impl Vault {
     }
 
     /// Read a note's raw text (as stored on disk, UTF-8). The internal state
-    /// directory is hidden — reading inside it reports the note as absent.
+    /// directory is hidden, and a file that is not a note is not one to read —
+    /// either reports the note as absent.
     pub fn read_note(&self, rel: &str) -> Result<String> {
         let clean = self.resolve_rel(rel)?;
-        if Self::is_internal_path(rel) {
+        if Self::is_internal_path(rel) || !Self::is_note_path(&clean) {
             return Err(Error::not_found(format!("note not found: {rel}")));
         }
         self.root
@@ -449,6 +450,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = Vault::open(dir.path()).unwrap();
         (dir, vault)
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_note_does_not_read_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join(".obsidian")).unwrap();
+        std::fs::write(dir.path().join(".obsidian/app.json"), b"{}").unwrap();
+
+        let err = vault.read_note(".obsidian/app.json").unwrap_err();
+
+        assert_eq!(err.code, Code::NotFound);
     }
 
     #[test]
