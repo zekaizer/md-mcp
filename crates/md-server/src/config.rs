@@ -417,11 +417,15 @@ impl Config {
 
 /// Resolve the bearer token from its non-argv sources: `--http-token-file` (read
 /// and trimmed) wins over the `MD_HTTP_TOKEN` env var. A given token file that
-/// cannot be read is a hard error — never a silent fall-through to no auth.
+/// cannot be read, or holds no token, is a hard error — never a silent
+/// fall-through to no auth.
 fn resolve_token(token_file: Option<&std::path::Path>) -> Result<Option<String>> {
     if let Some(path) = token_file {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read --http-token-file {}", path.display()))?;
+        if raw.trim().is_empty() {
+            anyhow::bail!("--http-token-file {} is empty", path.display());
+        }
         return Ok(Some(raw));
     }
     Ok(std::env::var("MD_HTTP_TOKEN").ok())
@@ -503,6 +507,16 @@ mod tests {
         // No file → falls back to the env var (absent here → None).
         // A given-but-unreadable file is a hard error, never silent no-auth.
         assert!(resolve_token(Some(&dir.path().join("missing"))).is_err());
+    }
+
+    #[test]
+    fn resolve_token_refuses_a_blank_token_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for blank in ["", " \n\t"] {
+            let path = dir.path().join("tok");
+            std::fs::write(&path, blank).unwrap();
+            assert!(resolve_token(Some(&path)).is_err(), "{blank:?}");
+        }
     }
 
     #[test]
