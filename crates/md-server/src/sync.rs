@@ -164,6 +164,9 @@ impl GitSync {
             .args(args)
             .current_dir(&self.root)
             .env("GIT_TERMINAL_PROMPT", "0")
+            // Every path this driver passes names one file: a note called
+            // `x[1].md` must not glob in its neighbour `x1.md`.
+            .env("GIT_LITERAL_PATHSPECS", "1")
             .output()
             .await
             .map_err(|e| format!("cannot run git: {e}"))
@@ -620,6 +623,28 @@ mod tests {
         git.run(&["config", "user.email", "t@t"]).await.unwrap();
         git.run(&["config", "user.name", "t"]).await.unwrap();
         git
+    }
+
+    #[tokio::test]
+    async fn commit_paths_takes_a_path_literally() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = init_repo(dir.path()).await;
+        std::fs::write(dir.path().join("x[1].md"), "bracketed").unwrap();
+        std::fs::write(dir.path().join("x1.md"), "external").unwrap();
+        git.run(&["add", "-A"]).await.unwrap();
+        git.run(&["commit", "-qm", "init"]).await.unwrap();
+
+        std::fs::remove_file(dir.path().join("x[1].md")).unwrap();
+        std::fs::write(dir.path().join("x1.md"), "external edit").unwrap();
+        git.commit_paths("mcp(delete_notes): 1 notes", &["x[1].md".into()])
+            .await
+            .unwrap();
+
+        let log = git
+            .run(&["log", "-1", "--name-only", "--format="])
+            .await
+            .unwrap();
+        assert_eq!(log.trim(), "x[1].md");
     }
 
     /// A restructure can leave a batch path that git cannot stage: a directory
