@@ -236,15 +236,20 @@ impl MdServer {
 
         // Keywords and scanned text are NFC-normalized (tool_spec §4): an NFC
         // query must find NFD-authored content synced from macOS.
-        let keywords: Vec<String> = req
+        // Not lowercased: the scan folds ASCII case only (ADR-0010), so a
+        // lowercased non-ASCII capital would no longer match its own spelling.
+        // Deduplicated: a repeated keyword is one pattern to have seen.
+        let mut keywords: Vec<String> = req
             .query
             .as_deref()
             .map(|q| {
                 q.split_whitespace()
-                    .map(|w| md_core::text::nfc(w).to_lowercase())
+                    .map(|w| md_core::text::nfc(w).into_owned())
                     .collect()
             })
             .unwrap_or_default();
+        keywords.sort();
+        keywords.dedup();
         let automaton = (!keywords.is_empty())
             .then(|| {
                 AhoCorasick::builder()
@@ -391,7 +396,9 @@ impl MdServer {
         if want_content && let Some(ac) = automaton {
             let mut seen = vec![false; keywords.len()];
             let mut hits = std::collections::BTreeSet::new(); // original byte offsets
-            for m in ac.find_iter(body) {
+            // Overlapping: a keyword inside another (`test`, `testing`) must
+            // not be shadowed by the match that consumed its bytes.
+            for m in ac.find_overlapping_iter(body) {
                 seen[m.pattern().as_usize()] = true;
                 hits.insert(m.start());
             }
@@ -402,7 +409,7 @@ impl MdServer {
                 && !seen.iter().all(|&s| s)
                 && let Some(folded) = cjk_fold::fold(body)
             {
-                for m in ac.find_iter(folded.text()) {
+                for m in ac.find_overlapping_iter(folded.text()) {
                     seen[m.pattern().as_usize()] = true;
                     hits.insert(folded.to_original(m.start()));
                 }
@@ -465,6 +472,28 @@ mod tests {
             vault.write_atomic(p, b.as_bytes()).unwrap();
         }
         (dir, MdServer::new(vault))
+    }
+
+    async fn content_hits(s: &MdServer, query: &str) -> usize {
+        let req = serde_json::from_value(json!({"query": query, "mode": "content"})).unwrap();
+        s.search_notes(Parameters(req)).await.unwrap().0.items.len()
+    }
+
+    #[tokio::test]
+    async fn every_keyword_is_matched_on_its_own() {
+        let (_d, s) = server(&[("a.md", "testing here\n")]);
+
+        assert_eq!(content_hits(&s, "test testing").await, 1, "one keyword inside another");
+        assert_eq!(content_hits(&s, "here here").await, 1, "a repeated keyword");
+        assert_eq!(content_hits(&s, "test absent").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_non_ascii_capital_is_found_as_written() {
+        let (_d, s) = server(&[("a.md", "\u{dc}ber \u{41c}\u{43e}\u{441}\u{43a}\u{432}\u{430}\n")]);
+
+        assert_eq!(content_hits(&s, "\u{dc}ber").await, 1);
+        assert_eq!(content_hits(&s, "\u{41c}\u{43e}\u{441}\u{43a}\u{432}\u{430}").await, 1);
     }
 
     #[tokio::test]
