@@ -112,6 +112,9 @@ pub enum Rebase {
 #[derive(Debug)]
 pub struct GitSync {
     root: PathBuf,
+    /// One sync at a time: `git fetch` runs outside the write guard and the
+    /// flock (it is network-bound), and two fetches race on the tracking ref.
+    serial: tokio::sync::Mutex<()>,
 }
 
 impl GitSync {
@@ -122,6 +125,7 @@ impl GitSync {
     pub async fn preflight(vault_root: &Path) -> Result<Self, String> {
         let sync = Self {
             root: vault_root.to_path_buf(),
+            serial: tokio::sync::Mutex::new(()),
         };
         let toplevel = sync
             .run(&["rev-parse", "--show-toplevel"])
@@ -171,6 +175,11 @@ impl GitSync {
             .await
             .ok()
             .map(|s| s.trim().to_string())
+    }
+
+    /// Held for the length of one sync run.
+    pub async fn serialized(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.serial.lock().await
     }
 
     /// The commit HEAD points at.
@@ -597,6 +606,7 @@ mod tests {
     async fn init_repo(root: &Path) -> GitSync {
         let git = GitSync {
             root: root.to_path_buf(),
+            serial: tokio::sync::Mutex::new(()),
         };
         git.run(&["init", "-q"]).await.unwrap();
         git.run(&["config", "user.email", "t@t"]).await.unwrap();

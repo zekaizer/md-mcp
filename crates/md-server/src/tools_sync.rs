@@ -103,6 +103,7 @@ impl MdServer {
         let Some(git) = self.git_sync() else {
             return Err("git sync is not enabled".into());
         };
+        let _serial = git.serialized().await;
         if self.vault().is_read_only() {
             return self.run_pull(git).await;
         }
@@ -438,6 +439,39 @@ mod tests {
         assert_eq!(text, "# Seed\nlocal line\n");
         assert!(!vault_dir.join(".git/rebase-merge").exists());
         assert!(!vault_dir.join(".git/rebase-apply").exists());
+    }
+
+    fn journal_paths(vault: &Path) -> Vec<String> {
+        std::fs::read_to_string(vault.join(".md-mcp/events.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .flat_map(|line| {
+                let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                record["ops"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|op| op["path"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    async fn server_with_sync_and_events(vault_dir: &Path) -> MdServer {
+        let sink = crate::events::EventSink::open(vault_dir, None).unwrap();
+        server_with_sync(vault_dir).await.with_event_sink(sink)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_syncs_both_succeed_and_journal_a_pull_once() {
+        let (_root, vault_dir, clone) = repo_fixture();
+        push_remote_note(&clone, "remote-note.md");
+        let s = server_with_sync_and_events(&vault_dir).await;
+
+        let (a, b) = tokio::join!(s.sync_vault(), s.sync_vault());
+
+        assert!(a.is_ok() && b.is_ok(), "{:?} {:?}", a.err(), b.err());
+        assert_eq!(journal_paths(&vault_dir), ["remote-note.md"]);
     }
 
     #[tokio::test]
